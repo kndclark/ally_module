@@ -1796,38 +1796,68 @@ static void ally_rgb_set(struct led_classdev *cdev, enum led_brightness brightne
 
 static int ally_rgb_apply_effect(struct ally_rgb_dev *led_rgb)
 {
-	u8 buf[17] = {FEATURE_KBD_LED_REPORT_ID1, 0xb3};
+	u8 buf[64];
 	int ret;
 
 	if (!led_rgb || !led_rgb->hdev)
 		return -ENODEV;
 
+	memset(buf, 0, FEATURE_ROG_ALLY_REPORT_SIZE);
+
 	/*
-	 * Set mode and speed based on user configurations.
+	 * Using FEATURE_ROG_ALLY_REPORT_ID (0x5A) for modern firmware/Ally X support.
 	 * buf[2] = zone, buf[3] = mode, buf[4-6] = RGB, buf[7] = speed
 	 */
+	buf[0] = FEATURE_ROG_ALLY_REPORT_ID;
+	buf[1] = 0xb3;
 	buf[2] = 0x00;
 	buf[3] = drvdata.led_rgb_data.mode;
 	buf[4] = led_rgb->red[0];
 	buf[5] = led_rgb->green[0];
 	buf[6] = led_rgb->blue[0];
 
-	if (drvdata.led_rgb_data.speed < 33)
+	if (drvdata.led_rgb_data.mode == 0) {
 		buf[7] = 0x00;
-	else if (drvdata.led_rgb_data.speed < 66)
-		buf[7] = 0x01;
-	else
-		buf[7] = 0x02;
+		buf[8] = 0x00;
+	} else {
+		/*
+		 * Refined Discrete 3-step for Ally X.
+		 * 0-33%   -> Slow (0xE1, ~13s)
+		 * 34-66%  -> Med  (0xE4, ~9s)
+		 * 67-100% -> Fast (0xEF, ~5s)
+		 */
+		u8 s;
+		if (drvdata.led_rgb_data.speed <= 33)
+			s = 0xE1;
+		else if (drvdata.led_rgb_data.speed <= 66)
+			s = 0xE4;
+		else
+			s = 0xEF;
 
-	ret = asus_dev_set_report(led_rgb->hdev, buf, sizeof(buf));
+		buf[7] = s;
+		buf[8] = 0x01; /* Forward direction */
+		buf[9] = 0x00;
+		buf[10] = 0x00; /* Ensure background colors are off (fixes Red Pulse) */
+		buf[11] = 0x00;
+		buf[12] = 0x00;
+
+		hid_info(led_rgb->hdev, "LED effect: mode=%u speed=%u (raw=0x%02x)\n",
+			 drvdata.led_rgb_data.mode, drvdata.led_rgb_data.speed, s);
+	}
+
+	ret = asus_dev_set_report(led_rgb->hdev, buf, FEATURE_ROG_ALLY_REPORT_SIZE);
 	if (ret < 0)
 		return ret;
 
-	ret = asus_dev_set_report(led_rgb->hdev, EC_MODE_LED_APPLY, sizeof(EC_MODE_LED_APPLY));
+	/* 
+	 * The sequence must be B3 (Config) -> B5 (Set) -> B4 (Apply) 
+	 * to correctly commit the new speed/mode state.
+	 */
+	ret = asus_dev_set_report(led_rgb->hdev, EC_MODE_LED_SET, sizeof(EC_MODE_LED_SET));
 	if (ret < 0)
 		return ret;
 
-	return asus_dev_set_report(led_rgb->hdev, EC_MODE_LED_SET, sizeof(EC_MODE_LED_SET));
+	return asus_dev_set_report(led_rgb->hdev, EC_MODE_LED_APPLY, sizeof(EC_MODE_LED_APPLY));
 }
 
 /*
@@ -1920,7 +1950,8 @@ static ssize_t rgb_speed_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%d\n", drvdata.led_rgb_data.speed);
 }
 
-static ssize_t rgb_speed_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+static ssize_t rgb_speed_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
 	u8 speed;
 	int ret = kstrtou8(buf, 10, &speed);
 	if (ret)
@@ -1929,6 +1960,7 @@ static ssize_t rgb_speed_store(struct device *dev, struct device_attribute *attr
 	if (speed > 100)
 		return -EINVAL;
 
+	hid_info(drvdata.hdev, "rgb_speed_store: %u\n", speed);
 	drvdata.led_rgb_data.speed = speed;
 	if (drvdata.led_rgb_dev)
 		ally_rgb_apply_effect(drvdata.led_rgb_dev);
