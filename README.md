@@ -60,4 +60,3 @@ sudo dmesg | grep -i "ally"
 
 ## Credits
 Based on the ASUS ROG HID driver by Luke Jones.
-Patched for Ally X SteamOS compatibility by Antigravity AI.
