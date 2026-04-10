@@ -2,6 +2,48 @@
 
 This repository contains a patched `hid-asus-ally` kernel module for the ASUS ROG Ally X, with specific fixes for LED RGB controls in SteamOS Game Mode.
 
+## Prerequisites
+
+Before installing, ensure the following:
+
+- **User deck password set**  
+  SteamOS requires a user password for administrative (`sudo`) actions.  
+  To set it, open a terminal and run:
+  ```bash
+  passwd
+  ```
+
+- **Git installed**  
+  SteamOS does not always include Git by default. To install it:
+
+  1. Disable the read-only filesystem:
+     ```bash
+     sudo steamos-readonly disable
+     ```
+
+  2. Initialize and populate the package manager keys:
+     ```bash
+     sudo pacman-key --init
+     sudo pacman-key --populate archlinux
+     ```
+
+  3. Install Git:
+     ```bash
+     sudo pacman -S git
+     ```
+  4. Clone the repo:
+     ```bash
+     git clone https://github.com/kndclark/ally_module.git
+
+> [!TIP]
+> **Clone to persistent storage**: When SteamOS performs a system update, your filesystem and drivers are reset, but your `/home` directory will be preserved; it is recommended to clone this repo to that location.
+---
+
+  5. (Optional) Re-enable the read-only filesystem:
+     ```bash
+     sudo steamos-readonly enable
+     ```
+
 ## Features
 - **SteamOS Native Integration**: Added sysfs stubs that allow the SteamOS Game Mode LED settings to control effect type, speed, and brightness out-of-the-box.
 - **Improved Effect Support**: Unlocked support for `monocolor`, `breathe`, `chroma`, and `rainbow` animations.
