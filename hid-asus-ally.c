@@ -2169,7 +2169,9 @@ static int ally_rgb_register(struct hid_device *hdev, struct ally_rgb_dev *led_r
 
 	led_cdev = &led_rgb->led_rgb_dev.led_cdev;
 	led_cdev->brightness = 128;
-	led_cdev->name = "go_s:rgb:joystick_rings";
+	/* TODO: update below "go_s" workaround, to show LED customization menu in 
+	/* SteamOS Game Mode, once asus UI profile is included in upstream kernel */
+	led_cdev->name = "go_s:rgb:joystick_rings"; 
 	led_cdev->max_brightness = 255;
 	led_cdev->brightness_set = ally_rgb_set;
 
