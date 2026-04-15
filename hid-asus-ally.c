@@ -681,8 +681,8 @@ static ssize_t gamepad_vibration_floor_store(struct device *dev,
 	if (val < 0 || val > 100)
 		return -EINVAL;
 
-	if (val > ally_cfg->vibration_intensity[0])
-		val = ally_cfg->vibration_intensity[0];
+	if (val > max(ally_cfg->vibration_intensity[0], ally_cfg->vibration_intensity[1]))
+		val = max(ally_cfg->vibration_intensity[0], ally_cfg->vibration_intensity[1]);
 
 	ally_cfg->vibration_min = val;
 	_gamepad_update_vibe_luts(ally_cfg);
@@ -1502,10 +1502,10 @@ static struct ally_gamepad_cfg *ally_gamepad_cfg_create(struct hid_device *hdev)
 	_gamepad_apply_btn_pair(hdev, ally_cfg, btn_pair_m1_m2);
 	gamepad_get_calibration(hdev);
 
-	ally_cfg->vibration_intensity[0] = 5;
-	ally_cfg->vibration_intensity[1] = 5;
-	ally_cfg->vibration_min = 5;
-	ally_cfg->vibration_curve = 300;
+	ally_cfg->vibration_intensity[0] = 8;
+	ally_cfg->vibration_intensity[1] = 8;
+	ally_cfg->vibration_min = 8;
+	ally_cfg->vibration_curve = 400;
 	_gamepad_update_vibe_luts(ally_cfg);
 
 	_gamepad_set_deadzones_default(ally_cfg);
@@ -2186,8 +2186,8 @@ static int ally_rgb_register(struct hid_device *hdev, struct ally_rgb_dev *led_r
 
 	led_cdev = &led_rgb->led_rgb_dev.led_cdev;
 	led_cdev->brightness = 128;
-	/* TODO: update below "go_s" workaround, to show LED customization menu in 
-	/* SteamOS Game Mode, once asus UI profile is included in upstream kernel */
+	/* TODO: update below "go_s" workaround, to show LED customization menu in
+	   SteamOS Game Mode, once asus UI profile is included in upstream kernel */
 	led_cdev->name = "go_s:rgb:joystick_rings"; 
 	led_cdev->max_brightness = 255;
 	led_cdev->brightness_set = ally_rgb_set;
