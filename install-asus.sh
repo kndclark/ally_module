@@ -45,7 +45,21 @@ fi
 
 # Check for root privileges
 if [ "$EUID" -ne 0 ]; then
-    error "Please run this script with sudo: sudo ./install.sh"
+    error "Please run this script with sudo: sudo ./install-asus.sh"
+fi
+
+# Check if user password is set (required for pacman/sudo)
+PW_STATUS=$(passwd --status "$TARGET_USER" | awk '{print $2}')
+if [ "$PW_STATUS" != "P" ]; then
+    log "--------------------------------------------------------"
+    warn "User '$TARGET_USER' does not appear to have a password set."
+    warn "SteamOS requires a user password for 'sudo' and 'pacman' operations."
+    warn "If you haven't set one, run 'passwd' in a new terminal first."
+    log "--------------------------------------------------------"
+    read -p "Continue anyway? (y/N) " confirm
+    if [[ ! $confirm =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
 fi
 
 # --- 2. Unlock Filesystem ---
