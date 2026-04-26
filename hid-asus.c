@@ -1887,8 +1887,12 @@ static void ally_rgb_set(struct led_classdev *cdev, enum led_brightness brightne
 		led->red[i]   = mc_cdev->subled_info[0].brightness;
 		led->green[i] = mc_cdev->subled_info[1].brightness;
 		led->blue[i]  = mc_cdev->subled_info[2].brightness;
+		ally_drvdata.led_rgb_data.red[i] = led->red[i];
+		ally_drvdata.led_rgb_data.green[i] = led->green[i];
+		ally_drvdata.led_rgb_data.blue[i] = led->blue[i];
 	}
 	spin_unlock_irqrestore(&led->lock, flags);
+	ally_drvdata.led_rgb_data.brightness = brightness;
 	ally_drvdata.led_rgb_data.initialized = true;
 
 	ally_rgb_schedule_work(led);
