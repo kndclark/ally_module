@@ -1986,6 +1986,12 @@ static void ally_rgb_restore_settings(struct ally_rgb_dev *led_rgb,
 	memcpy(led_rgb->green, ally_drvdata.led_rgb_data.green, arr_size);
 	memcpy(led_rgb->blue, ally_drvdata.led_rgb_data.blue, arr_size);
 	/* Restore R/G/B intensity from the first LED zone (all zones are identical) */
+	for (int i = 0; i < 4; i++) {
+		led_rgb->red[i] = ally_drvdata.led_rgb_data.red[0];
+		led_rgb->green[i] = ally_drvdata.led_rgb_data.green[0];
+		led_rgb->blue[i] = ally_drvdata.led_rgb_data.blue[0];
+	}
+
 	mc_led_info[0].intensity = ally_drvdata.led_rgb_data.red[0];
 	mc_led_info[1].intensity = ally_drvdata.led_rgb_data.green[0];
 	mc_led_info[2].intensity = ally_drvdata.led_rgb_data.blue[0];
@@ -2006,6 +2012,8 @@ static void ally_rgb_resume(void)
 	mc_led_info = led_rgb->led_rgb_dev.subled_info;
 
 	if (ally_drvdata.led_rgb_data.initialized) {
+		/* MCU requires time to initialize before accepting LED packets */
+		msleep(1500);
 		ally_rgb_restore_settings(led_rgb, led_cdev, mc_led_info);
 		led_rgb->update_rgb = true;
 		ally_rgb_schedule_work(led_rgb);
