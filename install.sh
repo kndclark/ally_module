@@ -9,6 +9,9 @@ set -e
 MODULE_NAME="hid-asus"
 MODULE_FILE="${MODULE_NAME}.ko"
 MODULE_ZST="${MODULE_FILE}.zst"
+STUB_NAME="asus-wmi-stub"
+STUB_FILE="${STUB_NAME}.ko"
+STUB_ZST="${STUB_FILE}.zst"
 INSTALL_PATH="/lib/modules/$(uname -r)/kernel/drivers/hid/"
 # Get the actual user if running via sudo
 TARGET_USER="${SUDO_USER:-$(whoami)}"
@@ -111,6 +114,7 @@ fi
 
 log "Compressing module..."
 zstd -f "$MODULE_FILE"
+zstd -f "$STUB_FILE"
 
 # Backup logic
 mkdir -p "$INSTALL_PATH"
@@ -128,6 +132,7 @@ fi
 
 log "Installing to $INSTALL_PATH..."
 cp -f "$MODULE_ZST" "$TARGET_FILE"
+cp -f "$STUB_ZST" "${INSTALL_PATH}/${STUB_ZST}"
 
 log "Updating dependency map..."
 depmod -a
