@@ -1502,7 +1502,7 @@ static struct ally_config *ally_config_create(struct hid_device *hdev, struct al
 
 	for (sysfs_i = 0; sysfs_i < ARRAY_SIZE(ally_attr_groups); sysfs_i++) {
 		ret = sysfs_create_group(&hdev->dev.kobj, &ally_attr_groups[sysfs_i]);
-		if (ret < 0) {
+		if (ret < 0 && ret != -EEXIST) {
 			hid_err(hdev, "Failed to create sysfs group '%s': %d\n",
 				ally_attr_groups[sysfs_i].name, ret);
 			goto ally_config_create_sysfs_err;
@@ -2209,8 +2209,12 @@ static int ally_rgb_register(struct hid_device *hdev, struct ally_rgb_dev *led_r
 	if (ret)
 		return ret;
 
-	return devm_device_add_group(led_rgb->led_rgb_dev.led_cdev.dev,
+	ret = devm_device_add_group(led_rgb->led_rgb_dev.led_cdev.dev,
 				     &ally_rgb_attr_group);
+	if (ret && ret != -EEXIST)
+		return ret;
+
+	return 0;
 }
 
 static struct ally_rgb_dev *ally_rgb_create(struct hid_device *hdev)
