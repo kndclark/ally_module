@@ -208,6 +208,7 @@ struct ally_rgb_data {
 	u8 mode;		/* 0=mono, 1=breathe, 2=chroma, 3=rainbow */
 	u8 speed;	/* 0-100, mapped to 3 discrete HW levels */
 	u8 brightness;	/* cached for suspend/resume */
+	u8 last_brightness; /* last non-zero brightness */
 	u8 red[4];
 	u8 green[4];
 	u8 blue[4];
@@ -1893,6 +1894,8 @@ static void ally_rgb_set(struct led_classdev *cdev, enum led_brightness brightne
 		ally_drvdata.led_rgb_data.blue[i] = mc_cdev->subled_info[2].intensity;
 	}
 	spin_unlock_irqrestore(&led->lock, flags);
+	if (brightness > 0)
+		ally_drvdata.led_rgb_data.last_brightness = brightness;
 	ally_drvdata.led_rgb_data.brightness = brightness;
 	ally_drvdata.led_rgb_data.initialized = true;
 
@@ -1990,7 +1993,11 @@ static void ally_rgb_restore_settings(struct ally_rgb_dev *led_rgb,
 	mc_led_info[0].intensity = ally_drvdata.led_rgb_data.red[0];
 	mc_led_info[1].intensity = ally_drvdata.led_rgb_data.green[0];
 	mc_led_info[2].intensity = ally_drvdata.led_rgb_data.blue[0];
-	led_cdev->brightness = ally_drvdata.led_rgb_data.brightness;
+	
+	if (ally_drvdata.led_rgb_data.brightness > 0)
+		led_cdev->brightness = ally_drvdata.led_rgb_data.brightness;
+	else
+		led_cdev->brightness = ally_drvdata.led_rgb_data.last_brightness;
 
 	/* Recalculate scaled hardware colors */
 	led_mc_calc_color_components(&led_rgb->led_rgb_dev, led_cdev->brightness);
