@@ -29,7 +29,7 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/platform_data/x86/asus-wmi.h>
+#include "asus-wmi.h" // TODO relative pathing removed for Ally X hardware module patch testing
 #include <linux/types.h>
 #include <linux/input/mt.h>
 #include <linux/usb.h> /* For to_usb_interface for T100 touchpad intf check */
