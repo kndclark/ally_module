@@ -1625,6 +1625,7 @@ static bool ally_x_raw_event(struct input_dev *input, struct hid_device *hdev,
 {
 	struct ally_x_input_report *in_report;
 	u8 byte;
+	int keycode = 0;
 
 	if (!input)
 		return false;
@@ -1671,18 +1672,22 @@ static bool ally_x_raw_event(struct input_dev *input, struct hid_device *hdev,
 		 */
 		byte = data[1];
 
-		/* Right Armoury Crate button: 0x93 for the Xbox ROG Ally X */
-		input_report_key(input, KEY_PROG1, byte == 0x38 || byte == 0x93);
-		/* Left/XBox button */
-		input_report_key(input, KEY_F16, byte == 0xA6);
-		/* QAM long press */
-		input_report_key(input, KEY_F17, byte == 0xA7);
-		/* QAM long press released */
-		input_report_key(input, KEY_F18, byte == 0xA8);
+		if (byte == 0x38 || byte == 0x93)
+			keycode = KEY_PROG1;
+		else if (byte == 0xA6)
+			keycode = KEY_F16;
+		else if (byte == 0xA7)
+			keycode = KEY_F17;
+		else if (byte == 0xA8)
+			keycode = KEY_F18;
 
-		input_sync(input);
-
-		return byte == 0xA6 || byte == 0xA7 || byte == 0xA8 || byte == 0x38;
+		if (keycode > 0) {
+			input_report_key(input, keycode, 1);
+			input_sync(input);
+			input_report_key(input, keycode, 0);
+			input_sync(input);
+			return true;
+		}
 	}
 
 	return false;
