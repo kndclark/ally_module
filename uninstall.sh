@@ -9,8 +9,11 @@ set -e
 MODULE_NAME="hid-asus"
 MODULE_FILE="${MODULE_NAME}.ko"
 MODULE_ZST="${MODULE_FILE}.zst"
+STUB_NAME="asus-wmi-stub"
+STUB_ZST="${STUB_NAME}.ko.zst"
 INSTALL_PATH="/lib/modules/$(uname -r)/kernel/drivers/hid/"
 TARGET_FILE="${INSTALL_PATH}/${MODULE_ZST}"
+STUB_TARGET="${INSTALL_PATH}/${STUB_ZST}"
 BACKUP_FILE="${TARGET_FILE}.bak"
 
 # --- Colors ---
@@ -50,6 +53,7 @@ if [ -f "$BACKUP_FILE" ]; then
     log "Restoring original driver from backup ($BACKUP_FILE)..."
     cp -f "$BACKUP_FILE" "$TARGET_FILE"
     rm -f "$BACKUP_FILE"
+    rm -f "$STUB_TARGET"
     log "Restoration complete."
 else
     warn "No local backup found at $BACKUP_FILE."
@@ -74,6 +78,7 @@ else
             read -p "Remove the patched module anyway? (y/N) " confirm_remove
             if [[ $confirm_remove =~ ^[Yy]$ ]]; then
                 rm -f "$TARGET_FILE"
+                rm -f "$STUB_TARGET"
             else
                 log "Uninstallation cancelled."
                 exit 0
