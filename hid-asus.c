@@ -203,9 +203,36 @@ struct ally_rgb_dev {
 	u8 blue[4];
 };
 
+/*
+ * Hardware LED mode bytes as sent to the Ally MCU in the B3 config packet.
+ */
+#define ALLY_RGB_MODE_STATIC		0x00
+#define ALLY_RGB_MODE_BREATHING		0x01
+#define ALLY_RGB_MODE_COLOR_CYCLE	0x02
+#define ALLY_RGB_MODE_RAINBOW		0x03
+#define ALLY_RGB_MODE_STROBING		0x0A
+
+/*
+ * Mode lookup table for mapping sysfs effect names to hardware byte values
+ */
+struct ally_rgb_mode_entry {
+	const char *name;
+	u8 hw_byte;
+};
+
+static const struct ally_rgb_mode_entry ally_rgb_modes[] = {
+	{ "monocolor",	ALLY_RGB_MODE_STATIC },
+	{ "breathe",	ALLY_RGB_MODE_BREATHING },
+	{ "chroma",	ALLY_RGB_MODE_COLOR_CYCLE },
+	{ "rainbow",	ALLY_RGB_MODE_RAINBOW },
+	{ "strobing",	ALLY_RGB_MODE_STROBING },
+};
+
+#define ALLY_RGB_MODE_COUNT ARRAY_SIZE(ally_rgb_modes)
+
 /* Persistent LED state — survives suspend/resume and device re-creation */
 struct ally_rgb_data {
-	u8 mode;		/* 0=mono, 1=breathe, 2=chroma, 3=rainbow */
+	u8 mode;		/* hardware mode byte (ALLY_RGB_MODE_*) */
 	u8 speed;	/* 0-100, mapped to 3 discrete HW levels */
 	u8 brightness;	/* cached for suspend/resume */
 	u8 last_brightness; /* last non-zero brightness */
@@ -1926,7 +1953,7 @@ static int ally_rgb_apply_effect(struct ally_rgb_dev *led_rgb)
 	buf[5] = led_rgb->green[0];
 	buf[6] = led_rgb->blue[0];
 
-	if (ally_drvdata.led_rgb_data.mode == 0) {
+	if (ally_drvdata.led_rgb_data.mode == ALLY_RGB_MODE_STATIC) {
 		buf[7] = 0x00;
 		buf[8] = 0x00;
 	} else {
@@ -2061,30 +2088,41 @@ static void ally_rgb_resume(void)
 
 /* Ally RGB sysfs attributes */
 
-static const char *const ally_rgb_effect_strings[] = {
-	"monocolor", "breathe", "chroma", "rainbow"
-};
+/* Look up effect name by hardware byte; returns "monocolor" if not found */
+static const char *ally_rgb_mode_name(u8 hw_byte)
+{
+	for (int i = 0; i < ALLY_RGB_MODE_COUNT; i++)
+		if (ally_rgb_modes[i].hw_byte == hw_byte)
+			return ally_rgb_modes[i].name;
+	return ally_rgb_modes[0].name;
+}
+
+/* Look up hardware byte by effect name; returns -EINVAL if not found */
+static int ally_rgb_mode_from_name(const char *name)
+{
+	for (int i = 0; i < ALLY_RGB_MODE_COUNT; i++)
+		if (sysfs_streq(name, ally_rgb_modes[i].name))
+			return ally_rgb_modes[i].hw_byte;
+	return -EINVAL;
+}
 
 static ssize_t rgb_effect_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
-	u8 mode = ally_drvdata.led_rgb_data.mode;
-
-	if (mode >= ARRAY_SIZE(ally_rgb_effect_strings))
-		mode = 0;
-	return sysfs_emit(buf, "%s\n", ally_rgb_effect_strings[mode]);
+	return sysfs_emit(buf, "%s\n",
+			  ally_rgb_mode_name(ally_drvdata.led_rgb_data.mode));
 }
 
 static ssize_t rgb_effect_store(struct device *dev,
 				struct device_attribute *attr,
 				const char *buf, size_t count)
 {
-	int mode = sysfs_match_string(ally_rgb_effect_strings, buf);
+	int hw_byte = ally_rgb_mode_from_name(buf);
 
-	if (mode < 0)
-		return mode;
+	if (hw_byte < 0)
+		return hw_byte;
 
-	ally_drvdata.led_rgb_data.mode = mode;
+	ally_drvdata.led_rgb_data.mode = hw_byte;
 	if (ally_drvdata.led_rgb_dev)
 		ally_rgb_apply_effect(ally_drvdata.led_rgb_dev);
 
@@ -2094,7 +2132,16 @@ static ssize_t rgb_effect_store(struct device *dev,
 static ssize_t rgb_effect_index_show(struct device *dev,
 				     struct device_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "monocolor breathe chroma rainbow\n");
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < ALLY_RGB_MODE_COUNT; i++) {
+		if (i > 0)
+			len += sysfs_emit_at(buf, len, " ");
+		len += sysfs_emit_at(buf, len, "%s", ally_rgb_modes[i].name);
+	}
+	len += sysfs_emit_at(buf, len, "\n");
+	return len;
 }
 
 static ssize_t rgb_mode_show(struct device *dev,
