@@ -173,58 +173,59 @@ fi
 
 log "Checking dependencies..."
 
-# Detect correct headers
-KERNEL_VER=$(uname -r)
-# Extract common SteamOS header patterns (e.g., neptune-618)
-HEADER_SUFFIX=$(echo "$KERNEL_VER" | grep -o 'neptune-[0-9]*' || echo "")
-if [ -n "$HEADER_SUFFIX" ]; then
-    HEADER_PKG="linux-${HEADER_SUFFIX}-headers"
-else
-    HEADER_PKG="linux-headers"
-fi
+# Build only for the running kernel. Headers for any other kernel produce a
+# module this one cannot load, and installing it into that kernel's tree
+# changes nothing until a reboot that may never boot that kernel.
+KVER=$(uname -r)
+KDIR="/lib/modules/${KVER}/build"
 
-log "Detected required headers: $HEADER_PKG"
+# A bare directory test passed both failures seen after the 20260924 update:
+# the repo's headers had moved a version ahead of the image's kernel, and a
+# power loss mid-install left the right version with zero-byte files.
+headers_ok() {
+    local f
+    for f in Makefile .config Module.symvers include/generated/utsrelease.h; do
+        [ -s "${KDIR}/${f}" ] || return 1
+    done
+    grep -qF "\"${KVER}\"" "${KDIR}/include/generated/utsrelease.h"
+}
 
-# Install base-devel and headers
-if [ -d "/lib/modules/$(uname -r)/build" ]; then
-    log "Headers for running kernel $(uname -r) are already installed. Skipping headers package installation."
-    pacman -Sy --needed --noconfirm base-devel zstd
+# Name the headers after the package that owns the running kernel, at that
+# package's exact version: the repo can already carry a newer kernel than the
+# SteamOS image ships, and its headers are what `pacman -S` would install.
+KERNEL_PKG=$(pacman -Qqo "/usr/lib/modules/${KVER}/vmlinuz" 2>/dev/null) \
+    || error "No package owns /usr/lib/modules/${KVER}/vmlinuz; cannot pick matching headers."
+KERNEL_PKG_VER=$(pacman -Q "$KERNEL_PKG" | awk '{print $2}')
+HEADER_PKG="${KERNEL_PKG}-headers"
+log "Running kernel ${KVER} is ${KERNEL_PKG} ${KERNEL_PKG_VER}; need ${HEADER_PKG} ${KERNEL_PKG_VER}"
+
+pacman -Sy --needed --noconfirm base-devel zstd
+
+if headers_ok; then
+    log "Headers for ${KVER} are installed and complete."
 else
-    log "Installing matching headers ($HEADER_PKG) from repository..."
-    if ! pacman -Sy --needed --noconfirm base-devel "$HEADER_PKG" zstd; then
-        warn "Could not install $HEADER_PKG directly from repository. Trying archive URL..."
-        KERNEL_VER_CLEAN=$(echo "$KERNEL_VER" | sed -E 's/([0-9]+)\.([0-9]+)\.([0-9]+)-([^-]+)-([0-9]+)-.*/\1.\2.\3.\4-\5/')
-        EXACT_PKG_URL="https://steamdeck-packages.steamos.cloud/archlinux-mirror/jupiter-main/os/x86_64/${HEADER_PKG}-${KERNEL_VER_CLEAN}-x86_64.pkg.tar.zst"
-        curl -s -f -L "$EXACT_PKG_URL" -o "/tmp/${HEADER_PKG}.pkg.tar.zst"
-        pacman -U --noconfirm --config <(sed 's/SigLevel.*/SigLevel = Never/' /etc/pacman.conf) "/tmp/${HEADER_PKG}.pkg.tar.zst"
-        rm -f "/tmp/${HEADER_PKG}.pkg.tar.zst"
+    # Not --needed: a damaged install still reports the right version and
+    # would be skipped. --overwrite covers files the local package database
+    # stopped listing when an install was cut short.
+    OVERWRITE=(--overwrite "/usr/lib/modules/${KVER}/build/*" --overwrite "/usr/src/${KERNEL_PKG}")
+    REPO_VER=$(pacman -Si "$HEADER_PKG" 2>/dev/null | awk '/^Version/{print $3; exit}')
+    if [ "$REPO_VER" = "$KERNEL_PKG_VER" ]; then
+        log "Installing ${HEADER_PKG} ${REPO_VER} from the repository..."
+        pacman -S --noconfirm "${OVERWRITE[@]}" "$HEADER_PKG"
+    else
+        warn "Repository has ${HEADER_PKG} ${REPO_VER:-(none)}, not ${KERNEL_PKG_VER}. Fetching that exact version..."
+        EXACT_PKG_URL="https://steamdeck-packages.steamos.cloud/archlinux-mirror/jupiter-main/os/x86_64/${HEADER_PKG}-${KERNEL_PKG_VER}-x86_64.pkg.tar.zst"
+        # pacman fetches the .sig beside a URL and checks it against the keyring.
+        pacman -U --noconfirm "${OVERWRITE[@]}" "$EXACT_PKG_URL"
     fi
+    # A hard power-off seconds after this left zero-byte headers behind once.
+    sync
+    headers_ok || error "Headers at ${KDIR} are still missing or incomplete for ${KVER}."
 fi
 
 
 # --- 5. Build and Install ---
 
-log "Detecting kernel headers..."
-KVER=$(uname -r)
-if [ -d "/lib/modules/${KVER}/build" ]; then
-    log "Found build headers for running kernel: ${KVER}"
-else
-    log "Headers for running kernel ${KVER} not found. Searching for installed headers..."
-    KVER=""
-    for d in /lib/modules/*; do
-        if [ -d "${d}/build" ]; then
-            KVER=$(basename "${d}")
-            log "Found active kernel headers: ${KVER}"
-            break
-        fi
-    done
-fi
-
-if [ -z "${KVER}" ]; then
-    error "Could not find any directory under /lib/modules/ containing a 'build' folder. Please install linux headers."
-fi
-
-KDIR="/lib/modules/${KVER}/build"
 INSTALL_PATH="/lib/modules/${KVER}/kernel/drivers/hid/"
 
 # Compiling needs no privileges, and building as root leaves root-owned
@@ -242,8 +243,8 @@ log "Building module using headers at ${KDIR}..."
 "${AS_BUILDER[@]}" make clean KDIR="${KDIR}"
 "${AS_BUILDER[@]}" make all KDIR="${KDIR}"
 
-if [ ! -f "$MODULE_FILE" ]; then
-    error "Build failed! $MODULE_FILE not found."
+if [ ! -s "$MODULE_FILE" ]; then
+    error "Build failed! $MODULE_FILE is missing or empty."
 fi
 
 log "Compressing module..."
@@ -260,8 +261,22 @@ mkdir -p "$INSTALL_PATH"
 BACKUP_FILE="${INSTALL_PATH}/${MODULE_ZST}.bak"
 TARGET_FILE="${INSTALL_PATH}/${MODULE_ZST}"
 
+# uninstall.sh copies the backup back unchecked, so only the stock module may
+# become one. Stock modules carry the kernel's signature and our builds do
+# not: an unsigned .bak is a build of ours saved by an earlier run, and gets
+# replaced. modinfo refuses a *.bak name, hence the decompressed copy.
+module_signer() {
+    local tmp
+    tmp=$(mktemp --suffix=.ko)
+    zstd -dcq "$1" > "$tmp" 2>/dev/null && modinfo -F signer "$tmp" 2>/dev/null
+    rm -f "$tmp"
+    return 0
+}
+
 if [ -f "$TARGET_FILE" ]; then
-    if [ ! -f "$BACKUP_FILE" ] || [ "$FORCE_BACKUP" = true ]; then
+    if [ -z "$(module_signer "$TARGET_FILE")" ]; then
+        log "Installed ${MODULE_ZST} is unsigned (an earlier build of ours); not backing it up."
+    elif [ -z "$(module_signer "$BACKUP_FILE")" ] || [ "$FORCE_BACKUP" = true ]; then
         log "Creating backup of original driver at $BACKUP_FILE..."
         cp -f "$TARGET_FILE" "$BACKUP_FILE"
     else
@@ -282,31 +297,11 @@ fi
 
 log "Updating dependency map..."
 depmod -a
+# A hard power-off seconds after an earlier install left this module, and
+# everything written with it, as zero-byte files.
+sync
 
-# --- 6. Blacklist Stock Module ---
-
-# SteamOS's atomic update process resets untracked /etc files (confirmed via
-# journalctl: rauc-override.sh / holo-post-update-shutdown both log "Before
-# /etc changes gets removed, a backup is created in
-# /var/lib/steamos-atomupd/etc_backup" during an OS update). This file does
-# not survive that, silently, so every write here is verified by reading it
-# back rather than trusted.
-BLACKLIST_FILE=/etc/modprobe.d/hid-asus-ally-blacklist.conf
-log "Writing modprobe blacklist for stock hid_asus_ally..."
-mkdir -p /etc/modprobe.d
-echo 'blacklist hid_asus_ally' > "$BLACKLIST_FILE"
-if [ "$(cat "$BLACKLIST_FILE" 2>/dev/null)" != "blacklist hid_asus_ally" ]; then
-    error "Failed to write $BLACKLIST_FILE - it does not contain the expected line."
-fi
-log "Blacklist written and verified at $BLACKLIST_FILE"
-
-# --- 7. Reload Module ---
-
-if [ "${KVER}" != "$(uname -r)" ]; then
-    warn "Module was built for kernel ${KVER} but you are running $(uname -r)."
-    warn "Installation is complete for the new kernel. Please reboot your Steam Deck to use the new kernel and the module."
-    exit 0
-fi
+# --- 6. Reload Module ---
 
 log "Reloading module..."
 
@@ -407,7 +402,30 @@ if ! verify_binding; then
     error "One or more interfaces are not on our driver. Re-run this script; if it persists, reboot and re-run."
 fi
 
-# --- 7. Final Status ---
+# --- 7. Blacklist Stock Module ---
+
+# Only now that ours owns every interface. The stock hid_asus_ally runs the
+# gamepad on the stock kernel, so a blacklist written before a swap that then
+# fails or never runs leaves those interfaces with no driver at all - a dead
+# controller that no resume or InputPlumber recovery can bring back.
+#
+# SteamOS's atomic update process resets untracked /etc files (confirmed via
+# journalctl: rauc-override.sh / holo-post-update-shutdown both log "Before
+# /etc changes gets removed, a backup is created in
+# /var/lib/steamos-atomupd/etc_backup" during an OS update). This file does
+# not survive that, silently, so every write here is verified by reading it
+# back rather than trusted.
+BLACKLIST_FILE=/etc/modprobe.d/hid-asus-ally-blacklist.conf
+log "Writing modprobe blacklist for stock hid_asus_ally..."
+mkdir -p /etc/modprobe.d
+echo 'blacklist hid_asus_ally' > "$BLACKLIST_FILE"
+if [ "$(cat "$BLACKLIST_FILE" 2>/dev/null)" != "blacklist hid_asus_ally" ]; then
+    error "Failed to write $BLACKLIST_FILE - it does not contain the expected line."
+fi
+sync
+log "Blacklist written and verified at $BLACKLIST_FILE"
+
+# --- 8. Final Status ---
 
 log "Installation complete!"
 log "Checking dmesg for Ally X registration..."
