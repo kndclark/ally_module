@@ -6003,6 +6003,8 @@ static int asus_usb_rgb_send_zone_effect(struct asus_usb_rgb_zone *zone)
 	else
 		report.speed = asus_usb_rgb_speed_to_hw(state->speed);
 	report.direction = state->direction;
+	if (state->effect == ASUS_USB_RGB_EFFECT_BREATHING)
+		report.pad1 = 1;
 
 	memcpy(out, &report, sizeof(report));
 
