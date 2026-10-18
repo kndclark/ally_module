@@ -29,14 +29,38 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 # --- Arguments ---
 FORCE_BACKUP=false
 CHECK_ONLY=false
+AUDIO_OVERRIDE="" # "yes", "no", or empty for auto-detect
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --force) FORCE_BACKUP=true ;;
         --check) CHECK_ONLY=true ;;
+        --audio) AUDIO_OVERRIDE="yes" ;;
+        --no-audio) AUDIO_OVERRIDE="no" ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
+
+# Hardware detection for models requiring out-of-tree audio (e.g. X20 / RC74XA)
+BOARD_NAME=$(cat /sys/devices/virtual/dmi/id/board_name 2>/dev/null || cat /sys/class/dmi/id/board_name 2>/dev/null || echo "")
+PRODUCT_NAME=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
+
+INSTALL_AUDIO=false
+if [ -d "audio" ]; then
+    if [ "$AUDIO_OVERRIDE" = "yes" ]; then
+        INSTALL_AUDIO=true
+        log "Audio driver installation explicitly enabled via --audio."
+    elif [ "$AUDIO_OVERRIDE" = "no" ]; then
+        INSTALL_AUDIO=false
+        log "Audio driver installation disabled via --no-audio."
+    elif [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; then
+        INSTALL_AUDIO=true
+        log "Hardware detected: ROG Xbox Ally X (RC74XA). SoundWire audio installation enabled."
+    else
+        INSTALL_AUDIO=false
+        log "Hardware detected: ${BOARD_NAME:-$PRODUCT_NAME} (stock audio already functional, skipping out-of-tree audio)."
+    fi
+fi
 
 # Confirm that every ROG Ally HID interface is bound to our driver ("asus"),
 # not the stock in-kernel one ("asus_rog_ally", from hid-asus-ally.ko). This is
@@ -246,7 +270,7 @@ if [ ! -f "$MODULE_FILE" ]; then
     error "Build failed! $MODULE_FILE not found."
 fi
 
-if [ -d "audio" ]; then
+if [ "$INSTALL_AUDIO" = true ]; then
     log "Building audio modules using headers at ${KDIR}..."
     "${AS_BUILDER[@]}" make -C audio clean KDIR="${KDIR}"
     "${AS_BUILDER[@]}" make -C audio all KDIR="${KDIR}"
@@ -286,7 +310,7 @@ elif [ -e "${INSTALL_PATH}/${STUB_ZST}" ]; then
     rm -f "${INSTALL_PATH}/${STUB_ZST}"
 fi
 
-if [ -d "audio" ]; then
+if [ "$INSTALL_AUDIO" = true ]; then
     log "Installing audio modules to /lib/modules/${KVER}/kernel/..."
     base_kdir="/lib/modules/${KVER}/kernel"
     audio_mods=(
@@ -459,7 +483,7 @@ log "Installation complete!"
 log "Checking dmesg for Ally X registration..."
 dmesg | grep -i "asus" | tail -n 5 || true
 
-if [ -d "audio" ]; then
+if [ "$INSTALL_AUDIO" = true ]; then
     log "Audio modules installed for AMD ACP 7.0 / SoundWire."
     if [ -d "/sys/bus/soundwire/devices" ] && [ "$(ls -1 /sys/bus/soundwire/devices/ 2>/dev/null | wc -l)" -gt 0 ]; then
         log "SoundWire devices enumerated: $(ls -1 /sys/bus/soundwire/devices/ | tr '\n' ' ')"
