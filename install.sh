@@ -249,7 +249,8 @@ if [ -z "${KVER}" ]; then
 fi
 
 KDIR="/lib/modules/${KVER}/build"
-INSTALL_PATH="/lib/modules/${KVER}/kernel/drivers/hid/"
+UPDATES_BASE="/lib/modules/${KVER}/updates/ally"
+INSTALL_PATH="${UPDATES_BASE}/drivers/hid"
 
 # Compiling needs no privileges, and building as root leaves root-owned
 # objects behind that make the next unprivileged build fail in MODPOST with
@@ -276,6 +277,22 @@ if [ "$INSTALL_AUDIO" = true ]; then
     "${AS_BUILDER[@]}" make -C audio all KDIR="${KDIR}"
 fi
 
+# Pre-flight Symbol & ABI Gate
+log "Running pre-flight symbol verification gate..."
+PREFLIGHT_TARGETS=("$MODULE_FILE")
+if [ "$INSTALL_AUDIO" = true ]; then
+    for f in audio/*.ko; do
+        [ -f "$f" ] && PREFLIGHT_TARGETS+=("$f")
+    done
+fi
+if [ -f "scripts/preflight_symbol_check.py" ]; then
+    if ! python3 scripts/preflight_symbol_check.py "${PREFLIGHT_TARGETS[@]}" --symvers "${KDIR}/Module.symvers"; then
+        error "Pre-flight symbol check failed! Aborting installation to prevent kernel oops/boot-loop."
+    fi
+else
+    warn "scripts/preflight_symbol_check.py not found; skipping pre-flight gate."
+fi
+
 log "Compressing module..."
 "${AS_BUILDER[@]}" zstd -f "$MODULE_FILE"
 # The Makefile only builds the stub on kernels whose asus-wmi lacks the
@@ -285,34 +302,52 @@ if [ -f "$STUB_FILE" ]; then
     "${AS_BUILDER[@]}" zstd -f "$STUB_FILE"
 fi
 
-# Backup logic
+# Ensure stock kernel modules under /lib/modules/${KVER}/kernel/ are pristine
+# and not overwritten by previous versions.
+restore_stock_kernel_modules() {
+    local target_kdir="/lib/modules/${KVER}/kernel"
+    local stock_dir="/home/${TARGET_USER}/stock_modules"
+    local files_to_check=(
+        "drivers/hid/hid-asus.ko.zst"
+        "sound/soc/amd/snd-acp-config.ko.zst"
+        "sound/soc/amd/acp/snd-soc-acpi-amd-match.ko.zst"
+        "sound/soc/sdw_utils/snd-soc-sdw-utils.ko.zst"
+        "sound/soc/codecs/snd-soc-tas2783-sdw.ko.zst"
+        "sound/soc/codecs/snd-soc-rt721-sdca.ko.zst"
+        "sound/soc/amd/acp/snd-acp-sdw-legacy-mach.ko.zst"
+        "sound/soc/amd/ps/snd-pci-ps.ko.zst"
+    )
+    for rel in "${files_to_check[@]}"; do
+        local target="${target_kdir}/${rel}"
+        local bak="${target}.bak"
+        if [ -f "$bak" ]; then
+            log "Restoring stock $rel from backup (.bak)..."
+            mv -f "$bak" "$target"
+        elif [ -d "$stock_dir" ]; then
+            local cand=$(find "$stock_dir" -type f -name "$(basename "$target")" 2>/dev/null | head -n 1)
+            if [ -n "$cand" ] && [ -f "$cand" ]; then
+                if ! cmp -s "$cand" "$target" 2>/dev/null; then
+                    log "Restoring pristine stock $rel from extracted official package..."
+                    cp -f "$cand" "$target"
+                fi
+            fi
+        fi
+    done
+}
+restore_stock_kernel_modules
+
+# Install to updates/ally directory (SteamOS search order: updates > extramodules > built-in)
 mkdir -p "$INSTALL_PATH"
-BACKUP_FILE="${INSTALL_PATH}/${MODULE_ZST}.bak"
-TARGET_FILE="${INSTALL_PATH}/${MODULE_ZST}"
-
-if [ -f "$TARGET_FILE" ]; then
-    if [ ! -f "$BACKUP_FILE" ] || [ "$FORCE_BACKUP" = true ]; then
-        log "Creating backup of original driver at $BACKUP_FILE..."
-        cp -f "$TARGET_FILE" "$BACKUP_FILE"
-    else
-        log "Backup already exists at $BACKUP_FILE. Skipping backup."
-    fi
-fi
-
-log "Installing to $INSTALL_PATH..."
-cp -f "$MODULE_ZST" "$TARGET_FILE"
+log "Installing HID module to $INSTALL_PATH..."
+cp -f "$MODULE_ZST" "${INSTALL_PATH}/${MODULE_ZST}"
 if [ -f "$STUB_ZST" ]; then
     cp -f "$STUB_ZST" "${INSTALL_PATH}/${STUB_ZST}"
 elif [ -e "${INSTALL_PATH}/${STUB_ZST}" ]; then
-    # A stub left by an install against an older kernel would still be listed
-    # in modules.dep and would fail to insert here, taking hid-asus with it.
-    log "Removing stale ${STUB_ZST} left by a previous install..."
     rm -f "${INSTALL_PATH}/${STUB_ZST}"
 fi
 
 if [ "$INSTALL_AUDIO" = true ]; then
-    log "Installing audio modules to /lib/modules/${KVER}/kernel/..."
-    base_kdir="/lib/modules/${KVER}/kernel"
+    log "Installing audio modules to ${UPDATES_BASE}/sound/..."
     audio_mods=(
         "audio/snd-acp-config.ko:sound/soc/amd/snd-acp-config.ko.zst"
         "audio/snd-soc-acpi-amd-match.ko:sound/soc/amd/acp/snd-soc-acpi-amd-match.ko.zst"
@@ -325,16 +360,10 @@ if [ "$INSTALL_AUDIO" = true ]; then
     for entry in "${audio_mods[@]}"; do
         src="${entry%%:*}"
         rel="${entry##*:}"
-        dst="${base_kdir}/${rel}"
+        dst="${UPDATES_BASE}/${rel}"
         if [ -f "$src" ]; then
             "${AS_BUILDER[@]}" zstd -f "$src"
             zst="${src}.zst"
-            if [ -f "$dst" ]; then
-                if [ ! -f "${dst}.bak" ] || [ "$FORCE_BACKUP" = true ]; then
-                    log "Backing up stock $rel..."
-                    cp -f "$dst" "${dst}.bak"
-                fi
-            fi
             mkdir -p "$(dirname "$dst")"
             cp -f "$zst" "$dst"
         fi
@@ -349,6 +378,38 @@ if [ "$INSTALL_AUDIO" = true ]; then
         ln -sf 1AC4-0-0-0xB.bin.zst "$fw_dir/1954-0-0-0xB.bin.zst"
     fi
 fi
+
+# Emergency Boot Guard Installation
+install_emergency_guard() {
+    local svc_file="/etc/systemd/system/ally-emergency-recovery.service"
+    local emergency_wants="/etc/systemd/system/emergency.target.wants"
+    local rescue_wants="/etc/systemd/system/rescue.target.wants"
+
+    log "Installing emergency boot guard service..."
+    if [ -f "systemd/ally-emergency-recovery.service" ]; then
+        cp -f "systemd/ally-emergency-recovery.service" "$svc_file"
+    else
+        cat <<'EOF' > "$svc_file"
+[Unit]
+Description=ROG Ally X Out-Of-Tree Module Emergency Recovery Guard
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=emergency.target rescue.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'rm -rf /lib/modules/*/updates/ally /lib/firmware/ti/audio/tas2783/1954-*.bin.zst && depmod -a'
+RemainAfterExit=no
+
+[Install]
+WantedBy=emergency.target rescue.target
+EOF
+    fi
+    mkdir -p "$emergency_wants" "$rescue_wants"
+    ln -sf "$svc_file" "${emergency_wants}/ally-emergency-recovery.service"
+    ln -sf "$svc_file" "${rescue_wants}/ally-emergency-recovery.service"
+}
+install_emergency_guard
 
 log "Updating dependency map..."
 depmod -a

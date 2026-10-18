@@ -11,10 +11,8 @@ MODULE_FILE="${MODULE_NAME}.ko"
 MODULE_ZST="${MODULE_FILE}.zst"
 STUB_NAME="asus-wmi-stub"
 STUB_ZST="${STUB_NAME}.ko.zst"
-INSTALL_PATH="/lib/modules/$(uname -r)/kernel/drivers/hid/"
-TARGET_FILE="${INSTALL_PATH}/${MODULE_ZST}"
-STUB_TARGET="${INSTALL_PATH}/${STUB_ZST}"
-BACKUP_FILE="${TARGET_FILE}.bak"
+UPDATES_PATH="/lib/modules/$(uname -r)/updates/ally"
+TARGET_USER="${SUDO_USER:-$(whoami)}"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -41,82 +39,64 @@ fi
 
 # --- 2. Restoration Logic ---
 
-if [ -f "$BACKUP_FILE" ]; then
-    # Turn off LEDs while driver is still active
-    log "Turning off LED rings..."
-    for led_path in /sys/class/leds/*:rgb:joystick_rings/brightness; do
-        if [ -f "$led_path" ]; then
-            echo 0 > "$led_path" || warn "Could not turn off LED at $led_path"
-        fi
-    done
-
-    log "Restoring original driver from backup ($BACKUP_FILE)..."
-    cp -f "$BACKUP_FILE" "$TARGET_FILE"
-    rm -f "$BACKUP_FILE"
-    rm -f "$STUB_TARGET"
-
-    base_kdir="/lib/modules/$(uname -r)/kernel"
-    audio_mods=(
-        "sound/soc/amd/snd-acp-config.ko.zst"
-        "sound/soc/amd/acp/snd-soc-acpi-amd-match.ko.zst"
-        "sound/soc/sdw_utils/snd-soc-sdw-utils.ko.zst"
-        "sound/soc/codecs/snd-soc-tas2783-sdw.ko.zst"
-        "sound/soc/codecs/snd-soc-rt721-sdca.ko.zst"
-        "sound/soc/amd/acp/snd-acp-sdw-legacy-mach.ko.zst"
-        "sound/soc/amd/ps/snd-pci-ps.ko.zst"
-    )
-    for rel in "${audio_mods[@]}"; do
-        dst="${base_kdir}/${rel}"
-        bak="${dst}.bak"
-        if [ -f "$bak" ]; then
-            log "Restoring stock $rel from backup..."
-            cp -f "$bak" "$dst"
-            rm -f "$bak"
-        fi
-    done
-
-    fw_dir="/lib/firmware/ti/audio/tas2783"
-    for fw in 1954-1-0-0x8.bin.zst 1954-1-0-0xB.bin.zst 1954-0-0-0x8.bin.zst 1954-0-0-0xB.bin.zst; do
-        if [ -L "$fw_dir/$fw" ]; then
-            log "Removing firmware symlink $fw..."
-            rm -f "$fw_dir/$fw"
-        fi
-    done
-
-    log "Restoration complete."
-else
-    warn "No local backup found at $BACKUP_FILE."
-    
-    # Dynamic detection of owner package
-    OWNER_PKG=$(pacman -Qo "$TARGET_FILE" 2>/dev/null | awk '{print $(NF-1)}' || echo "")
-    
-    if [ -n "$OWNER_PKG" ]; then
-        log "Detected owner package: $OWNER_PKG"
-        DL_SIZE=$(pacman -Si "$OWNER_PKG" | grep "Download Size" | cut -d: -f2 | xargs || echo "unknown size")
-        
-        warn "The original driver file is missing or has been overwritten."
-        warn "To restore the OS to its original state, the parent package ($OWNER_PKG) needs to be reinstalled."
-        warn "Estimated download size: $DL_SIZE"
-        
-        read -p "Would you like to reinstall $OWNER_PKG now? (y/N) " confirm
-        if [[ $confirm =~ ^[Yy]$ ]]; then
-            log "Reinstalling $OWNER_PKG..."
-            pacman -S --noconfirm "$OWNER_PKG"
-        else
-            log "Skipping package reinstallation. The patched module will be removed, but the original will NOT be restored."
-            read -p "Remove the patched module anyway? (y/N) " confirm_remove
-            if [[ $confirm_remove =~ ^[Yy]$ ]]; then
-                rm -f "$TARGET_FILE"
-                rm -f "$STUB_TARGET"
-            else
-                log "Uninstallation cancelled."
-                exit 0
-            fi
-        fi
-    else
-        error "Could not determine owner package for $TARGET_FILE and no backup exists."
+# Turn off LEDs while driver is still active
+log "Turning off LED rings..."
+for led_path in /sys/class/leds/*:rgb:joystick_rings/brightness; do
+    if [ -f "$led_path" ]; then
+        echo 0 > "$led_path" 2>/dev/null || warn "Could not turn off LED at $led_path"
     fi
+done
+
+# Remove out-of-tree modules from updates/ally
+if [ -d "$UPDATES_PATH" ]; then
+    log "Removing out-of-tree modules from $UPDATES_PATH..."
+    rm -rf "$UPDATES_PATH"
 fi
+rm -rf /lib/modules/*/updates/ally 2>/dev/null || true
+
+# Restore stock kernel modules under /lib/modules/$(uname -r)/kernel/ if modified
+base_kdir="/lib/modules/$(uname -r)/kernel"
+stock_dir="/home/${TARGET_USER}/stock_modules"
+stock_files=(
+    "drivers/hid/hid-asus.ko.zst"
+    "sound/soc/amd/snd-acp-config.ko.zst"
+    "sound/soc/amd/acp/snd-soc-acpi-amd-match.ko.zst"
+    "sound/soc/sdw_utils/snd-soc-sdw-utils.ko.zst"
+    "sound/soc/codecs/snd-soc-tas2783-sdw.ko.zst"
+    "sound/soc/codecs/snd-soc-rt721-sdca.ko.zst"
+    "sound/soc/amd/acp/snd-acp-sdw-legacy-mach.ko.zst"
+    "sound/soc/amd/ps/snd-pci-ps.ko.zst"
+)
+for rel in "${stock_files[@]}"; do
+    dst="${base_kdir}/${rel}"
+    bak="${dst}.bak"
+    if [ -f "$bak" ]; then
+        log "Restoring stock $rel from backup..."
+        mv -f "$bak" "$dst"
+    elif [ -d "$stock_dir" ]; then
+        cand=$(find "$stock_dir" -type f -name "$(basename "$dst")" 2>/dev/null | head -n 1)
+        if [ -n "$cand" ] && [ -f "$cand" ]; then
+            log "Restoring pristine stock $rel from package extract..."
+            cp -f "$cand" "$dst"
+        fi
+    fi
+done
+rm -f "${base_kdir}/drivers/hid/asus-wmi-stub.ko.zst"
+
+# Remove TAS2783 firmware symlinks
+fw_dir="/lib/firmware/ti/audio/tas2783"
+for fw in 1954-1-0-0x8.bin.zst 1954-1-0-0xB.bin.zst 1954-0-0-0x8.bin.zst 1954-0-0-0xB.bin.zst; do
+    if [ -L "$fw_dir/$fw" ]; then
+        log "Removing firmware symlink $fw..."
+        rm -f "$fw_dir/$fw"
+    fi
+done
+
+# Remove emergency recovery guard service
+log "Removing emergency recovery guard service..."
+rm -f /etc/systemd/system/emergency.target.wants/ally-emergency-recovery.service \
+      /etc/systemd/system/rescue.target.wants/ally-emergency-recovery.service \
+      /etc/systemd/system/ally-emergency-recovery.service
 
 # --- 3. Remove Blacklist ---
 
