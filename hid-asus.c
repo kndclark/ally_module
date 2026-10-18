@@ -38,6 +38,7 @@
 #include <linux/stddef.h>
 #include <linux/sysfs.h>
 #include <linux/leds.h>
+#include <linux/unaligned.h>
 #include <linux/led-class-multicolor.h>
 
 #include "hid-ids.h"
@@ -167,26 +168,13 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 
 #define TRKID_SGN       ((TRKID_MAX + 1) >> 1)
 
-#define ALLY_DEVICE_ATTR_RO(_name, _sysfs_name)    \
-	struct device_attribute dev_attr_##_name = \
-		__ATTR(_sysfs_name, 0444, _name##_show, NULL)
-
-#define ALLY_DEVICE_ATTR_WO(_name, _sysfs_name)			\
-	struct device_attribute dev_attr_##_name =			\
+#define ALLY_DEVICE_ATTR_WO(_name, _sysfs_name)				\
+	struct device_attribute dev_attr_##_name =				\
 		__ATTR(_sysfs_name, 0200, NULL, _name##_store)
 
-#define ALLY_DEVICE_ATTR_RW(_name, _sysfs_name)			\
-	struct device_attribute dev_attr_##_name =			\
+#define ALLY_DEVICE_ATTR_RW(_name, _sysfs_name)				\
+	struct device_attribute dev_attr_##_name =				\
 		__ATTR(_sysfs_name, 0644, _name##_show, _name##_store)
-
-#define ALLY_DEVICE_CONST_ATTR_RO(fname, sysfs_name, value)		\
-	static ssize_t fname##_show(struct device *dev,				\
-				   struct device_attribute *attr, char *buf)	\
-	{									\
-		return sysfs_emit(buf, value);					\
-	}									\
-	struct device_attribute dev_attr_##fname =				\
-		__ATTR(sysfs_name, 0444, fname##_show, NULL)
 
 enum asus_work_action_type {
 	FN_LOCK_SYNC,
@@ -321,18 +309,23 @@ struct ally_turbo_config {
 	struct ally_btn_turbo_params btn_m1;
 };
 
-struct ally_btn_turbo_attr;
 struct button_remap_attr;
+struct ally_button_mapping;
 
 struct ally_btn_sysfs_entry {
 	struct attribute_group group;
 	struct attribute *attrs[8]; /* turbo + ranges + remap + macro + remap_index + NULL */
+	/*
+	 * The entries are created while hid_asus_ally_probe() is still running,
+	 * before asus_probe() publishes drvdata->rog_ally: carrying the shared
+	 * state pointer here avoids dereferencing that not-yet-assigned field.
+	 */
+	struct ally_handheld *ally;
 	struct ally_config *cfg;
 	struct hid_device *hdev;
 	enum ally_button_id btn;
 	struct device_attribute attr_turbo_period;
 	struct device_attribute attr_toggle_period;
-	struct ally_btn_turbo_attr *turbo_attr;
 	struct button_remap_attr *remap_attr;
 	struct button_remap_attr *macro_attr;
 	struct device_attribute attr_remap_index;
@@ -370,11 +363,11 @@ struct ally_config {
 	/* Vibration settings */
 	u8 vibration_intensity_left;
 	u8 vibration_intensity_right;
-	bool vibration_active;
 
 	struct ally_turbo_config turbo;
 	struct ally_btn_sysfs_entry *button_entries;
-	void *button_mappings; /* ally_button_mapping array indexed by gamepad_mode */
+	/* Button mappings for each gamepad mode, indexed by gamepad_mode */
+	struct ally_button_mapping *button_mappings;
 
 	struct ally_joystick_resp_curve left_curve;
 	struct ally_joystick_resp_curve right_curve;
@@ -400,6 +393,12 @@ struct ff_report {
 struct ally_handheld {
 	/* All read/write to IN interfaces must lock */
 	struct mutex intf_mutex;
+	/*
+	 * USB device of the connected controller, held with a reference:
+	 * at most one ROG Ally can exist, so probes from any other USB
+	 * device are rejected to protect the shared state.
+	 */
+	struct usb_device *udev;
 	struct hid_device *cfg_hdev;
 
 	struct input_dev *ally_x_input;
@@ -756,9 +755,14 @@ static_assert(sizeof(struct ff_report) == sizeof(ALLY_FORCE_FEEDBACK_OFF));
  * ally_handheld structure to share state across these separate HID interfaces.
  */
 static void ally_resume_work_fn(struct work_struct *work);
+static void ally_x_ff_work_fn(struct work_struct *work);
 
-/* Changes to ally_drvdata must lock */
-static DEFINE_MUTEX(ally_data_mutex);
+/*
+ * Changes to ally_drvdata must lock: the raw_event callbacks, which may
+ * run in atomic (URB completion) context, also take this lock, so it must
+ * be a spinlock.
+ */
+static DEFINE_SPINLOCK(ally_data_lock);
 static struct ally_handheld ally_drvdata = {
 	.intf_mutex = __MUTEX_INITIALIZER(ally_drvdata.intf_mutex),
 	/*
@@ -767,7 +771,39 @@ static struct ally_handheld ally_drvdata = {
 	 */
 	.resume_work = __DELAYED_WORK_INITIALIZER(ally_drvdata.resume_work,
 						  ally_resume_work_fn, 0),
+	/*
+	 * Initialised statically for the same reason as resume_work: remove()
+	 * drains the work whichever of the interfaces probed or failed to
+	 * probe, so it must be safe to cancel unconditionally.
+	 */
+	.ff_work = __WORK_INITIALIZER(ally_drvdata.ff_work, ally_x_ff_work_fn),
+	.ff_lock = __SPIN_LOCK_UNLOCKED(ally_drvdata.ff_lock),
 };
+
+/*
+ * Drop the recorded USB device if no Ally interface is bound anymore:
+ * probe failures never run remove(), so without this cleanup a failed
+ * probe would leave a stale record behind and the driver would then
+ * reject the real controller when it reconnects.
+ */
+static void ally_put_udev_if_orphaned(void)
+{
+	struct usb_device *udev;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ally_data_lock, flags);
+	if (!ally_drvdata.udev || ally_drvdata.keyboard_hdev ||
+	    ally_drvdata.cfg_hdev || ally_drvdata.ally_x_hdev) {
+		spin_unlock_irqrestore(&ally_data_lock, flags);
+		return;
+	}
+
+	udev = ally_drvdata.udev;
+	ally_drvdata.udev = NULL;
+	spin_unlock_irqrestore(&ally_data_lock, flags);
+
+	usb_put_dev(udev);
+}
 
 static const u8 asus_report_id_init[] = {
 	FEATURE_KBD_REPORT_ID,
@@ -796,24 +832,33 @@ static void ally_resume_work_fn(struct work_struct *work)
 	struct ally_handheld *ally = container_of(work, struct ally_handheld,
 						  resume_work.work);
 	struct input_dev *keyboard_input, *x_input;
+	unsigned long flags;
 
 	/*
-	 * Test the very pointers that get dereferenced: probe sets
-	 * keyboard_hdev even when the interface exposes no input_dev, and
-	 * removal clears the two fields one after the other.
+	 * Snapshot the very pointers that get dereferenced under the lock
+	 * protecting them, and take a reference on each input_dev: probe
+	 * sets keyboard_hdev even when the interface exposes no input_dev,
+	 * removal clears the two fields one after the other, and the input
+	 * devices are freed with their own interface.
 	 */
-	keyboard_input = READ_ONCE(ally->keyboard_input);
-	x_input = READ_ONCE(ally->ally_x_input);
+	spin_lock_irqsave(&ally_data_lock, flags);
+	keyboard_input = input_get_device(ally->keyboard_input);
+	x_input = input_get_device(ally->ally_x_input);
+	spin_unlock_irqrestore(&ally_data_lock, flags);
 
-	/* Force release all vendor buttons to prevent "stuck" ghosting on resume
-	 * (workaround for Ally X USB re-probing during suspend/resume)
+	/*
+	 * Force release all vendor buttons to prevent "stuck" ghosting on
+	 * resume (workaround for Ally X USB re-probing during suspend/resume).
 	 */
 	if (keyboard_input) {
 		input_report_key(keyboard_input, KEY_F16, 0);
 		input_report_key(keyboard_input, KEY_F17, 0);
 		input_report_key(keyboard_input, KEY_F18, 0);
+		input_report_key(keyboard_input, KEY_F19, 0);
+		input_report_key(keyboard_input, KEY_F20, 0);
 		input_report_key(keyboard_input, KEY_PROG1, 0);
 		input_sync(keyboard_input);
+		input_put_device(keyboard_input);
 	}
 
 	if (x_input) {
@@ -822,11 +867,12 @@ static void ally_resume_work_fn(struct work_struct *work)
 		input_report_key(x_input, KEY_F18, 0);
 		input_report_key(x_input, KEY_PROG1, 0);
 		input_sync(x_input);
+		input_put_device(x_input);
 	}
 }
 
 /**
- * handle_ctrl_alt_del() - detect a left button long press.
+ * handle_ctrl_alt_del() - detect a left button long press
  * @hdev: HID device the report arrived on
  * @ally: ally handheld structure holding the sequence state
  * @data: raw report buffer, rewritten in place when the sequence matches
@@ -896,6 +942,7 @@ static bool handle_ally_event(struct hid_device *hdev, struct ally_handheld *all
 			      u8 *data, int size)
 {
 	struct input_dev *keyboard_input;
+	unsigned long flags;
 	int keycode = 0;
 
 	if (size < 2)
@@ -919,43 +966,50 @@ static bool handle_ally_event(struct hid_device *hdev, struct ally_handheld *all
 			return false;
 		}
 
-		scoped_guard(mutex, &ally_data_mutex) {
-			keyboard_input = ally->keyboard_input;
-			if (keyboard_input) {
-				input_report_key(keyboard_input, keycode, 1);
-				input_sync(keyboard_input);
-				input_report_key(keyboard_input, keycode, 0);
-				input_sync(keyboard_input);
-				return true;
-			}
-		}
+		/*
+		 * Take a reference on the input_dev before dropping the lock:
+		 * the keyboard interface can be unbound concurrently, and its
+		 * input_dev is freed with it.
+		 */
+		spin_lock_irqsave(&ally_data_lock, flags);
+		keyboard_input = input_get_device(ally->keyboard_input);
+		spin_unlock_irqrestore(&ally_data_lock, flags);
+
+		if (!keyboard_input)
+			return false;
+
+		input_report_key(keyboard_input, keycode, 1);
+		input_sync(keyboard_input);
+		input_report_key(keyboard_input, keycode, 0);
+		input_sync(keyboard_input);
+		input_put_device(keyboard_input);
+		return true;
 	}
 	return false;
 }
 
 /**
- * ally_gamepad_send_packet() - Send a raw packet to the gamepad device.
- *
+ * ally_gamepad_send_packet() - Send a raw packet to the gamepad device
  * @ally: ally handheld structure
- * @hdev: hid device
- * @buf: Buffer containing the packet data
- * @len: Length of data to send
+ * @hdev: HID device
+ * @buf: buffer containing the packet data
+ * @len: length of data to send
  *
  * Return: count of data transferred, negative if error
  */
 static int ally_gamepad_send_packet(struct ally_handheld *ally,
-			     struct hid_device *hdev, const u8 *buf, size_t len)
+				    struct hid_device *hdev, const u8 *buf, size_t len)
 {
-	scoped_guard(mutex, &ally->intf_mutex)
-		return ally_dev_set_report(hdev, buf, len);
+	guard(mutex)(&ally->intf_mutex);
+	return ally_dev_set_report(hdev, buf, len);
 }
 
 /**
- * ally_gamepad_send_receive_packet() - Send a packet and receive the response.
+ * ally_gamepad_send_receive_packet() - Send a packet and receive the response
  * @ally: ally handheld structure
- * @hdev: hid device
- * @buf: Buffer containing the packet data to send and receive response in
- * @len: Length of buffer
+ * @hdev: HID device
+ * @buf: buffer containing the packet data to send and receive response in
+ * @len: length of buffer
  *
  * Return: count of data transferred, negative if error
  */
@@ -985,8 +1039,8 @@ static int ally_gamepad_send_receive_packet(struct ally_handheld *ally,
  * The constructed buffer is 64 bytes long, and it is the caller
  * responsibility to free the buffer using kfree().
  *
- * Returns the pointer of newly allocated buffer containing the command,
- * or NULL on allocation failure.
+ * Return: the newly allocated buffer containing the command, or NULL on
+ * allocation failure
  */
 static u8 *ally_alloc_cmd(u8 cmd, const u8 *payload, u8 payload_size)
 {
@@ -1007,37 +1061,33 @@ static u8 *ally_alloc_cmd(u8 cmd, const u8 *payload, u8 payload_size)
 }
 
 /**
- * ally_check_capability - Check if a specific capability is supported
+ * ally_check_capability() - Check if a specific capability is supported
  * @hdev: HID device
  * @ally: ally handheld structure
- * @check_cmd: Capability command code to query
+ * @check_cmd: capability command code to query
  *
- * Returns true if capability is supported, false otherwise
+ * Return: true if the capability is supported, false otherwise
  */
 static bool ally_check_capability(struct hid_device *hdev, struct ally_handheld *ally,
 				  enum ally_command_codes check_cmd)
 {
 	u8 payload[] = { 0x00 };
-	bool result = false;
 	int ret;
 
 	u8 *buf __free(kfree) = ally_alloc_cmd(check_cmd, payload, sizeof(payload));
 	if (!buf) {
 		hid_err(hdev, "Failed to allocate buffer for capability check.\n");
-		goto ally_check_capability_err;
+		return false;
 	}
 
 	ret = ally_gamepad_send_receive_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
 	if (ret < 0) {
 		hid_err(hdev, "Failed to check capability 0x%02x: %d\n", check_cmd, ret);
-		goto ally_check_capability_err;
+		return false;
 	}
 
-	if (buf[1] == HID_ALLY_FEATURE_CODE_PAGE && buf[2] == check_cmd)
-		result = (buf[4] == 0x01);
-
-ally_check_capability_err:
-	return result;
+	return buf[1] == HID_ALLY_FEATURE_CODE_PAGE && buf[2] == check_cmd &&
+	       buf[4] == 0x01;
 }
 
 static int ally_detect_capabilities(struct hid_device *hdev, struct ally_handheld *ally,
@@ -1069,6 +1119,7 @@ static int ally_detect_capabilities(struct hid_device *hdev, struct ally_handhel
 }
 
 static int ally_set_xbox_controller(struct hid_device *hdev,
+				    struct ally_handheld *ally,
 				    struct ally_config *cfg, bool enabled)
 {
 	u8 payload[] = { enabled ? 0x01 : 0x00 };
@@ -1081,7 +1132,7 @@ static int ally_set_xbox_controller(struct hid_device *hdev,
 	if (!buf)
 		return -ENOMEM;
 
-	ret = ally_dev_set_report(hdev, buf, ROG_ALLY_REPORT_SIZE);
+	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
 	if (ret < 0) {
 		hid_err(hdev, "Failed to set Xbox controller mode: %d\n", ret);
 		return ret;
@@ -1089,6 +1140,32 @@ static int ally_set_xbox_controller(struct hid_device *hdev,
 
 	cfg->xbox_controller_enabled = enabled;
 	return 0;
+}
+
+/**
+ * ally_get_config() - Get the configuration of the Ally device
+ * @ally: ally handheld structure
+ *
+ * Fetch the configuration published by hid_asus_ally_probe() under
+ * ally_data_lock: the pointer is also cleared by hid_asus_ally_remove(),
+ * so reading it without the lock would race with interface removal.
+ *
+ * The returned configuration outlives the sysfs callbacks using it: it is
+ * devm-managed on the same device as the sysfs attributes, which are
+ * removed before the memory is released.
+ *
+ * Return: the ally config, or NULL if no configuration is published
+ */
+static struct ally_config *ally_get_config(struct ally_handheld *ally)
+{
+	struct ally_config *cfg;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ally_data_lock, flags);
+	cfg = ally->config;
+	spin_unlock_irqrestore(&ally_data_lock, flags);
+
+	return cfg;
 }
 
 static ssize_t xbox_controller_show(struct device *dev,
@@ -1099,10 +1176,15 @@ static ssize_t xbox_controller_show(struct device *dev,
 	struct ally_handheld *ally = drvdata->rog_ally;
 	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	cfg = ally->config;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
 	if (!cfg->xbox_controller_support)
 		return -ENODEV;
 
@@ -1120,18 +1202,23 @@ static ssize_t xbox_controller_store(struct device *dev,
 	bool enabled;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	cfg = ally->config;
-	if (!cfg->xbox_controller_support)
+	cfg = ally_get_config(ally);
+	if (!cfg)
 		return -ENODEV;
 
 	ret = kstrtobool(buf, &enabled);
 	if (ret)
 		return ret;
 
-	ret = ally_set_xbox_controller(hdev, cfg, enabled);
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->xbox_controller_support)
+		return -ENODEV;
+
+	ret = ally_set_xbox_controller(hdev, ally, cfg, enabled);
 	if (ret < 0)
 		return ret;
 
@@ -1141,21 +1228,17 @@ static ssize_t xbox_controller_store(struct device *dev,
 static DEVICE_ATTR_RW(xbox_controller);
 
 /**
- * ally_set_gamepad_mode - Set the gamepad operating mode
+ * ally_set_gamepad_mode() - Set the gamepad operating mode
  * @ally: ally handheld structure
  * @hdev: HID device
- * @mode: Gamepad mode to set
+ * @mode: gamepad mode to set
  *
- * Returns: 0 on success, negative on failure
+ * Return: 0 on success, negative errno on failure
  */
 static int ally_set_gamepad_mode(struct ally_handheld *ally, struct hid_device *hdev, u8 mode)
 {
-	struct ally_config *cfg = ally->config;
 	u8 payload[] = { mode };
 	int ret;
-
-	if (!cfg)
-		return -EINVAL;
 
 	if (mode < ALLY_GAMEPAD_MODE_GAMEPAD ||
 	    mode > ALLY_GAMEPAD_MODE_KEYBOARD) {
@@ -1167,7 +1250,7 @@ static int ally_set_gamepad_mode(struct ally_handheld *ally, struct hid_device *
 	if (!buf)
 		return -ENOMEM;
 
-	ret = ally_dev_set_report(hdev, buf, ROG_ALLY_REPORT_SIZE);
+	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
 	if (ret < 0) {
 		hid_err(hdev, "Failed to set gamepad mode: %d\n", ret);
 		return ret;
@@ -1193,23 +1276,23 @@ struct btn_code_map {
 static const struct btn_code_map ally_btn_codes[] = {
 	{ BTN_TYPE_NONE, 0x00, "NONE" },
 	/* Gamepad button codes */
-	{ BTN_TYPE_PAD, 0x01, "PAD_A" },
-	{ BTN_TYPE_PAD, 0x02, "PAD_B" },
-	{ BTN_TYPE_PAD, 0x03, "PAD_X" },
-	{ BTN_TYPE_PAD, 0x04, "PAD_Y" },
-	{ BTN_TYPE_PAD, 0x05, "PAD_LB" },
-	{ BTN_TYPE_PAD, 0x06, "PAD_RB" },
-	{ BTN_TYPE_PAD, 0x07, "PAD_LS" },
-	{ BTN_TYPE_PAD, 0x08, "PAD_RS" },
-	{ BTN_TYPE_PAD, 0x09, "PAD_DPAD_UP" },
-	{ BTN_TYPE_PAD, 0x0A, "PAD_DPAD_DOWN" },
-	{ BTN_TYPE_PAD, 0x0B, "PAD_DPAD_LEFT" },
-	{ BTN_TYPE_PAD, 0x0C, "PAD_DPAD_RIGHT" },
-	{ BTN_TYPE_PAD, 0x0D, "PAD_LT" },
-	{ BTN_TYPE_PAD, 0x0E, "PAD_RT" },
-	{ BTN_TYPE_PAD, 0x11, "PAD_VIEW" },
-	{ BTN_TYPE_PAD, 0x12, "PAD_MENU" },
-	{ BTN_TYPE_PAD, 0x13, "PAD_XBOX" },
+	{ BTN_TYPE_PAD, 0x01, "BTN_SOUTH" },
+	{ BTN_TYPE_PAD, 0x02, "BTN_EAST" },
+	{ BTN_TYPE_PAD, 0x03, "BTN_NORTH" },
+	{ BTN_TYPE_PAD, 0x04, "BTN_WEST" },
+	{ BTN_TYPE_PAD, 0x05, "BTN_TL" },
+	{ BTN_TYPE_PAD, 0x06, "BTN_TR" },
+	{ BTN_TYPE_PAD, 0x07, "BTN_THUMBL" },
+	{ BTN_TYPE_PAD, 0x08, "BTN_THUMBR" },
+	{ BTN_TYPE_PAD, 0x09, "ABS_HAT0Y_NEG" },
+	{ BTN_TYPE_PAD, 0x0A, "ABS_HAT0Y_POS" },
+	{ BTN_TYPE_PAD, 0x0B, "ABS_HAT0X_NEG" },
+	{ BTN_TYPE_PAD, 0x0C, "ABS_HAT0X_POS" },
+	{ BTN_TYPE_PAD, 0x0D, "ABS_Z" },
+	{ BTN_TYPE_PAD, 0x0E, "ABS_RZ" },
+	{ BTN_TYPE_PAD, 0x11, "BTN_SELECT" },
+	{ BTN_TYPE_PAD, 0x12, "BTN_START" },
+	{ BTN_TYPE_PAD, 0x13, "BTN_MODE" },
 
 	/* Keyboard button codes */
 	{ BTN_TYPE_KB, 0x8E, "FN_M2" },
@@ -1341,6 +1424,8 @@ static const struct btn_code_map ally_btn_codes[] = {
 
 static const size_t keymap_len = ARRAY_SIZE(ally_btn_codes);
 
+static const struct btn_code_map *find_button_by_name(const char *name);
+
 /* Button pair indexes for mapping commands */
 enum btn_pair_index {
 	BTN_PAIR_DPAD_UPDOWN    = 0x01,
@@ -1355,8 +1440,8 @@ enum btn_pair_index {
 };
 
 struct button_map {
-	struct btn_code_map *remap;
-	struct btn_code_map *macro;
+	const struct btn_code_map *remap;
+	const struct btn_code_map *macro;
 };
 
 struct button_pair_map {
@@ -1379,60 +1464,59 @@ static void ally_set_default_gamepad_mapping(struct ally_button_mapping *mapping
 	for (i = 0; i < 9; i++) {
 		map->button_pairs[i].pair_index = i + 1;
 		map->button_pairs[i].first.remap =
-			(struct btn_code_map *)&ally_btn_codes[0];
+			find_button_by_name("NONE");
 		map->button_pairs[i].first.macro =
-			(struct btn_code_map *)&ally_btn_codes[0];
+			find_button_by_name("NONE");
 		map->button_pairs[i].second.remap =
-			(struct btn_code_map *)&ally_btn_codes[0];
+			find_button_by_name("NONE");
 		map->button_pairs[i].second.macro =
-			(struct btn_code_map *)&ally_btn_codes[0];
+			find_button_by_name("NONE");
 	}
 
-	/* Set direct mappings using array indices */
 	map->button_pairs[BTN_PAIR_AB - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[1]; /* PAD_A */
+		find_button_by_name("BTN_SOUTH");
 	map->button_pairs[BTN_PAIR_AB - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[2]; /* PAD_B */
+		find_button_by_name("BTN_EAST");
 
 	map->button_pairs[BTN_PAIR_XY - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[3]; /* PAD_X */
+		find_button_by_name("BTN_NORTH");
 	map->button_pairs[BTN_PAIR_XY - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[4]; /* PAD_Y */
+		find_button_by_name("BTN_WEST");
 
 	map->button_pairs[BTN_PAIR_BUMPER_LR - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[5]; /* PAD_LB */
+		find_button_by_name("BTN_TL");
 	map->button_pairs[BTN_PAIR_BUMPER_LR - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[6]; /* PAD_RB */
+		find_button_by_name("BTN_TR");
 
 	map->button_pairs[BTN_PAIR_STICK_LR - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[7]; /* PAD_LS */
+		find_button_by_name("BTN_THUMBL");
 	map->button_pairs[BTN_PAIR_STICK_LR - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[8]; /* PAD_RS */
+		find_button_by_name("BTN_THUMBR");
 
 	map->button_pairs[BTN_PAIR_DPAD_UPDOWN - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[9]; /* PAD_DPAD_UP */
+		find_button_by_name("ABS_HAT0Y_NEG");
 	map->button_pairs[BTN_PAIR_DPAD_UPDOWN - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[10]; /* PAD_DPAD_DOWN */
+		find_button_by_name("ABS_HAT0Y_POS");
 
 	map->button_pairs[BTN_PAIR_DPAD_LEFTRIGHT - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[11]; /* PAD_DPAD_LEFT */
+		find_button_by_name("ABS_HAT0X_NEG");
 	map->button_pairs[BTN_PAIR_DPAD_LEFTRIGHT - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[12]; /* PAD_DPAD_RIGHT */
+		find_button_by_name("ABS_HAT0X_POS");
 
 	map->button_pairs[BTN_PAIR_TRIGGER_LR - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[13]; /* PAD_LT */
+		find_button_by_name("ABS_Z");
 	map->button_pairs[BTN_PAIR_TRIGGER_LR - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[14]; /* PAD_RT */
+		find_button_by_name("ABS_RZ");
 
 	map->button_pairs[BTN_PAIR_VIEW_MENU - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[15]; /* PAD_VIEW */
+		find_button_by_name("BTN_SELECT");
 	map->button_pairs[BTN_PAIR_VIEW_MENU - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[16]; /* PAD_MENU */
+		find_button_by_name("BTN_START");
 
 	map->button_pairs[BTN_PAIR_M1M2 - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[18]; /* FN_M2 */
+		find_button_by_name("FN_M2");
 	map->button_pairs[BTN_PAIR_M1M2 - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[19]; /* FN_M1 */
+		find_button_by_name("FN_M1");
 }
 
 static void ally_set_default_keyboard_mapping(struct ally_button_mapping *mappings)
@@ -1444,13 +1528,13 @@ static void ally_set_default_keyboard_mapping(struct ally_button_mapping *mappin
 	for (i = 0; i < 9; i++) {
 		map->button_pairs[i].pair_index = i + 1;
 		map->button_pairs[i].first.remap =
-			(struct btn_code_map *)&ally_btn_codes[0];
+			find_button_by_name("NONE");
 		map->button_pairs[i].first.macro =
-			(struct btn_code_map *)&ally_btn_codes[0];
+			find_button_by_name("NONE");
 		map->button_pairs[i].second.remap =
-			(struct btn_code_map *)&ally_btn_codes[0];
+			find_button_by_name("NONE");
 		map->button_pairs[i].second.macro =
-			(struct btn_code_map *)&ally_btn_codes[0];
+			find_button_by_name("NONE");
 	}
 
 	/*
@@ -1458,41 +1542,41 @@ static void ally_set_default_keyboard_mapping(struct ally_button_mapping *mappin
 	 * Buttons not listed here (dpad, view, menu) remain NONE.
 	 */
 
-	/* btn_a => KB_SPACE, btn_b => KB_E */
+	/* btn_a => KEY_SPACE, btn_b => KEY_E */
 	map->button_pairs[BTN_PAIR_AB - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[91]; /* KB_SPACE */
+		find_button_by_name("KEY_SPACE");
 	map->button_pairs[BTN_PAIR_AB - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[53]; /* KB_E */
+		find_button_by_name("KEY_E");
 
-	/* btn_x => KB_R, btn_y => KB_F */
+	/* btn_x => KEY_R, btn_y => KEY_F */
 	map->button_pairs[BTN_PAIR_XY - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[54]; /* KB_R */
+		find_button_by_name("KEY_R");
 	map->button_pairs[BTN_PAIR_XY - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[68]; /* KB_F */
+		find_button_by_name("KEY_F");
 
-	/* LB => MOUSE_WHEEL_UP, RB => MOUSE_WHEEL_DOWN */
+	/* LB => wheel up, RB => wheel down */
 	map->button_pairs[BTN_PAIR_BUMPER_LR - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[128]; /* MOUSE_WHEEL_UP */
+		find_button_by_name("REL_WHEEL_HI_RES_UP");
 	map->button_pairs[BTN_PAIR_BUMPER_LR - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[129]; /* MOUSE_WHEEL_DOWN */
+		find_button_by_name("REL_WHEEL_HI_RES_DOWN");
 
-	/* left stick click => MOUSE_LCLICK, right stick click => KB_LSHIFT */
+	/* left stick click => left click, right stick click => left shift */
 	map->button_pairs[BTN_PAIR_STICK_LR - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[125]; /* MOUSE_LCLICK */
+		find_button_by_name("BTN_LEFT");
 	map->button_pairs[BTN_PAIR_STICK_LR - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[77]; /* KB_LSHIFT */
+		find_button_by_name("KEY_LEFTSHIFT");
 
-	/* LT => MOUSE_LCLICK, RT => MOUSE_RCLICK */
+	/* LT => left click, RT => right click */
 	map->button_pairs[BTN_PAIR_TRIGGER_LR - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[125]; /* MOUSE_LCLICK */
+		find_button_by_name("BTN_LEFT");
 	map->button_pairs[BTN_PAIR_TRIGGER_LR - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[126]; /* MOUSE_RCLICK */
+		find_button_by_name("BTN_RIGHT");
 
 	/* M2 => FN_M2, M1 => FN_M1 */
 	map->button_pairs[BTN_PAIR_M1M2 - 1].first.remap =
-		(struct btn_code_map *)&ally_btn_codes[18]; /* FN_M2 */
+		find_button_by_name("FN_M2");
 	map->button_pairs[BTN_PAIR_M1M2 - 1].second.remap =
-		(struct btn_code_map *)&ally_btn_codes[19]; /* FN_M1 */
+		find_button_by_name("FN_M1");
 }
 
 static ssize_t gamepad_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -1504,10 +1588,15 @@ static ssize_t gamepad_mode_show(struct device *dev, struct device_attribute *at
 	u8 mode_byte;
 	int i;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	cfg = ally->config;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
 	mode_byte = cfg->gamepad_mode;
 
 	for (i = 0; i < ARRAY_SIZE(ally_gamepad_mode); i++) {
@@ -1529,10 +1618,12 @@ static ssize_t gamepad_mode_store(struct device *dev, struct device_attribute *a
 	int mode;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	cfg = ally->config;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
 
 	mode = sysfs_match_string(ally_gamepad_mode_text, buf);
 	if (mode < 0) {
@@ -1545,30 +1636,30 @@ static ssize_t gamepad_mode_store(struct device *dev, struct device_attribute *a
 	 */
 	mode_byte = ally_gamepad_mode[mode];
 
+	guard(mutex)(&cfg->config_mutex);
+
 	ret = ally_set_gamepad_mode(ally, hdev, mode_byte);
 	if (ret < 0)
 		return ret;
 
-	scoped_guard(mutex, &cfg->config_mutex) {
-		cfg->gamepad_mode = mode_byte;
+	cfg->gamepad_mode = mode_byte;
 
-		/*
-		 * When the gamepad mode changes, the hardware automatically
-		 * resets all button mappings to its internal defaults for the
-		 * new mode.
-		 *
-		 * Refresh the software cache so that subsequent
-		 * reads from sysfs reflect what the firmware is actually
-		 * using.
-		 */
-		if (cfg->button_mappings) {
-			struct ally_button_mapping *mappings = cfg->button_mappings;
+	/*
+	 * When the gamepad mode changes, the hardware automatically
+	 * resets all button mappings to its internal defaults for the
+	 * new mode.
+	 *
+	 * Refresh the software cache so that subsequent
+	 * reads from sysfs reflect what the firmware is actually
+	 * using.
+	 */
+	if (cfg->button_mappings) {
+		struct ally_button_mapping *mappings = cfg->button_mappings;
 
-			if (mode_byte == ALLY_GAMEPAD_MODE_GAMEPAD)
-				ally_set_default_gamepad_mapping(mappings);
-			else if (mode_byte == ALLY_GAMEPAD_MODE_KEYBOARD)
-				ally_set_default_keyboard_mapping(mappings);
-		}
+		if (mode_byte == ALLY_GAMEPAD_MODE_GAMEPAD)
+			ally_set_default_gamepad_mapping(mappings);
+		else if (mode_byte == ALLY_GAMEPAD_MODE_KEYBOARD)
+			ally_set_default_keyboard_mapping(mappings);
 	}
 
 	hid_dbg(hdev, "Set gamepad mode to %s\n", ally_gamepad_mode_text[mode]);
@@ -1577,8 +1668,8 @@ static ssize_t gamepad_mode_store(struct device *dev, struct device_attribute *a
 }
 
 static ssize_t gamepad_mode_index_show(struct device *dev,
-					    struct device_attribute *attr,
-					    char *buf)
+				       struct device_attribute *attr,
+				       char *buf)
 {
 	int i;
 	ssize_t len = 0;
@@ -1599,26 +1690,38 @@ static ssize_t gamepad_mode_index_show(struct device *dev,
 static DEVICE_ATTR_RW(gamepad_mode);
 static DEVICE_ATTR_RO(gamepad_mode_index);
 
-static int ally_set_default_gamepad_mode(struct hid_device *hdev,
-					 struct ally_handheld *ally,
-					 struct ally_config *cfg)
+/**
+ * ally_apply_gamepad_mode() - Re-send the recorded gamepad mode to the hardware
+ * @hdev: HID device
+ * @ally: ally handheld structure
+ * @cfg: ally config
+ *
+ * Re-send the gamepad mode currently recorded in the configuration to the
+ * hardware: during probe that is the default mode, while a reset resume
+ * restores whatever the user last wrote instead of overwriting it. The
+ * shared state is accessed under the lock, as sysfs is already live.
+ *
+ * Return: 0 on success, negative errno on failure
+ */
+static int ally_apply_gamepad_mode(struct hid_device *hdev,
+				   struct ally_handheld *ally,
+				   struct ally_config *cfg)
 {
-	cfg->gamepad_mode = ALLY_GAMEPAD_MODE_GAMEPAD;
-
-	return ally_set_gamepad_mode(ally, hdev, cfg->gamepad_mode);
+	scoped_guard(mutex, &cfg->config_mutex)
+		return ally_set_gamepad_mode(ally, hdev, cfg->gamepad_mode);
 }
 
 /**
  * ally_set_vibration_intensity() - Set vibration intensity values
+ * @ally: ally handheld structure
  * @hdev: HID device
- * @cfg: Ally config
  * @left: Left motor intensity (0-100)
  * @right: Right motor intensity (0-100)
  *
- * Returns 0 on success, negative error code on failure
+ * Return: 0 on success, negative errno on failure
  */
-static int ally_set_vibration_intensity(struct hid_device *hdev, struct ally_config *cfg,
-					u8 left, u8 right)
+static int ally_set_vibration_intensity(struct ally_handheld *ally,
+					struct hid_device *hdev, u8 left, u8 right)
 {
 	const u8 data[] = { left, right };
 	int ret;
@@ -1627,7 +1730,7 @@ static int ally_set_vibration_intensity(struct hid_device *hdev, struct ally_con
 	if (!buf)
 		return -ENOMEM;
 
-	ret = ally_dev_set_report(hdev, buf, ROG_ALLY_REPORT_SIZE);
+	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
 	if (ret < 0) {
 		hid_err(hdev, "Failed to set vibration intensity: %d\n", ret);
 		return ret;
@@ -1637,23 +1740,27 @@ static int ally_set_vibration_intensity(struct hid_device *hdev, struct ally_con
 }
 
 static ssize_t left_vibration_intensity_show(struct device *dev, struct device_attribute *attr,
-					char *buf)
+					     char *buf)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *ally = drvdata->rog_ally;
 	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	cfg = ally->config;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
 
 	return sysfs_emit(buf, "%u\n", cfg->vibration_intensity_left);
 }
 
 static ssize_t left_vibration_intensity_store(struct device *dev, struct device_attribute *attr,
-					 const char *buf, size_t count)
+					      const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
@@ -1662,21 +1769,25 @@ static ssize_t left_vibration_intensity_store(struct device *dev, struct device_
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	cfg = ally->config;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value > 100)
 		return -EINVAL;
 
-	ret = ally_set_vibration_intensity(hdev, cfg, value, cfg->vibration_intensity_right);
+	guard(mutex)(&cfg->config_mutex);
+
+	ret = ally_set_vibration_intensity(ally, hdev, value,
+					   cfg->vibration_intensity_right);
 	if (ret < 0)
 		return ret;
 
-	scoped_guard(mutex, &cfg->config_mutex)
-		cfg->vibration_intensity_left = value;
+	cfg->vibration_intensity_left = value;
 
 	return count;
 }
@@ -1688,23 +1799,27 @@ static ssize_t left_vibration_intensity_range_show(struct device *dev,
 }
 
 static ssize_t right_vibration_intensity_show(struct device *dev, struct device_attribute *attr,
-					char *buf)
+					      char *buf)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *ally = drvdata->rog_ally;
 	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	cfg = ally->config;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
 
 	return sysfs_emit(buf, "%u\n", cfg->vibration_intensity_right);
 }
 
 static ssize_t right_vibration_intensity_store(struct device *dev, struct device_attribute *attr,
-					 const char *buf, size_t count)
+					       const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
@@ -1713,21 +1828,25 @@ static ssize_t right_vibration_intensity_store(struct device *dev, struct device
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	cfg = ally->config;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value > 100)
 		return -EINVAL;
 
-	ret = ally_set_vibration_intensity(hdev, cfg, cfg->vibration_intensity_left, value);
+	guard(mutex)(&cfg->config_mutex);
+
+	ret = ally_set_vibration_intensity(ally, hdev,
+					   cfg->vibration_intensity_left, value);
 	if (ret < 0)
 		return ret;
 
-	scoped_guard(mutex, &cfg->config_mutex)
-		cfg->vibration_intensity_right = value;
+	cfg->vibration_intensity_right = value;
 
 	return count;
 }
@@ -1752,33 +1871,31 @@ static struct device_attribute dev_attr_right_vibration_intensity_range =
 
 /**
  * ally_set_joystick_thresholds() - Generic function to set joystick ranges
- *
- * This function send the command to set both inner and outer threshold for
- * the left and right joysticks.
- *
+ * @ally: ally handheld structure
  * @hdev: HID device
- * @cfg: Ally config
+ * @cfg: ally config
  * @left_it: inner threshold (deadzone) of the left stick (0-50)
  * @left_ot: outer threshold of the left stick (70-100)
  * @right_it: inner threshold (deadzone) of the right stick (0-50)
  * @right_ot: outer threshold of the right stick (70-100)
  *
- * Returns 0 on success, negative error code on failure
+ * This function sends the command to set both inner and outer threshold
+ * for the left and right joysticks.
+ *
+ * Return: 0 on success, negative errno on failure
  */
-static int ally_set_joystick_thresholds(struct hid_device *hdev, struct ally_config *cfg,
+static int ally_set_joystick_thresholds(struct ally_handheld *ally,
+					struct hid_device *hdev, struct ally_config *cfg,
 					u8 left_it, u8 left_ot, u8 right_it, u8 right_ot)
 {
-	u8 payload[] = { left_it, left_ot, right_it, right_ot };
+	const u8 payload[] = { left_it, left_ot, right_it, right_ot };
 	int ret;
-
-	if (!cfg->xbox_controller_support)
-		return -ENODEV;
 
 	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_JOYSTICK_DEADZONE, payload, sizeof(payload));
 	if (!buf)
 		return -ENOMEM;
 
-	ret = ally_dev_set_report(hdev, buf, ROG_ALLY_REPORT_SIZE);
+	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
 	if (ret < 0) {
 		hid_err(hdev, "Failed to set joystick ranges: %d\n", ret);
 		return ret;
@@ -1788,96 +1905,134 @@ static int ally_set_joystick_thresholds(struct hid_device *hdev, struct ally_con
 }
 
 static ssize_t left_joystick_inner_threshold_show(struct device *dev, struct device_attribute *attr,
-				      char *buf)
+						  char *buf)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	return sysfs_emit(buf, "%u\n", ally->config->left_deadzone);
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	return sysfs_emit(buf, "%u\n", cfg->left_deadzone);
 }
 
 static ssize_t left_joystick_inner_threshold_store(struct device *dev,
-				       struct device_attribute *attr,
-				       const char *buf, size_t count)
+						   struct device_attribute *attr,
+						   const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
+		return -ENODEV;
+
+	cfg = ally_get_config(ally);
+	if (!cfg)
 		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value > 50)
 		return -EINVAL;
 
-	ret = ally_set_joystick_thresholds(hdev, ally->config,
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	ret = ally_set_joystick_thresholds(ally, hdev, cfg,
 					   value,
-					   ally->config->left_outer_threshold,
-					   ally->config->right_deadzone,
-					   ally->config->right_outer_threshold);
+					   cfg->left_outer_threshold,
+					   cfg->right_deadzone,
+					   cfg->right_outer_threshold);
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &ally->config->config_mutex)
-		ally->config->left_deadzone = value;
+	cfg->left_deadzone = value;
 
 	return count;
 }
 
 static ssize_t left_joystick_inner_threshold_range_show(struct device *dev,
-							 struct device_attribute *attr,
-							 char *buf)
+							struct device_attribute *attr,
+							char *buf)
 {
 	return sysfs_emit(buf, "0 50\n");
 }
 
 static ssize_t left_joystick_outer_threshold_show(struct device *dev, struct device_attribute *attr,
-				      char *buf)
+						  char *buf)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	return sysfs_emit(buf, "%u\n", ally->config->left_outer_threshold);
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	return sysfs_emit(buf, "%u\n", cfg->left_outer_threshold);
 }
 
 static ssize_t left_joystick_outer_threshold_store(struct device *dev,
-				       struct device_attribute *attr,
-				       const char *buf, size_t count)
+						   struct device_attribute *attr,
+						   const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
+		return -ENODEV;
+
+	cfg = ally_get_config(ally);
+	if (!cfg)
 		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value < 70 || value > 100)
 		return -EINVAL;
 
-	ret = ally_set_joystick_thresholds(hdev, ally->config,
-					   ally->config->left_deadzone,
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	ret = ally_set_joystick_thresholds(ally, hdev, cfg,
+					   cfg->left_deadzone,
 					   value,
-					   ally->config->right_deadzone,
-					   ally->config->right_outer_threshold);
+					   cfg->right_deadzone,
+					   cfg->right_outer_threshold);
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &ally->config->config_mutex)
-		ally->config->left_outer_threshold = value;
+	cfg->left_outer_threshold = value;
 
 	return count;
 }
@@ -1896,47 +2051,66 @@ static ssize_t right_joystick_inner_threshold_show(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	return sysfs_emit(buf, "%u\n", ally->config->right_deadzone);
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	return sysfs_emit(buf, "%u\n", cfg->right_deadzone);
 }
 
 static ssize_t right_joystick_inner_threshold_store(struct device *dev,
-				       struct device_attribute *attr,
-				       const char *buf, size_t count)
+						    struct device_attribute *attr,
+						    const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
+		return -ENODEV;
+
+	cfg = ally_get_config(ally);
+	if (!cfg)
 		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value > 50)
 		return -EINVAL;
 
-	ret = ally_set_joystick_thresholds(hdev, ally->config,
-					   ally->config->left_deadzone,
-					   ally->config->left_outer_threshold,
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	ret = ally_set_joystick_thresholds(ally, hdev, cfg,
+					   cfg->left_deadzone,
+					   cfg->left_outer_threshold,
 					   value,
-					   ally->config->right_outer_threshold);
+					   cfg->right_outer_threshold);
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &ally->config->config_mutex)
-		ally->config->right_deadzone = value;
+	cfg->right_deadzone = value;
 
 	return count;
 }
 
 static ssize_t right_joystick_inner_threshold_range_show(struct device *dev,
-							  struct device_attribute *attr,
-							  char *buf)
+							 struct device_attribute *attr,
+							 char *buf)
 {
 	return sysfs_emit(buf, "0 50\n");
 }
@@ -1948,11 +2122,21 @@ static ssize_t right_joystick_outer_threshold_show(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	return sysfs_emit(buf, "%u\n", ally->config->right_outer_threshold);
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	return sysfs_emit(buf, "%u\n", cfg->right_outer_threshold);
 }
 
 static ssize_t right_joystick_outer_threshold_store(struct device *dev,
@@ -1962,26 +2146,35 @@ static ssize_t right_joystick_outer_threshold_store(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
+		return -ENODEV;
+
+	cfg = ally_get_config(ally);
+	if (!cfg)
 		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value < 70 || value > 100)
 		return -EINVAL;
 
-	ret = ally_set_joystick_thresholds(hdev, ally->config,
-					   ally->config->left_deadzone,
-					   ally->config->left_outer_threshold,
-					   ally->config->right_deadzone,
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	ret = ally_set_joystick_thresholds(ally, hdev, cfg,
+					   cfg->left_deadzone,
+					   cfg->left_outer_threshold,
+					   cfg->right_deadzone,
 					   value);
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &ally->config->config_mutex)
-		ally->config->right_outer_threshold = value;
+	cfg->right_outer_threshold = value;
 
 	return count;
 }
@@ -2022,30 +2215,32 @@ static struct device_attribute dev_attr_right_joystick_outer_threshold_range =
 	__ATTR(outer_threshold_range, 0444, right_joystick_outer_threshold_range_show, NULL);
 
 /**
- * ally_set_anti_deadzone - Set anti-deadzone values for joysticks
+ * ally_set_anti_deadzone() - Set anti-deadzone values for joysticks
+ * @ally: ally handheld structure
  * @hdev: HID device
- * @left_adz: Left joystick anti-deadzone value (0-100)
- * @right_adz: Right joystick anti-deadzone value (0-100)
+ * @cfg: ally config
+ * @left_adz: left joystick anti-deadzone value (0-100)
+ * @right_adz: right joystick anti-deadzone value (0-100)
  *
- * Return: 0 on success, negative on failure
+ * Return: 0 on success, negative errno on failure
  */
-static int ally_set_anti_deadzone(struct hid_device *hdev, u8 left_adz, u8 right_adz)
+static int ally_set_anti_deadzone(struct ally_handheld *ally,
+				  struct hid_device *hdev, struct ally_config *cfg,
+				  u8 left_adz, u8 right_adz)
 {
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
 	const u8 payload[] = { left_adz, right_adz };
 	int ret;
+
+	if (!cfg->anti_deadzone_support) {
+		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
+		return -EOPNOTSUPP;
+	}
 
 	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_ANTI_DEADZONE, payload, sizeof(payload));
 	if (!buf)
 		return -ENOMEM;
 
-	if (!ally->config->anti_deadzone_support) {
-		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
-		return -EOPNOTSUPP;
-	}
-
-	ret = ally_dev_set_report(hdev, buf, ROG_ALLY_REPORT_SIZE);
+	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
 	if (ret < 0) {
 		hid_err(hdev, "Failed to set anti-deadzone values: %d\n", ret);
 		return ret;
@@ -2060,16 +2255,23 @@ static ssize_t left_joystick_anti_deadzone_show(struct device *dev, struct devic
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	if (!ally->config->anti_deadzone_support) {
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->anti_deadzone_support) {
 		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
 		return -EOPNOTSUPP;
 	}
 
-	return sysfs_emit(buf, "%u\n", ally->config->left_anti_deadzone);
+	return sysfs_emit(buf, "%u\n", cfg->left_anti_deadzone);
 }
 
 static ssize_t left_joystick_anti_deadzone_store(struct device *dev, struct device_attribute *attr,
@@ -2078,90 +2280,109 @@ static ssize_t left_joystick_anti_deadzone_store(struct device *dev, struct devi
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	if (!ally->config->anti_deadzone_support) {
-		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
-		return -EOPNOTSUPP;
-	}
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value > 100)
 		return -EINVAL;
 
-	ret = ally_set_anti_deadzone(hdev, value, ally->config->right_anti_deadzone);
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->anti_deadzone_support) {
+		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
+		return -EOPNOTSUPP;
+	}
+
+	ret = ally_set_anti_deadzone(ally, hdev, cfg, value, cfg->right_anti_deadzone);
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &ally->config->config_mutex)
-		ally->config->left_anti_deadzone = value;
+	cfg->left_anti_deadzone = value;
 
 	return count;
 }
 
 static ssize_t left_joystick_anti_deadzone_range_show(struct device *dev,
-						       struct device_attribute *attr,
-						       char *buf)
+						      struct device_attribute *attr,
+						      char *buf)
 {
 	return sysfs_emit(buf, "0 100\n");
 }
 
 static ssize_t right_joystick_anti_deadzone_show(struct device *dev, struct device_attribute *attr,
-						char *buf)
+						 char *buf)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	if (!ally->config->anti_deadzone_support) {
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->anti_deadzone_support) {
 		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
 		return -EOPNOTSUPP;
 	}
 
-	return sysfs_emit(buf, "%u\n", ally->config->right_anti_deadzone);
+	return sysfs_emit(buf, "%u\n", cfg->right_anti_deadzone);
 }
 
 static ssize_t right_joystick_anti_deadzone_store(struct device *dev, struct device_attribute *attr,
-						 const char *buf, size_t count)
+						  const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	if (!ally->config->anti_deadzone_support) {
-		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
-		return -EOPNOTSUPP;
-	}
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value > 100)
 		return -EINVAL;
 
-	ret = ally_set_anti_deadzone(hdev, ally->config->left_anti_deadzone, value);
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->anti_deadzone_support) {
+		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
+		return -EOPNOTSUPP;
+	}
+
+	ret = ally_set_anti_deadzone(ally, hdev, cfg, cfg->left_anti_deadzone, value);
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &ally->config->config_mutex)
-		ally->config->right_anti_deadzone = value;
+	cfg->right_anti_deadzone = value;
 
 	return count;
 }
 
 static ssize_t right_joystick_anti_deadzone_range_show(struct device *dev,
-							struct device_attribute *attr,
-							char *buf)
+						       struct device_attribute *attr,
+						       char *buf)
 {
 	return sysfs_emit(buf, "0 100\n");
 }
@@ -2182,33 +2403,31 @@ static struct device_attribute dev_attr_right_joystick_anti_deadzone_range =
 
 /**
  * ally_set_trigger_ranges() - Generic function to set triggers ranges
- *
- * This function send the command to set both inner and outer threshold for
- * the left and right triggers.
- *
+ * @ally: ally handheld structure
  * @hdev: HID device
- * @cfg: Ally config
+ * @cfg: ally config
  * @left_it: lower limit of the left trigger range (0-50)
  * @left_ot: upper limit of the left trigger range (70-100)
  * @right_it: lower limit of the right trigger range (0-50)
  * @right_ot: upper limit of the right trigger range (70-100)
  *
- * Returns 0 on success, negative error code on failure
+ * This function sends the command to set both inner and outer threshold
+ * for the left and right triggers.
+ *
+ * Return: 0 on success, negative errno on failure
  */
-static int ally_set_trigger_ranges(struct hid_device *hdev, struct ally_config *cfg,
+static int ally_set_trigger_ranges(struct ally_handheld *ally,
+				   struct hid_device *hdev, struct ally_config *cfg,
 				   u8 left_it, u8 left_ot, u8 right_it, u8 right_ot)
 {
 	const u8 payload[] = { left_it, left_ot, right_it, right_ot };
 	int ret;
 
-	if (!cfg->xbox_controller_support)
-		return -ENODEV;
-
 	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_TRIGGER_RANGE, payload, sizeof(payload));
 	if (!buf)
 		return -ENOMEM;
 
-	ret = ally_dev_set_report(hdev, buf, ROG_ALLY_REPORT_SIZE);
+	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
 	if (ret < 0) {
 		hid_err(hdev, "Failed to set trigger ranges: %d\n", ret);
 		return ret;
@@ -2223,40 +2442,59 @@ static ssize_t left_trigger_range_lower_limit_show(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	return sysfs_emit(buf, "%u\n", ally->config->left_trigger_min);
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	return sysfs_emit(buf, "%u\n", cfg->left_trigger_min);
 }
 
 static ssize_t left_trigger_range_lower_limit_store(struct device *dev,
-				       struct device_attribute *attr,
-				       const char *buf, size_t count)
+						    struct device_attribute *attr,
+						    const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
+		return -ENODEV;
+
+	cfg = ally_get_config(ally);
+	if (!cfg)
 		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value > 50)
 		return -EINVAL;
 
-	ret = ally_set_trigger_ranges(hdev, ally->config,
-					   value,
-					   ally->config->left_trigger_max,
-					   ally->config->right_trigger_min,
-					   ally->config->right_trigger_max);
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	ret = ally_set_trigger_ranges(ally, hdev, cfg,
+				      value,
+				      cfg->left_trigger_max,
+				      cfg->right_trigger_min,
+				      cfg->right_trigger_max);
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &ally->config->config_mutex)
-		ally->config->left_trigger_min = value;
+	cfg->left_trigger_min = value;
 
 	return count;
 }
@@ -2274,47 +2512,66 @@ static ssize_t right_trigger_range_upper_limit_show(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	return sysfs_emit(buf, "%u\n", ally->config->right_trigger_max);
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	return sysfs_emit(buf, "%u\n", cfg->right_trigger_max);
 }
 
 static ssize_t right_trigger_range_upper_limit_store(struct device *dev,
-				       struct device_attribute *attr,
-				       const char *buf, size_t count)
+						     struct device_attribute *attr,
+						     const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
+		return -ENODEV;
+
+	cfg = ally_get_config(ally);
+	if (!cfg)
 		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value < 70 || value > 100)
 		return -EINVAL;
 
-	ret = ally_set_trigger_ranges(hdev, ally->config,
-					   ally->config->left_trigger_min,
-					   ally->config->left_trigger_max,
-					   ally->config->right_trigger_min,
-					   value);
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	ret = ally_set_trigger_ranges(ally, hdev, cfg,
+				      cfg->left_trigger_min,
+				      cfg->left_trigger_max,
+				      cfg->right_trigger_min,
+				      value);
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &ally->config->config_mutex)
-		ally->config->right_trigger_max = value;
+	cfg->right_trigger_max = value;
 
 	return count;
 }
 
 static ssize_t right_trigger_range_upper_limit_range_show(struct device *dev,
-							 struct device_attribute *attr,
-							 char *buf)
+							  struct device_attribute *attr,
+							  char *buf)
 {
 	return sysfs_emit(buf, "70 100\n");
 }
@@ -2325,11 +2582,21 @@ static ssize_t right_trigger_range_lower_limit_show(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	return sysfs_emit(buf, "%u\n", ally->config->right_trigger_min);
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	return sysfs_emit(buf, "%u\n", cfg->right_trigger_min);
 }
 
 static ssize_t right_trigger_range_lower_limit_store(struct device *dev,
@@ -2339,26 +2606,35 @@ static ssize_t right_trigger_range_lower_limit_store(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
+		return -ENODEV;
+
+	cfg = ally_get_config(ally);
+	if (!cfg)
 		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value > 50)
 		return -EINVAL;
 
-	ret = ally_set_trigger_ranges(hdev, ally->config,
-					   ally->config->left_trigger_min,
-					   ally->config->left_trigger_max,
-					   value,
-					   ally->config->right_trigger_max);
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	ret = ally_set_trigger_ranges(ally, hdev, cfg,
+				      cfg->left_trigger_min,
+				      cfg->left_trigger_max,
+				      value,
+				      cfg->right_trigger_max);
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &ally->config->config_mutex)
-		ally->config->right_trigger_min = value;
+	cfg->right_trigger_min = value;
 
 	return count;
 }
@@ -2377,11 +2653,21 @@ static ssize_t left_trigger_range_upper_limit_show(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	return sysfs_emit(buf, "%u\n", ally->config->left_trigger_max);
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	return sysfs_emit(buf, "%u\n", cfg->left_trigger_max);
 }
 
 static ssize_t left_trigger_range_upper_limit_store(struct device *dev,
@@ -2391,26 +2677,35 @@ static ssize_t left_trigger_range_upper_limit_store(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	u8 value;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
+		return -ENODEV;
+
+	cfg = ally_get_config(ally);
+	if (!cfg)
 		return -ENODEV;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret || value < 70 || value > 100)
 		return -EINVAL;
 
-	ret = ally_set_trigger_ranges(hdev, ally->config,
-					   ally->config->left_trigger_min,
-					   value,
-					   ally->config->right_trigger_min,
-					   ally->config->right_trigger_max);
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->user_cal_support)
+		return -EOPNOTSUPP;
+
+	ret = ally_set_trigger_ranges(ally, hdev, cfg,
+				      cfg->left_trigger_min,
+				      value,
+				      cfg->right_trigger_min,
+				      cfg->right_trigger_max);
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &ally->config->config_mutex)
-		ally->config->left_trigger_max = value;
+	cfg->left_trigger_max = value;
 
 	return count;
 }
@@ -2456,14 +2751,16 @@ enum ally_joystick_side {
 };
 
 /**
- * ally_set_joystick_resp_curve - Set joystick response curve parameters
+ * ally_set_joystick_resp_curve() - Set joystick response curve parameters
+ * @ally: ally handheld structure
  * @hdev: HID device
- * @side: Which joystick side (0=left, 1=right)
- * @curve: Response curve parameter structure
+ * @side: which joystick side (0=left, 1=right)
+ * @curve: response curve parameter structure
  *
- * Return: 0 on success, negative on failure
+ * Return: 0 on success, negative errno on failure
  */
-static int ally_set_joystick_resp_curve(struct hid_device *hdev, enum ally_joystick_side side,
+static int ally_set_joystick_resp_curve(struct ally_handheld *ally,
+					struct hid_device *hdev, enum ally_joystick_side side,
 					struct ally_joystick_resp_curve *curve)
 {
 	const u8 payload[] = { side,
@@ -2478,36 +2775,35 @@ static int ally_set_joystick_resp_curve(struct hid_device *hdev, enum ally_joyst
 	if (!buf)
 		return -ENOMEM;
 
-	ret = ally_dev_set_report(hdev, buf, ROG_ALLY_REPORT_SIZE);
+	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
 	if (ret < 0)
 		return ret;
 
 	return 0;
 }
 
-static int response_curve_apply(struct hid_device *hdev, bool is_left)
+static int response_curve_apply(struct ally_handheld *ally,
+				struct hid_device *hdev,
+				struct ally_config *cfg, bool is_left)
 {
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg = ally->config;
 	struct ally_joystick_resp_curve curve;
 	int ret;
 
-	/*
-	 * Snapshot under the lock so a concurrent sysfs write cannot change an
-	 * entry between the monotonicity check and the packet being built.
-	 */
-	scoped_guard(mutex, &cfg->config_mutex)
-		curve = is_left ? cfg->left_curve : cfg->right_curve;
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->resp_curve_support)
+		return -EOPNOTSUPP;
+
+	curve = is_left ? cfg->left_curve : cfg->right_curve;
 
 	if (!(curve.entry_1.move < curve.entry_2.move &&
 	      curve.entry_2.move < curve.entry_3.move &&
 	      curve.entry_3.move < curve.entry_4.move))
 		return -EINVAL;
 
-	ret = ally_set_joystick_resp_curve(hdev,
-					    is_left ? JOYSTICK_LEFT : JOYSTICK_RIGHT,
-					    &curve);
+	ret = ally_set_joystick_resp_curve(ally, hdev,
+					   is_left ? JOYSTICK_LEFT : JOYSTICK_RIGHT,
+					   &curve);
 	if (ret) {
 		hid_err(hdev, "Failed to set joystick response curve: %d\n", ret);
 		return ret;
@@ -2523,14 +2819,16 @@ static ssize_t left_response_curve_apply_store(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	bool apply;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	if (!ally->config->resp_curve_support)
-		return -EOPNOTSUPP;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
 
 	ret = kstrtobool(buf, &apply);
 	if (ret)
@@ -2539,7 +2837,7 @@ static ssize_t left_response_curve_apply_store(struct device *dev,
 	if (!apply)
 		return count;
 
-	ret = response_curve_apply(hdev, true);
+	ret = response_curve_apply(ally, hdev, cfg, true);
 	if (ret < 0)
 		return ret;
 
@@ -2553,14 +2851,16 @@ static ssize_t right_response_curve_apply_store(struct device *dev,
 	struct hid_device *hdev = to_hid_device(dev);
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *const ally = drvdata->rog_ally;
+	struct ally_config *cfg;
 	bool apply;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	if (!ally->config->resp_curve_support)
-		return -EOPNOTSUPP;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
 
 	ret = kstrtobool(buf, &apply);
 	if (ret)
@@ -2569,7 +2869,7 @@ static ssize_t right_response_curve_apply_store(struct device *dev,
 	if (!apply)
 		return count;
 
-	ret = response_curve_apply(hdev, false);
+	ret = response_curve_apply(ally, hdev, cfg, false);
 	if (ret < 0)
 		return ret;
 
@@ -2580,46 +2880,79 @@ static ALLY_DEVICE_ATTR_WO(left_response_curve_apply, response_curve_apply);
 static ALLY_DEVICE_ATTR_WO(right_response_curve_apply, response_curve_apply);
 
 static ssize_t response_curve_pct_show(struct device *dev,
-				       struct device_attribute *attr, char *buf,
-				       struct ally_joystick_resp_curve *curve,
-				       int idx)
+				       char *buf,
+				       struct ally_config *cfg, bool is_left,
+				       unsigned int idx)
 {
-	switch (idx) {
-	case 1: return sysfs_emit(buf, "%u\n", curve->entry_1.resp);
-	case 2: return sysfs_emit(buf, "%u\n", curve->entry_2.resp);
-	case 3: return sysfs_emit(buf, "%u\n", curve->entry_3.resp);
-	case 4: return sysfs_emit(buf, "%u\n", curve->entry_4.resp);
-	default: return -EINVAL;
-	}
-}
-
-static ssize_t response_curve_move_show(struct device *dev,
-					struct device_attribute *attr, char *buf,
-					struct ally_joystick_resp_curve *curve,
-					int idx)
-{
-	switch (idx) {
-	case 1: return sysfs_emit(buf, "%u\n", curve->entry_1.move);
-	case 2: return sysfs_emit(buf, "%u\n", curve->entry_2.move);
-	case 3: return sysfs_emit(buf, "%u\n", curve->entry_3.move);
-	case 4: return sysfs_emit(buf, "%u\n", curve->entry_4.move);
-	default: return -EINVAL;
-	}
-}
-
-static ssize_t response_curve_pct_store(struct device *dev,
-					struct device_attribute *attr,
-					const char *buf, size_t count,
-					bool is_left,
-					struct ally_handheld *ally, int idx)
-{
-	struct ally_config *cfg = ally->config;
 	struct ally_joystick_resp_curve *curve;
-	u8 value;
-	int ret;
+	int ret = -EINVAL;
+
+	guard(mutex)(&cfg->config_mutex);
 
 	if (!cfg->resp_curve_support)
 		return -EOPNOTSUPP;
+
+	curve = is_left ? &cfg->left_curve : &cfg->right_curve;
+
+	switch (idx) {
+	case 1:
+		ret = sysfs_emit(buf, "%u\n", curve->entry_1.resp);
+		break;
+	case 2:
+		ret = sysfs_emit(buf, "%u\n", curve->entry_2.resp);
+		break;
+	case 3:
+		ret = sysfs_emit(buf, "%u\n", curve->entry_3.resp);
+		break;
+	case 4:
+		ret = sysfs_emit(buf, "%u\n", curve->entry_4.resp);
+		break;
+	}
+
+	return ret;
+}
+
+static ssize_t response_curve_move_show(struct device *dev,
+					char *buf,
+					struct ally_config *cfg, bool is_left,
+					unsigned int idx)
+{
+	struct ally_joystick_resp_curve *curve;
+	int ret = -EINVAL;
+
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->resp_curve_support)
+		return -EOPNOTSUPP;
+
+	curve = is_left ? &cfg->left_curve : &cfg->right_curve;
+
+	switch (idx) {
+	case 1:
+		ret = sysfs_emit(buf, "%u\n", curve->entry_1.move);
+		break;
+	case 2:
+		ret = sysfs_emit(buf, "%u\n", curve->entry_2.move);
+		break;
+	case 3:
+		ret = sysfs_emit(buf, "%u\n", curve->entry_3.move);
+		break;
+	case 4:
+		ret = sysfs_emit(buf, "%u\n", curve->entry_4.move);
+		break;
+	}
+
+	return ret;
+}
+
+static ssize_t response_curve_pct_store(struct device *dev,
+					const char *buf, size_t count,
+					struct ally_config *cfg, bool is_left,
+					unsigned int idx)
+{
+	struct ally_joystick_resp_curve *curve;
+	u8 value;
+	int ret;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret)
@@ -2628,43 +2961,41 @@ static ssize_t response_curve_pct_store(struct device *dev,
 	if (value > 100)
 		return -EINVAL;
 
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->resp_curve_support)
+		return -EOPNOTSUPP;
+
 	curve = is_left ? &cfg->left_curve : &cfg->right_curve;
 
-	scoped_guard(mutex, &cfg->config_mutex) {
-		switch (idx) {
-		case 1:
-			curve->entry_1.resp = value;
-			break;
-		case 2:
-			curve->entry_2.resp = value;
-			break;
-		case 3:
-			curve->entry_3.resp = value;
-			break;
-		case 4:
-			curve->entry_4.resp = value;
-			break;
-		default:
-			return -EINVAL;
-		}
+	switch (idx) {
+	case 1:
+		curve->entry_1.resp = value;
+		break;
+	case 2:
+		curve->entry_2.resp = value;
+		break;
+	case 3:
+		curve->entry_3.resp = value;
+		break;
+	case 4:
+		curve->entry_4.resp = value;
+		break;
+	default:
+		return -EINVAL;
 	}
 
 	return count;
 }
 
 static ssize_t response_curve_move_store(struct device *dev,
-					 struct device_attribute *attr,
 					 const char *buf, size_t count,
-					 bool is_left,
-					 struct ally_handheld *ally, int idx)
+					 struct ally_config *cfg, bool is_left,
+					 unsigned int idx)
 {
-	struct ally_config *cfg = ally->config;
 	struct ally_joystick_resp_curve *curve;
 	u8 value;
 	int ret;
-
-	if (!cfg->resp_curve_support)
-		return -EOPNOTSUPP;
 
 	ret = kstrtou8(buf, 10, &value);
 	if (ret)
@@ -2673,80 +3004,121 @@ static ssize_t response_curve_move_store(struct device *dev,
 	if (value > 100)
 		return -EINVAL;
 
+	guard(mutex)(&cfg->config_mutex);
+
+	if (!cfg->resp_curve_support)
+		return -EOPNOTSUPP;
+
 	curve = is_left ? &cfg->left_curve : &cfg->right_curve;
 
-	scoped_guard(mutex, &cfg->config_mutex) {
-		switch (idx) {
-		case 1:
-			curve->entry_1.move = value;
-			break;
-		case 2:
-			curve->entry_2.move = value;
-			break;
-		case 3:
-			curve->entry_3.move = value;
-			break;
-		case 4:
-			curve->entry_4.move = value;
-			break;
-		default:
-			return -EINVAL;
-		}
+	switch (idx) {
+	case 1:
+		curve->entry_1.move = value;
+		break;
+	case 2:
+		curve->entry_2.move = value;
+		break;
+	case 3:
+		curve->entry_3.move = value;
+		break;
+	case 4:
+		curve->entry_4.move = value;
+		break;
+	default:
+		return -EINVAL;
 	}
 
 	return count;
 }
 
-#define DEFINE_JS_CURVE_PCT_FOPS(region, side)					\
-	static ssize_t side##_response_curve_pct_##region##_show(		\
-		struct device *dev, struct device_attribute *attr, char *buf)	\
-	{									\
-		struct hid_device *hdev = to_hid_device(dev);			\
-		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);		\
-		struct ally_handheld *ally = drvdata->rog_ally;			\
-		return response_curve_pct_show(					\
-			dev, attr, buf, &ally->config->side##_curve, region);\
-	}									\
-										\
-	static ssize_t side##_response_curve_pct_##region##_store(		\
-		struct device *dev, struct device_attribute *attr,		\
-		const char *buf, size_t count)					\
-	{									\
-		struct hid_device *hdev = to_hid_device(dev);			\
-		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);		\
-		struct ally_handheld *ally = drvdata->rog_ally;			\
-		return response_curve_pct_store(dev, attr, buf, count,		\
-						side##_is_left, ally, region);	\
+#define DEFINE_JS_CURVE_PCT_FOPS(region, side)				\
+	static ssize_t side##_response_curve_pct_##region##_show(	\
+		struct device *dev, struct device_attribute *attr,	\
+		char *buf)						\
+	{								\
+		struct hid_device *hdev = to_hid_device(dev);		\
+		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);	\
+		struct ally_handheld *ally = drvdata->rog_ally;		\
+		struct ally_config *cfg;				\
+									\
+		if (!ally)						\
+			return -ENODEV;				\
+									\
+		cfg = ally_get_config(ally);				\
+		if (!cfg)						\
+			return -ENODEV;				\
+									\
+		return response_curve_pct_show(dev, buf, cfg,		\
+					       side##_is_left, region);\
+	}								\
+									\
+	static ssize_t side##_response_curve_pct_##region##_store(	\
+		struct device *dev, struct device_attribute *attr,	\
+		const char *buf, size_t count)				\
+	{								\
+		struct hid_device *hdev = to_hid_device(dev);		\
+		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);	\
+		struct ally_handheld *ally = drvdata->rog_ally;		\
+		struct ally_config *cfg;				\
+									\
+		if (!ally)						\
+			return -ENODEV;				\
+									\
+		cfg = ally_get_config(ally);				\
+		if (!cfg)						\
+			return -ENODEV;				\
+									\
+		return response_curve_pct_store(dev, buf, count, cfg,	\
+						side##_is_left, region);\
 	}
 
-#define DEFINE_JS_CURVE_MOVE_FOPS(region, side)					\
-	static ssize_t side##_response_curve_move_##region##_show(		\
-		struct device *dev, struct device_attribute *attr, char *buf)	\
-	{									\
-		struct hid_device *hdev = to_hid_device(dev);			\
-		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);		\
-		struct ally_handheld *ally = drvdata->rog_ally;			\
-		return response_curve_move_show(					\
-			dev, attr, buf, &ally->config->side##_curve, region);\
-	}									\
-										\
-	static ssize_t side##_response_curve_move_##region##_store(		\
-		struct device *dev, struct device_attribute *attr,		\
-		const char *buf, size_t count)					\
-	{									\
-		struct hid_device *hdev = to_hid_device(dev);			\
-		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);		\
-		struct ally_handheld *ally = drvdata->rog_ally;			\
-		return response_curve_move_store(dev, attr, buf, count,	        \
-						 side##_is_left, ally, region); \
+#define DEFINE_JS_CURVE_MOVE_FOPS(region, side)				\
+	static ssize_t side##_response_curve_move_##region##_show(	\
+		struct device *dev, struct device_attribute *attr,	\
+		char *buf)						\
+	{								\
+		struct hid_device *hdev = to_hid_device(dev);		\
+		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);	\
+		struct ally_handheld *ally = drvdata->rog_ally;		\
+		struct ally_config *cfg;				\
+									\
+		if (!ally)						\
+			return -ENODEV;				\
+									\
+		cfg = ally_get_config(ally);				\
+		if (!cfg)						\
+			return -ENODEV;				\
+									\
+		return response_curve_move_show(dev, buf, cfg,		\
+						side##_is_left, region);\
+	}								\
+									\
+	static ssize_t side##_response_curve_move_##region##_store(	\
+		struct device *dev, struct device_attribute *attr,	\
+		const char *buf, size_t count)				\
+	{								\
+		struct hid_device *hdev = to_hid_device(dev);		\
+		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);	\
+		struct ally_handheld *ally = drvdata->rog_ally;		\
+		struct ally_config *cfg;				\
+									\
+		if (!ally)						\
+			return -ENODEV;				\
+									\
+		cfg = ally_get_config(ally);				\
+		if (!cfg)						\
+			return -ENODEV;				\
+									\
+		return response_curve_move_store(dev, buf, count, cfg,	\
+						 side##_is_left, region);\
 	}
 
-#define DEFINE_JS_CURVE_ATTRS(region, side)					\
-	DEFINE_JS_CURVE_PCT_FOPS(region, side)					\
-	DEFINE_JS_CURVE_MOVE_FOPS(region, side)					\
-	static ALLY_DEVICE_ATTR_RW(side##_response_curve_pct_##region,		\
-				   response_curve_pct_##region);		\
-	static ALLY_DEVICE_ATTR_RW(side##_response_curve_move_##region,		\
+#define DEFINE_JS_CURVE_ATTRS(region, side)				\
+	DEFINE_JS_CURVE_PCT_FOPS(region, side)				\
+	DEFINE_JS_CURVE_MOVE_FOPS(region, side)				\
+	static ALLY_DEVICE_ATTR_RW(side##_response_curve_pct_##region,	\
+				   response_curve_pct_##region);	\
+	static ALLY_DEVICE_ATTR_RW(side##_response_curve_move_##region,	\
 				   response_curve_move_##region)
 
 /* Helper defines for "is_left" parameter in DEFINE_JS_CURVE_ATTRS macros */
@@ -2848,35 +3220,58 @@ static const struct attribute_group ally_attr_groups[] = {
 		.name = "right_vibration",
 		.attrs = ally_right_vibration_attrs,
 	},
-	{
-		.name = "left_joystick_axis",
-		.attrs = left_joystick_axis_attrs,
-	},
-	{
-		.name = "right_joystick_axis",
-		.attrs = right_joystick_axis_attrs,
-	},
-	{
-		.name = "left_trigger",
-		.attrs = left_trigger_attrs,
-	},
-	{
-		.name = "right_trigger",
-		.attrs = right_trigger_attrs,
-	},
+};
+
+/*
+ * The joystick and trigger range calibration attributes are tied to the
+ * user-calibration capability: their sysfs groups are registered only
+ * when the device supports configuring those parameters, and the show
+ * and store callbacks reject accesses with -EOPNOTSUPP regardless, in
+ * case the groups are registered for another supported feature.
+ */
+static const struct attribute_group ally_left_joystick_axis_group = {
+	.name = "left_joystick_axis",
+	.attrs = left_joystick_axis_attrs,
+};
+
+static const struct attribute_group ally_right_joystick_axis_group = {
+	.name = "right_joystick_axis",
+	.attrs = right_joystick_axis_attrs,
+};
+
+static const struct attribute_group ally_left_trigger_group = {
+	.name = "left_trigger",
+	.attrs = left_trigger_attrs,
+};
+
+static const struct attribute_group ally_right_trigger_group = {
+	.name = "right_trigger",
+	.attrs = right_trigger_attrs,
+};
+
+static const struct attribute_group *const ally_cal_attr_groups[] = {
+	&ally_left_joystick_axis_group,
+	&ally_right_joystick_axis_group,
+	&ally_left_trigger_group,
+	&ally_right_trigger_group,
 };
 
 /**
- * ally_set_turbo_params - Set turbo parameters for all buttons
+ * ally_set_turbo_params() - Set turbo parameters for all buttons
+ * @ally: ally handheld structure
  * @hdev: HID device
- * @cfg: Ally config structure
+ * @cfg: ally config structure
  *
- * Returns: 0 on success, negative on failure
+ * The payload mirrors the whole per-button turbo configuration, so the
+ * caller must hold cfg->config_mutex: building it locklessly could send a
+ * mix of parameters from concurrent sysfs writes to the hardware.
+ *
+ * Return: 0 on success, negative errno on failure
  */
-static int ally_set_turbo_params(struct hid_device *hdev, struct ally_config *cfg)
+static int ally_set_turbo_params(struct ally_handheld *ally,
+				 struct hid_device *hdev,
+				 struct ally_config *cfg)
 {
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
 	struct ally_turbo_config *turbo = &cfg->turbo;
 	const u8 payload[] = {
 		turbo->btn_du.turbo,
@@ -2927,13 +3322,6 @@ static int ally_set_turbo_params(struct hid_device *hdev, struct ally_config *cf
 	return 0;
 }
 
-struct ally_btn_turbo_attr {
-	struct device_attribute dev_attr;
-	int button_id;
-};
-
-#define to_ally_btn_turbo_attr(x) container_of(x, struct ally_btn_turbo_attr, dev_attr)
-
 static struct ally_btn_turbo_params *ally_btn_get_turbo_params(struct ally_config *cfg,
 							       enum ally_button_id btn)
 {
@@ -2963,11 +3351,16 @@ static ssize_t btn_turbo_period_show(struct device *dev,
 {
 	struct ally_btn_sysfs_entry *entry = container_of(attr, struct ally_btn_sysfs_entry,
 							  attr_turbo_period);
-	struct ally_btn_turbo_params *params = ally_btn_get_turbo_params(entry->cfg,
-									 entry->btn);
+	struct ally_btn_turbo_params *params;
 
+	if (!entry->cfg->turbo_support)
+		return -EOPNOTSUPP;
+
+	params = ally_btn_get_turbo_params(entry->cfg, entry->btn);
 	if (!params)
 		return -ENODEV;
+
+	guard(mutex)(&entry->cfg->config_mutex);
 
 	return sysfs_emit(buf, "%hhu\n", params->turbo);
 }
@@ -2978,7 +3371,7 @@ static ssize_t btn_turbo_period_store(struct device *dev, struct device_attribut
 	struct ally_btn_sysfs_entry *entry = container_of(attr, struct ally_btn_sysfs_entry,
 							  attr_turbo_period);
 	struct ally_btn_turbo_params *params;
-	u8 value;
+	u8 old_value, value;
 	int ret;
 
 	if (!entry->cfg->turbo_support)
@@ -2995,12 +3388,20 @@ static ssize_t btn_turbo_period_store(struct device *dev, struct device_attribut
 	if (value < ALLY_TURBO_PERIOD_MIN || value > ALLY_TURBO_PERIOD_MAX)
 		return -EINVAL;
 
-	scoped_guard(mutex, &entry->cfg->config_mutex)
-		params->turbo = value;
+	guard(mutex)(&entry->cfg->config_mutex);
 
-	ret = ally_set_turbo_params(entry->hdev, entry->cfg);
-	if (ret)
+	old_value = params->turbo;
+	params->turbo = value;
+	ret = ally_set_turbo_params(entry->ally, entry->hdev, entry->cfg);
+	if (ret) {
+		/*
+		 * The hardware rejected the update: restore the old
+		 * value or a later write to another button would
+		 * flush this stale one to the device.
+		 */
+		params->turbo = old_value;
 		return ret;
+	}
 
 	return count;
 }
@@ -3010,10 +3411,16 @@ static ssize_t btn_toggle_period_show(struct device *dev,
 {
 	struct ally_btn_sysfs_entry *entry = container_of(attr, struct ally_btn_sysfs_entry,
 							  attr_toggle_period);
-	struct ally_btn_turbo_params *params = ally_btn_get_turbo_params(entry->cfg, entry->btn);
+	struct ally_btn_turbo_params *params;
 
+	if (!entry->cfg->turbo_support)
+		return -EOPNOTSUPP;
+
+	params = ally_btn_get_turbo_params(entry->cfg, entry->btn);
 	if (!params)
 		return -ENODEV;
+
+	guard(mutex)(&entry->cfg->config_mutex);
 
 	return sysfs_emit(buf, "%hhu\n", params->toggle);
 }
@@ -3024,7 +3431,7 @@ static ssize_t btn_toggle_period_store(struct device *dev, struct device_attribu
 	struct ally_btn_sysfs_entry *entry = container_of(attr, struct ally_btn_sysfs_entry,
 							  attr_toggle_period);
 	struct ally_btn_turbo_params *params;
-	u8 value;
+	u8 old_value, value;
 	int ret;
 
 	if (!entry->cfg->turbo_support)
@@ -3041,18 +3448,41 @@ static ssize_t btn_toggle_period_store(struct device *dev, struct device_attribu
 	if (value < ALLY_TOGGLE_PERIOD_MIN || value > ALLY_TOGGLE_PERIOD_MAX)
 		return -EINVAL;
 
-	scoped_guard(mutex, &entry->cfg->config_mutex)
-		params->toggle = value;
+	guard(mutex)(&entry->cfg->config_mutex);
 
-	ret = ally_set_turbo_params(entry->hdev, entry->cfg);
-	if (ret)
+	old_value = params->toggle;
+	params->toggle = value;
+	ret = ally_set_turbo_params(entry->ally, entry->hdev, entry->cfg);
+	if (ret) {
+		/*
+		 * The hardware rejected the update: restore the old
+		 * value or a later write to another button would
+		 * flush this stale one to the device.
+		 */
+		params->toggle = old_value;
 		return ret;
+	}
 
 	return count;
 }
 
-ALLY_DEVICE_CONST_ATTR_RO(btn_turbo_period_range, turbo_period_range, "0 20\n");
-ALLY_DEVICE_CONST_ATTR_RO(btn_toggle_period_range, toggle_period_range, "0 255\n");
+static ssize_t btn_turbo_period_range_show(struct device *dev,
+					   struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "0 20\n");
+}
+
+static ssize_t btn_toggle_period_range_show(struct device *dev,
+					    struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "0 255\n");
+}
+
+static struct device_attribute dev_attr_btn_turbo_period_range =
+	__ATTR(turbo_period_range, 0444, btn_turbo_period_range_show, NULL);
+
+static struct device_attribute dev_attr_btn_toggle_period_range =
+	__ATTR(toggle_period_range, 0444, btn_toggle_period_range_show, NULL);
 
 static void ally_btn_turbo_init_attrs(struct ally_btn_sysfs_entry *entry)
 {
@@ -3067,36 +3497,19 @@ static void ally_btn_turbo_init_attrs(struct ally_btn_sysfs_entry *entry)
 	entry->attr_toggle_period.attr.mode = 0644;
 	entry->attr_toggle_period.show = btn_toggle_period_show;
 	entry->attr_toggle_period.store = btn_toggle_period_store;
-}
-
-/* Helper to create button turbo attribute */
-static struct ally_btn_turbo_attr *ally_btn_turbo_attr_create(struct hid_device *hdev,
-							      struct ally_btn_sysfs_entry *entry)
-{
-	struct ally_btn_turbo_attr *attr __free(kfree) = kzalloc_obj(*attr, GFP_KERNEL);
-
-	if (!entry || !entry->cfg || !entry->cfg->turbo_support)
-		return ERR_PTR(-EOPNOTSUPP);
-
-	if (!ally_btn_get_turbo_params(entry->cfg, entry->btn)) {
-		hid_err(hdev, "Invalid button id %d for turbo attributes\n", entry->btn);
-		return ERR_PTR(-EINVAL);
-	}
-
-	if (!attr)
-		return ERR_PTR(-ENOMEM);
-
-	ally_btn_turbo_init_attrs(entry);
 	entry->attrs[0] = &entry->attr_turbo_period.attr;
 	entry->attrs[1] = &entry->attr_toggle_period.attr;
 	entry->attrs[2] = &dev_attr_btn_turbo_period_range.attr;
 	entry->attrs[3] = &dev_attr_btn_toggle_period_range.attr;
 	entry->attrs[4] = NULL;
-
-	return no_free_ptr(attr);
 }
 
-/* Find a button code map by its name */
+/**
+ * find_button_by_name() - Find a button code map by its name
+ * @name: name of the button code to look up
+ *
+ * Return: the matching button code map, or NULL if not found
+ */
 static const struct btn_code_map *find_button_by_name(const char *name)
 {
 	int i;
@@ -3109,17 +3522,24 @@ static const struct btn_code_map *find_button_by_name(const char *name)
 	return NULL;
 }
 
-/*
- * Check whether a remap target is valid for a given button in the current
- * gamepad mode.
+/**
+ * ally_remap_code_valid() - Check if a remap target is valid for a button
+ * @btn: button to remap
+ * @gamepad_mode: gamepad mode to validate the remap against
+ * @code: remap target to check
+ * @is_macro: whether the target is assigned to the macro mapping
  *
  * M1 and M2 can be remapped to anything at any time.
  * All other buttons may only be remapped to gamepad buttons (BTN_TYPE_PAD)
  * when in gamepad mode, and to keyboard/mouse/media codes when in desktop
  * (keyboard) mode.  BTN_TYPE_NONE (unmapped) is always allowed.
+ * Macro mappings are executed by the MCU as input sequences on the virtual
+ * keyboard and are accepted regardless of the current gamepad mode.
+ *
+ * Return: true if the remap is valid, false otherwise
  */
 static bool ally_remap_code_valid(enum ally_button_id btn, u8 gamepad_mode,
-				  const struct btn_code_map *code)
+				  const struct btn_code_map *code, bool is_macro)
 {
 	if (!code)
 		return false;
@@ -3132,6 +3552,10 @@ static bool ally_remap_code_valid(enum ally_button_id btn, u8 gamepad_mode,
 	if (code->type == BTN_TYPE_NONE)
 		return true;
 
+	/* Macros are not restricted by the controller emulation mode */
+	if (is_macro)
+		return true;
+
 	if (gamepad_mode == ALLY_GAMEPAD_MODE_GAMEPAD)
 		return code->type == BTN_TYPE_PAD;
 
@@ -3141,9 +3565,16 @@ static bool ally_remap_code_valid(enum ally_button_id btn, u8 gamepad_mode,
 	       code->type == BTN_TYPE_MEDIA;
 }
 
-/* Set button mapping for a button pair */
+/**
+ * ally_set_button_mapping() - Set the button mapping for a button pair
+ * @hdev: HID device
+ * @ally: ally handheld structure
+ * @mapping: button pair mapping to send to the device
+ *
+ * Return: count of data transferred, negative if error
+ */
 static int ally_set_button_mapping(struct hid_device *hdev, struct ally_handheld *ally,
-				  struct button_pair_map *mapping)
+				   struct button_pair_map *mapping)
 {
 	/* The MCU mapping block is four consecutive 11-byte entries starting at
 	 * buf[5]: first remap 5-15, first macro 16-26, second remap 27-37,
@@ -3283,7 +3714,14 @@ struct button_remap_attr {
 
 #define to_button_remap_attr(x) container_of(x, struct button_remap_attr, dev_attr)
 
-/* Get appropriate button pair index and position for a given button */
+/**
+ * get_button_pair_info() - Get the pair index and position of a button
+ * @button_id: button to look up
+ * @pair_idx: output pointer for the pair index of the button
+ * @is_first: output pointer for the position of the button within the pair
+ *
+ * Return: 0 on success, negative errno on failure
+ */
 static int get_button_pair_info(enum ally_button_id button_id,
 				enum btn_pair_index *pair_idx,
 				bool *is_first)
@@ -3367,40 +3805,44 @@ static ssize_t button_remap_show(struct device *dev,
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct ally_handheld *ally = drvdata->rog_ally;
 	struct button_remap_attr *btn_attr = to_button_remap_attr(attr);
+	const struct btn_code_map *code;
 	struct ally_config *cfg;
 	enum ally_button_id button_id = btn_attr->button_id;
 	enum btn_pair_index pair_idx;
-	bool is_first;
 	struct button_pair_map *pair;
 	struct button_map *btn_map;
+	bool is_first;
 	int ret;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	cfg = ally->config;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
 
 	ret = get_button_pair_info(button_id, &pair_idx, &is_first);
 	if (ret < 0)
 		return ret;
 
 	guard(mutex)(&cfg->config_mutex);
-	pair = &((struct ally_button_mapping
-			  *)(cfg->button_mappings))[cfg->gamepad_mode]
+
+	/*
+	 * button_mappings is unpublished by the remove path while holding
+	 * this same lock, so the check cannot race with the teardown.
+	 */
+	if (!cfg->button_mappings)
+		return -ENODEV;
+
+	pair = &cfg->button_mappings[cfg->gamepad_mode]
 			.button_pairs[pair_idx - 1];
 	btn_map = is_first ? &pair->first : &pair->second;
+	code = btn_attr->is_macro ? btn_map->macro : btn_map->remap;
 
-	if (btn_attr->is_macro) {
-		if (btn_map->macro->type == BTN_TYPE_NONE)
-			return sysfs_emit(buf, "NONE\n");
-		else
-			return sysfs_emit(buf, "%s\n", btn_map->macro->name);
-	} else {
-		if (btn_map->remap->type == BTN_TYPE_NONE)
-			return sysfs_emit(buf, "NONE\n");
-		else
-			return sysfs_emit(buf, "%s\n", btn_map->remap->name);
-	}
+	if (code->type == BTN_TYPE_NONE)
+		return sysfs_emit(buf, "NONE\n");
+
+	return sysfs_emit(buf, "%s\n", code->name);
 }
 
 static ssize_t button_remap_store(struct device *dev,
@@ -3414,18 +3856,22 @@ static ssize_t button_remap_store(struct device *dev,
 	enum ally_button_id button_id = btn_attr->button_id;
 	struct ally_button_mapping *mode_map;
 	const struct btn_code_map *code;
+	const struct btn_code_map *old_code;
 	enum btn_pair_index pair_idx;
 	struct button_pair_map *pair;
 	struct button_map *btn_map;
 	struct ally_config *cfg;
 	char btn_name[32];
 	bool is_first;
+	bool undo_hw;
 	int ret, i;
 
-	if (!ally || !ally->config)
+	if (!ally)
 		return -ENODEV;
 
-	cfg = ally->config;
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return -ENODEV;
 
 	if (sscanf(buf, "%31s", btn_name) != 1)
 		return -EINVAL;
@@ -3443,50 +3889,102 @@ static ssize_t button_remap_store(struct device *dev,
 	if (ret < 0)
 		return ret;
 
-	/* Validate that the remap target is allowed for this button/mode */
-	if (!ally_remap_code_valid(button_id, cfg->gamepad_mode, code))
+	guard(mutex)(&cfg->config_mutex);
+
+	/*
+	 * button_mappings is unpublished by the remove path while
+	 * holding this same lock, so the check cannot race with the
+	 * teardown.
+	 */
+	if (!cfg->button_mappings)
+		return -ENODEV;
+
+	/*
+	 * Validate the remap target while holding the lock: the
+	 * gamepad mode can change concurrently, and the check must
+	 * be done against the very mode the mapping is written to.
+	 */
+	if (!ally_remap_code_valid(button_id, cfg->gamepad_mode, code,
+				   btn_attr->is_macro))
 		return -EINVAL;
 
-	scoped_guard(mutex, &cfg->config_mutex) {
-		/* Access the mapping for current gamepad mode */
-		pair = &((struct ally_button_mapping
-				  *)(cfg->button_mappings))[cfg->gamepad_mode]
-				.button_pairs[pair_idx - 1];
-		btn_map = is_first ? &pair->first : &pair->second;
+	/* Access the mapping for current gamepad mode */
+	pair = &cfg->button_mappings[cfg->gamepad_mode]
+			.button_pairs[pair_idx - 1];
+	btn_map = is_first ? &pair->first : &pair->second;
 
-		if (btn_attr->is_macro)
-			btn_map->macro = (struct btn_code_map *)code;
-		else
-			btn_map->remap = (struct btn_code_map *)code;
+	if (btn_attr->is_macro) {
+		old_code = btn_map->macro;
+		btn_map->macro = code;
+	} else {
+		old_code = btn_map->remap;
+		btn_map->remap = code;
+	}
 
-		/* Update pair index */
-		pair->pair_index = pair_idx;
+	/* Update pair index */
+	pair->pair_index = pair_idx;
+
+	/*
+	 * Send mapping to device with the caveat that first
+	 * generation devices require individual button pair updates.
+	 */
+	if (cfg->is_ally_x) {
+		ret = ally_set_button_mapping(hdev, ally, pair);
+		undo_hw = false;
+	} else {
+		mode_map = &cfg->button_mappings[cfg->gamepad_mode];
+		ret = 0;
+		for (i = 0; i < 9; i++) {
+			mode_map->button_pairs[i].pair_index = i + 1;
+			ret = ally_set_button_mapping(hdev, ally,
+				&mode_map->button_pairs[i]);
+			if (ret < 0)
+				break;
+		}
 
 		/*
-		 * Send mapping to device with the caveat that first generation
-		 * devices require individual button pair updates.
+		 * Pairs are pushed one at a time: remember whether
+		 * the target pair reached the hardware before a
+		 * later pair failed, so the rollback below can undo
+		 * it on the device too.
 		 */
-		if (cfg->is_ally_x) {
-			ret = ally_set_button_mapping(hdev, ally, pair);
-			if (ret < 0)
-				return ret;
-		} else {
-			mode_map = &((struct ally_button_mapping
-					 *)(cfg->button_mappings))[cfg->gamepad_mode];
-			for (i = 0; i < 9; i++) {
-				mode_map->button_pairs[i].pair_index = i + 1;
-				ret = ally_set_button_mapping(hdev, ally,
-					&mode_map->button_pairs[i]);
-				if (ret < 0)
-					break;
-			}
-		}
+		undo_hw = ret < 0 && i > pair_idx - 1;
+	}
+
+	/*
+	 * The hardware rejected the update: restore the previous
+	 * mapping so that the software cache keeps describing the
+	 * state the device is actually in.
+	 */
+	if (ret < 0) {
+		if (btn_attr->is_macro)
+			btn_map->macro = old_code;
+		else
+			btn_map->remap = old_code;
+
+		/*
+		 * The target pair was already committed before a
+		 * later pair failed: push the restored mapping once
+		 * more so the hardware matches the cache again. Best
+		 * effort only: the device is misbehaving already.
+		 */
+		if (undo_hw)
+			ally_set_button_mapping(hdev, ally, pair);
+
+		hid_err(hdev, "Failed to set button mapping: %d\n", ret);
+		return ret;
 	}
 
 	return count;
 }
 
-/* Helper to create button remap attribute */
+/**
+ * button_remap_attr_create() - Create a button remap attribute
+ * @button_id: button the attribute is for
+ * @is_macro: whether the attribute controls the macro mapping
+ *
+ * Return: the newly created attribute, or NULL on allocation failure
+ */
 static struct button_remap_attr *button_remap_attr_create(enum ally_button_id button_id,
 							  bool is_macro)
 {
@@ -3505,11 +4003,17 @@ static struct button_remap_attr *button_remap_attr_create(enum ally_button_id bu
 	return no_free_ptr(attr);
 }
 
-/*
- * Show the list of valid remap target names for a button in the current
- * gamepad mode.  M1/M2 list everything; other buttons list only the codes
- * valid for the active mode (gamepad buttons in gamepad mode, keyboard /
- * mouse / media in desktop mode).
+/**
+ * btn_remap_index_show() - Show the list of valid remap targets for a button
+ * @dev: device the attribute belongs to
+ * @attr: attribute being read
+ * @buf: buffer to write the list into
+ *
+ * M1/M2 list everything; other buttons list only the codes valid for the
+ * active mode (gamepad buttons in gamepad mode, keyboard / mouse / media
+ * in desktop mode).
+ *
+ * Return: number of characters written
  */
 static ssize_t btn_remap_index_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
@@ -3525,7 +4029,7 @@ static ssize_t btn_remap_index_show(struct device *dev,
 		mode = entry->cfg->gamepad_mode;
 
 	for (i = 0; i < keymap_len; i++) {
-		if (!ally_remap_code_valid(btn, mode, &ally_btn_codes[i]))
+		if (!ally_remap_code_valid(btn, mode, &ally_btn_codes[i], false))
 			continue;
 		len += sysfs_emit_at(buf, len, "%s ", ally_btn_codes[i].name);
 	}
@@ -3537,13 +4041,16 @@ static ssize_t btn_remap_index_show(struct device *dev,
 }
 
 /**
- * ally_create_button_attributes - Create turbo button attributes
+ * ally_create_button_attributes() - Create turbo button attributes
  * @hdev: HID device
- * @cfg: Ally config structure
+ * @ally: ally handheld structure
+ * @cfg: ally config structure
  *
- * Returns: 0 on success, negative on failure
+ * Return: 0 on success, negative errno on failure
  */
-static int ally_create_button_attributes(struct hid_device *hdev, struct ally_config *cfg)
+static int ally_create_button_attributes(struct hid_device *hdev,
+					 struct ally_handheld *ally,
+					 struct ally_config *cfg)
 {
 	struct ally_btn_sysfs_entry *entries;
 	struct ally_button_mapping *mappings;
@@ -3556,10 +4063,8 @@ static int ally_create_button_attributes(struct hid_device *hdev, struct ally_co
 	/* Allocate mappings for each gamepad mode (1-based indexing) */
 	mappings = devm_kcalloc(&hdev->dev, ALLY_GAMEPAD_MODE_KEYBOARD + 1,
 				sizeof(*mappings), GFP_KERNEL);
-	if (!mappings) {
-		ret = -ENOMEM;
-		goto err_free_entries;
-	}
+	if (!mappings)
+		return -ENOMEM;
 
 	cfg->button_entries = entries;
 	cfg->button_mappings = mappings;
@@ -3567,17 +4072,19 @@ static int ally_create_button_attributes(struct hid_device *hdev, struct ally_co
 	ally_set_default_keyboard_mapping(mappings);
 
 	for (i = 0; i < ALLY_BTN_MAX; i++) {
+		entries[i].ally = ally;
 		entries[i].cfg = cfg;
 		entries[i].hdev = hdev;
 		entries[i].btn = i;
 
 		if (cfg->turbo_support) {
-			entries[i].turbo_attr = ally_btn_turbo_attr_create(hdev, &entries[i]);
-			if (IS_ERR(entries[i].turbo_attr)) {
-				ret = PTR_ERR(entries[i].turbo_attr);
-				entries[i].turbo_attr = NULL;
+			if (!ally_btn_get_turbo_params(cfg, i)) {
+				hid_err(hdev, "Invalid button id %d for turbo attributes\n", i);
+				ret = -EINVAL;
 				goto err_cleanup;
 			}
+
+			ally_btn_turbo_init_attrs(&entries[i]);
 		}
 
 		entries[i].remap_attr = button_remap_attr_create(i, false);
@@ -3637,19 +4144,16 @@ err_cleanup:
 		sysfs_remove_group(&hdev->dev.kobj, &entries[i].group);
 
 	for (i = 0; i < ALLY_BTN_MAX; i++) {
-		kfree(entries[i].turbo_attr);
 		kfree(entries[i].remap_attr);
 		kfree(entries[i].macro_attr);
-		entries[i].turbo_attr = NULL;
-		entries[i].remap_attr = NULL;
-		entries[i].macro_attr = NULL;
 	}
-err_free_entries:
-	if (mappings)
-		devm_kfree(&hdev->dev, mappings);
-	devm_kfree(&hdev->dev, entries);
 
-	/* Nullify the entries and mappings to prevent use-after-free crashes */
+	/*
+	 * The arrays are devm-managed on the same device as the sysfs
+	 * attributes, so they are released together with them: only
+	 * unpublish the pointers here, or a concurrent sysfs callback
+	 * would dereference freed memory.
+	 */
 	cfg->button_entries = NULL;
 	cfg->button_mappings = NULL;
 
@@ -3657,9 +4161,9 @@ err_free_entries:
 }
 
 /**
- * ally_remove_button_attributes - Remove turbo button attributes
+ * ally_remove_button_attributes() - Remove turbo button attributes
  * @hdev: HID device
- * @cfg: Ally config structure
+ * @cfg: ally config structure
  */
 static void ally_remove_button_attributes(struct hid_device *hdev, struct ally_config *cfg)
 {
@@ -3673,26 +4177,29 @@ static void ally_remove_button_attributes(struct hid_device *hdev, struct ally_c
 
 	for (i = 0; i < ALLY_BTN_MAX; i++) {
 		sysfs_remove_group(&hdev->dev.kobj, &entries[i].group);
-		kfree(entries[i].turbo_attr);
 		kfree(entries[i].remap_attr);
 		kfree(entries[i].macro_attr);
 	}
 
-	if (cfg->button_mappings) {
-		devm_kfree(&hdev->dev, cfg->button_mappings);
+	/*
+	 * The arrays are devm-managed on the same device as the sysfs
+	 * attributes, so they are released together with them.  Only
+	 * unpublish the pointers here, under the lock, so that a sysfs
+	 * callback which is still holding config_mutex observes the
+	 * teardown instead of racing against a manual free.
+	 */
+	scoped_guard(mutex, &cfg->config_mutex) {
+		cfg->button_entries = NULL;
 		cfg->button_mappings = NULL;
 	}
-
-	devm_kfree(&hdev->dev, entries);
-	cfg->button_entries = NULL;
 }
 
 /**
  * ally_config_create() - Initialize configuration and create sysfs entries
  * @hdev: HID device
- * @ally: Non-NULL ally device data with uninitialized config pointer
+ * @ally: non-NULL ally device data with uninitialized config pointer
  *
- * Returns valid pointer on success, error pointer on failure.
+ * Return: valid pointer on success, error pointer on failure
  */
 static struct ally_config *ally_config_create(struct hid_device *hdev, struct ally_handheld *ally)
 {
@@ -3703,30 +4210,40 @@ static struct ally_config *ally_config_create(struct hid_device *hdev, struct al
 	if (!cfg)
 		return ERR_PTR(-ENOMEM);
 
+	mutex_init(&cfg->config_mutex);
+
 	ret = ally_detect_capabilities(hdev, ally, cfg);
 	if (ret < 0) {
 		hid_err(hdev, "Failed to detect Ally capabilities: %d\n", ret);
 		goto ally_config_create_err;
 	}
 
-	for (sysfs_i = 0; sysfs_i < ARRAY_SIZE(ally_attr_groups); sysfs_i++) {
-		ret = devm_device_add_group(&hdev->dev, &ally_attr_groups[sysfs_i]);
-		if (ret < 0) {
-			hid_err(hdev, "Failed to create sysfs group '%s': %d\n",
-				ally_attr_groups[sysfs_i].name, ret);
-			goto ally_config_create_sysfs_err;
+	/*
+	 * Skip the calibration, anti-deadzone and response curve groups when
+	 * none of the features they expose is supported.
+	 */
+	if (cfg->user_cal_support || cfg->anti_deadzone_support ||
+	    cfg->resp_curve_support) {
+		for (sysfs_i = 0; sysfs_i < ARRAY_SIZE(ally_cal_attr_groups); sysfs_i++) {
+			ret = devm_device_add_group(&hdev->dev,
+						    ally_cal_attr_groups[sysfs_i]);
+			if (ret < 0) {
+				hid_err(hdev, "Failed to create sysfs group '%s': %d\n",
+					ally_cal_attr_groups[sysfs_i]->name, ret);
+				goto ally_config_create_sysfs_err;
+			}
 		}
 	}
 
 	if (cfg->turbo_support) {
-		ret = ally_create_button_attributes(hdev, cfg);
+		ret = ally_create_button_attributes(hdev, ally, cfg);
 		if (ret < 0) {
 			hid_err(hdev, "Failed to create button attributes: %d\n", ret);
 			goto ally_config_create_sysfs_err;
 		}
 	}
 
-	cfg->gamepad_mode = 0x01;
+	cfg->gamepad_mode = ALLY_GAMEPAD_MODE_GAMEPAD;
 	cfg->left_deadzone = 10;
 	cfg->left_outer_threshold = 90;
 	cfg->right_deadzone = 10;
@@ -3737,7 +4254,6 @@ static struct ally_config *ally_config_create(struct hid_device *hdev, struct al
 	cfg->right_trigger_max = 100;
 	cfg->vibration_intensity_left = 100;
 	cfg->vibration_intensity_right = 100;
-	cfg->vibration_active = false;
 
 	/* Initialize default response curve values (linear) */
 	cfg->left_curve.entry_1.move = 0;
@@ -3758,22 +4274,38 @@ static struct ally_config *ally_config_create(struct hid_device *hdev, struct al
 	cfg->right_curve.entry_4.move = 100;
 	cfg->right_curve.entry_4.resp = 100;
 
+	for (sysfs_i = 0; sysfs_i < ARRAY_SIZE(ally_attr_groups); sysfs_i++) {
+		ret = devm_device_add_group(&hdev->dev, &ally_attr_groups[sysfs_i]);
+		if (ret < 0) {
+			hid_err(hdev, "Failed to create sysfs group '%s': %d\n",
+				ally_attr_groups[sysfs_i].name ?: "", ret);
+			goto ally_config_create_sysfs_err;
+		}
+	}
+
 	/* So far the only hardware this is supported is the Ally 1 */
 	if (cfg->xbox_controller_support) {
-		ret = ally_set_xbox_controller(hdev, cfg, true);
+		ret = ally_set_xbox_controller(hdev, ally, cfg, true);
 		if (ret < 0)
 			hid_warn(hdev, "Failed to set default Xbox controller mode: %d\n",
 				ret);
 	}
 
+	/*
+	 * Set the default gamepad mode now that the MCU is confirmed ready:
+	 * failure is non-critical, the mode can still be changed from sysfs.
+	 */
+	ret = ally_apply_gamepad_mode(hdev, ally, cfg);
+	if (ret < 0)
+		hid_warn(hdev, "Failed to set default gamepad mode: %d\n", ret);
+
 	cfg->initialized = true;
 
 	return cfg;
 ally_config_create_sysfs_err:
-	if (cfg->turbo_support && cfg->button_entries)
+	if (cfg->button_entries)
 		ally_remove_button_attributes(hdev, cfg);
 ally_config_create_err:
-	ally->config = NULL;
 	devm_kfree(&hdev->dev, cfg);
 	return ERR_PTR(ret);
 }
@@ -3781,23 +4313,32 @@ ally_config_create_err:
 /**
  * ally_config_remove() - Clean up configuration resources
  * @hdev: HID device
- * @ally: Non-NULL Ally device data
+ * @cfg: ally config to clean up, may be NULL
  */
-static void ally_config_remove(struct hid_device *hdev, struct ally_handheld *ally)
+static void ally_config_remove(struct hid_device *hdev, struct ally_config *cfg)
 {
-	struct ally_config *cfg = ally->config;
+	int i;
 
 	if (!cfg || !cfg->initialized)
 		return;
 
-	if (cfg->turbo_support && cfg->button_entries)
+	if (cfg->button_entries)
 		ally_remove_button_attributes(hdev, cfg);
+
+	for (i = 0; i < ARRAY_SIZE(ally_attr_groups); i++)
+		sysfs_remove_group(&hdev->dev.kobj, &ally_attr_groups[i]);
 }
 
-/*
- * This should be called before any remapping attempts,
- * and on driver init/resume, after the asus handshake
- * has been performed on the configuration endpoint.
+/**
+ * ally_gamepad_check_ready() - Wait for the gamepad MCU to report ready
+ * @ally: ally handheld structure
+ * @hdev: HID device
+ *
+ * This should be called before any remapping attempts, and on driver
+ * init/resume, after the asus handshake has been performed on the
+ * configuration endpoint.
+ *
+ * Return: 0 on success, negative errno on failure
  */
 static int ally_gamepad_check_ready(struct ally_handheld *ally, struct hid_device *hdev)
 {
@@ -3838,6 +4379,9 @@ static int ally_get_endpoint_address(struct hid_device *hdev)
 	if (!intf || !intf->cur_altsetting)
 		return -ENODEV;
 
+	if (intf->cur_altsetting->desc.bNumEndpoints == 0)
+		return -ENODEV;
+
 	ep = intf->cur_altsetting->endpoint;
 	if (!ep)
 		return -ENODEV;
@@ -3845,17 +4389,12 @@ static int ally_get_endpoint_address(struct hid_device *hdev)
 	return ep->desc.bEndpointAddress;
 }
 
-/* Matches the 15-byte payload of the 16-byte 0x0B wire report:
- * buttons[0..1] are button bitmaps, buttons[2] is the hatswitch.
- */
 struct ally_x_input_report {
-	uint16_t x, y;
-	uint16_t rx, ry;
-	uint16_t z, rz;
-	uint8_t buttons[3];
+	__le16 x, y;
+	__le16 rx, ry;
+	__le16 z, rz;
+	u8 buttons[3];
 } __packed;
-static_assert(sizeof(struct ally_x_input_report) ==
-	      HID_ALLY_X_INPUT_REPORT_SIZE - 1);
 
 /* The hatswitch outputs integers, we use them to index this X|Y pair */
 static const int hat_values[][2] = {
@@ -3863,11 +4402,21 @@ static const int hat_values[][2] = {
 	{ 0, 1 }, { -1, 1 }, { -1, 0 }, { -1, -1 },
 };
 
-/* Return true if event was handled, otherwise false */
+/**
+ * ally_x_raw_event() - Parse and report an Ally X gamepad input report
+ * @input: input device to report the events on
+ * @hdev: HID device
+ * @report: HID report the raw data arrived in
+ * @data: raw report buffer
+ * @size: length of @data in bytes
+ *
+ * Return: true if the event was handled, otherwise false
+ */
 static bool ally_x_raw_event(struct input_dev *input, struct hid_device *hdev,
-			    struct hid_report *report, u8 *data, int size)
+			     struct hid_report *report, u8 *data, int size)
 {
 	struct ally_x_input_report *in_report;
+	u16 x, y, rx, ry, z, rz;
 	u8 byte;
 
 	if (!input)
@@ -3876,7 +4425,14 @@ static bool ally_x_raw_event(struct input_dev *input, struct hid_device *hdev,
 	if (size < 1)
 		return false;
 
+	/*
+	 * The size check above only guarantees one valid byte: do not
+	 * read the code of a truncated report.
+	 */
 	if (data[0] == 0x5A) {
+		if (size < 2)
+			return false;
+
 		input_report_key(input, KEY_PROG1, data[1] == 0x38);
 		input_report_key(input, KEY_F16, data[1] == 0xA6);
 		input_report_key(input, KEY_F17, data[1] == 0xA7);
@@ -3899,12 +4455,20 @@ static bool ally_x_raw_event(struct input_dev *input, struct hid_device *hdev,
 
 	in_report = (struct ally_x_input_report *)&data[1];
 
-	input_report_abs(input, ABS_X, in_report->x - 32768);
-	input_report_abs(input, ABS_Y, in_report->y - 32768);
-	input_report_abs(input, ABS_RX, in_report->rx - 32768);
-	input_report_abs(input, ABS_RY, in_report->ry - 32768);
-	input_report_abs(input, ABS_Z, in_report->z);
-	input_report_abs(input, ABS_RZ, in_report->rz);
+	/* USB HID payloads are little-endian: convert them explicitly. */
+	x = get_unaligned_le16(&in_report->x);
+	y = get_unaligned_le16(&in_report->y);
+	rx = get_unaligned_le16(&in_report->rx);
+	ry = get_unaligned_le16(&in_report->ry);
+	z = get_unaligned_le16(&in_report->z);
+	rz = get_unaligned_le16(&in_report->rz);
+
+	input_report_abs(input, ABS_X, x - 32768);
+	input_report_abs(input, ABS_Y, y - 32768);
+	input_report_abs(input, ABS_RX, rx - 32768);
+	input_report_abs(input, ABS_RY, ry - 32768);
+	input_report_abs(input, ABS_Z, z);
+	input_report_abs(input, ABS_RZ, rz);
 
 	byte = in_report->buttons[0];
 	input_report_key(input, BTN_A, byte & BIT(0));
@@ -3935,12 +4499,57 @@ static bool ally_x_raw_event(struct input_dev *input, struct hid_device *hdev,
 	return true;
 }
 
+static int ally_x_input_open(struct input_dev *dev)
+{
+	struct hid_device *hdev = input_get_drvdata(dev);
+
+	return hid_hw_open(hdev);
+}
+
+static void ally_x_input_close(struct input_dev *dev)
+{
+	hid_hw_close(input_get_drvdata(dev));
+}
+
+/**
+ * ally_x_send_ff_report() - Send a force-feedback report to the gamepad
+ * @ally: ally handheld structure
+ * @hdev: HID device
+ * @buf: buffer containing the report to send
+ * @len: length of the report
+ *
+ * The gamepad interface consumes force-feedback packets as output reports,
+ * unlike the config interface which expects feature reports: a rumble packet
+ * sent as HID_REQ_SET_REPORT would be rejected by the hardware.
+ *
+ * Return: count of data transferred, negative if error
+ */
+static int ally_x_send_ff_report(struct ally_handheld *ally,
+				 struct hid_device *hdev,
+				 const u8 *buf, size_t len)
+{
+	u8 *dmabuf __free(kfree) = kmemdup(buf, len, GFP_KERNEL);
+	if (!dmabuf)
+		return -ENOMEM;
+
+	guard(mutex)(&ally->intf_mutex);
+
+	return hid_hw_output_report(hdev, dmabuf, len);
+}
+
+static int ally_x_send_ff_off(struct ally_handheld *ally, struct hid_device *hdev)
+{
+	return ally_x_send_ff_report(ally, hdev, ALLY_FORCE_FEEDBACK_OFF,
+				     sizeof(ALLY_FORCE_FEEDBACK_OFF));
+}
+
 static void ally_x_ff_work_fn(struct work_struct *work)
 {
 	struct ally_handheld *ally =
 		container_of(work, struct ally_handheld, ff_work);
 	struct hid_device *hdev = NULL;
 	struct ff_report report;
+	unsigned long flags;
 	bool update = false;
 	int ret;
 
@@ -3949,31 +4558,41 @@ static void ally_x_ff_work_fn(struct work_struct *work)
 			report = ally->ff_packet;
 			ally->update_ff = false;
 			update = true;
-			hdev = ally->ally_x_hdev;
 		}
 	}
 
-	if (!update || !hdev)
+	if (!update)
 		return;
 
-	ret = ally_gamepad_send_packet(ally, hdev, (u8 *)&report, sizeof(report));
+	/*
+	 * The hdev pointer is published and cleared under ally_data_lock:
+	 * take a reference on it so the gamepad interface cannot be freed
+	 * under us while the report is being sent.
+	 */
+	spin_lock_irqsave(&ally_data_lock, flags);
+	hdev = ally->ally_x_hdev;
+	if (hdev)
+		get_device(&hdev->dev);
+	spin_unlock_irqrestore(&ally_data_lock, flags);
+
+	if (!hdev)
+		return;
+
+	ret = ally_x_send_ff_report(ally, hdev, (u8 *)&report, sizeof(report));
 	if (ret < 0)
 		hid_err(hdev, "Failed to send force-feedback: %d\n", ret);
+
+	put_device(&hdev->dev);
 }
 
 static int ally_x_play_effect(struct input_dev *idev, void *data,
-			     struct ff_effect *effect)
+			      struct ff_effect *effect)
 {
 	struct ally_handheld *ally = &ally_drvdata;
 
 	if (effect->type != FF_RUMBLE)
 		return 0;
 
-	/*
-	 * Both the flag and the queueing must happen under ff_lock: removal
-	 * clears the flag under the same lock before cancel_work_sync(), so an
-	 * unlocked test here could queue work again after the cancel.
-	 */
 	scoped_guard(spinlock_irqsave, &ally->ff_lock) {
 		ally->ff_packet.ff.magnitude_strong =
 			effect->u.rumble.strong_magnitude * ALLY_FF_MAX_INTENSITY / 65535;
@@ -3990,11 +4609,12 @@ static int ally_x_play_effect(struct input_dev *idev, void *data,
 
 static struct input_dev *ally_x_alloc_input_dev(struct hid_device *hdev)
 {
-	struct input_dev *input_dev = devm_input_allocate_device(&hdev->dev);
+	struct input_dev *input_dev = input_allocate_device();
 
 	if (!input_dev)
 		return ERR_PTR(-ENOMEM);
 
+	input_dev->dev.parent = &hdev->dev;
 	input_dev->id.bustype = hdev->bus;
 	input_dev->id.vendor = hdev->vendor;
 	input_dev->id.product = hdev->product;
@@ -4003,6 +4623,13 @@ static struct input_dev *ally_x_alloc_input_dev(struct hid_device *hdev)
 	input_dev->name = "ASUS ROG Ally X Gamepad";
 
 	input_set_drvdata(input_dev, hdev);
+	/*
+	 * Let the input core hold the hardware open while the device node
+	 * is in use: without these the interface could be runtime-suspended
+	 * and drop events.
+	 */
+	input_dev->open = ally_x_input_open;
+	input_dev->close = ally_x_input_close;
 
 	return input_dev;
 }
@@ -4010,6 +4637,7 @@ static struct input_dev *ally_x_alloc_input_dev(struct hid_device *hdev)
 static int ally_x_setup_input(struct hid_device *hdev, struct ally_handheld *ally)
 {
 	struct input_dev *input = ally_x_alloc_input_dev(hdev);
+	unsigned long flags;
 	int ret;
 
 	if (IS_ERR(input))
@@ -4043,14 +4671,28 @@ static int ally_x_setup_input(struct hid_device *hdev, struct ally_handheld *all
 	input_set_capability(input, EV_KEY, BTN_TRIGGER_HAPPY1);
 
 	memcpy(&ally->ff_packet, ALLY_FORCE_FEEDBACK_OFF, sizeof(ally->ff_packet));
-	spin_lock_init(&ally->ff_lock);
-	INIT_WORK(&ally->ff_work, ally_x_ff_work_fn);
 	ally->ff_work_initialized = true;
 
 	input_set_capability(input, EV_FF, FF_RUMBLE);
+
+	/*
+	 * A registered device advertising FF_RUMBLE without the memless core
+	 * behind it would crash input_ff_upload(): fail the whole setup instead.
+	 */
 	ret = input_ff_create_memless(input, NULL, ally_x_play_effect);
-	if (ret)
-		hid_warn(hdev, "Failed to create force-feedback: %d\n", ret);
+	if (ret) {
+		hid_err(hdev, "Failed to create force-feedback: %d\n", ret);
+		goto ally_x_setup_input_err;
+	}
+
+	/*
+	 * Publish the interface before the input device becomes visible to
+	 * userspace: an effect uploaded right after registration would
+	 * otherwise find a NULL hdev and get dropped.
+	 */
+	spin_lock_irqsave(&ally_data_lock, flags);
+	ally->ally_x_hdev = hdev;
+	spin_unlock_irqrestore(&ally_data_lock, flags);
 
 	ret = input_register_device(input);
 	if (ret) {
@@ -4058,49 +4700,110 @@ static int ally_x_setup_input(struct hid_device *hdev, struct ally_handheld *all
 		goto ally_x_setup_input_err;
 	}
 
+	/* Publish the input_dev only when it is fully set up. */
+	spin_lock_irqsave(&ally_data_lock, flags);
 	ally->ally_x_input = input;
+	spin_unlock_irqrestore(&ally_data_lock, flags);
 
 	return 0;
 ally_x_setup_input_err:
+	spin_lock_irqsave(&ally_data_lock, flags);
+	if (ally->ally_x_hdev == hdev)
+		ally->ally_x_hdev = NULL;
+	spin_unlock_irqrestore(&ally_data_lock, flags);
+
+	input_free_device(input);
 	return ret;
 }
 
 static int hid_asus_ally_init(struct hid_device *hdev, struct ally_handheld *ally)
 {
+	struct hid_device *x_hdev;
+	struct ally_config *cfg;
+	unsigned long flags;
 	int ret;
 
-	/* Failure at this point is non-critical */
-	ret = ally_gamepad_send_packet(ally, hdev, ALLY_FORCE_FEEDBACK_OFF,
-				       sizeof(ALLY_FORCE_FEEDBACK_OFF));
-	if (ret < 0)
-		hid_err(hdev, "Ally failed to init force-feedback off: %d\n", ret);
+	/*
+	 * The force-feedback "off" packet belongs to the gamepad interface,
+	 * which consumes it as an output report: the config interface probed
+	 * here would reject it. The gamepad probe path sends the packet itself,
+	 * so this only matters when the gamepad interface is already bound,
+	 * e.g. after a reset resume that re-initialized the MCU.
+	 */
+	spin_lock_irqsave(&ally_data_lock, flags);
+	x_hdev = ally->ally_x_hdev;
+	if (x_hdev)
+		get_device(&x_hdev->dev);
+	spin_unlock_irqrestore(&ally_data_lock, flags);
 
-	/* Set the default gamepad mode now that the MCU is confirmed ready */
-	if (ally->config) {
-		ret = ally_set_default_gamepad_mode(hdev, ally, ally->config);
+	if (x_hdev) {
+		/* Failure at this point is non-critical */
+		ret = ally_x_send_ff_off(ally, x_hdev);
+
 		if (ret < 0)
-			hid_warn(hdev, "Failed to set default gamepad mode: %d\n", ret);
+			hid_err(hdev, "Ally failed to init force-feedback off: %d\n",
+				ret);
+
+		put_device(&x_hdev->dev);
+	}
+
+	cfg = ally_get_config(ally);
+	if (!cfg)
+		return 0;
+
+	/* The MCU may have just been reset: restore the cached state. */
+	guard(mutex)(&cfg->config_mutex);
+
+	if (cfg->xbox_controller_enabled) {
+		ret = ally_set_xbox_controller(hdev, ally, cfg, true);
+		if (ret < 0)
+			hid_warn(hdev, "Failed to restore Xbox controller mode: %d\n",
+				 ret);
 	}
 
 	return 0;
 }
 
+/**
+ * hid_asus_ally_raw_event() - Route raw reports from the Ally interfaces
+ * @hdev: HID device
+ * @ally: ally handheld structure
+ * @report: HID report the raw data arrived in
+ * @data: raw report buffer
+ * @size: length of @data in bytes
+ *
+ * Called from the raw_event callback, which may run in atomic (URB
+ * completion) context: only spinlock-protected accesses to the shared
+ * state are allowed here.
+ *
+ * Return: true if the event was handled, otherwise false
+ */
 static bool hid_asus_ally_raw_event(struct hid_device *hdev, struct ally_handheld *ally,
-			struct hid_report *report, u8 *data, int size)
+			    struct hid_report *report, u8 *data, int size)
 {
 	struct input_dev *x_input;
 	struct hid_device *x_hdev;
+	unsigned long flags;
+	bool handled;
 
 	if (!ally)
 		return false;
 
 	switch (ally_get_endpoint_address(hdev)) {
 	case HID_ALLY_X_INTF_IN:
-		scoped_guard(mutex, &ally_data_mutex) {
-			x_input = ally->ally_x_input;
-			x_hdev = ally->ally_x_hdev;
-		}
-		if (ally_x_raw_event(x_input, x_hdev, report, data, size))
+		/*
+		 * Take a reference on the input_dev while using it: the
+		 * gamepad interface can be unbound concurrently, and its
+		 * input_dev is freed with it.
+		 */
+		spin_lock_irqsave(&ally_data_lock, flags);
+		x_input = input_get_device(ally->ally_x_input);
+		x_hdev = ally->ally_x_hdev;
+		spin_unlock_irqrestore(&ally_data_lock, flags);
+
+		handled = ally_x_raw_event(x_input, x_hdev, report, data, size);
+		input_put_device(x_input);
+		if (handled)
 			return true;
 		break;
 	case HID_ALLY_INTF_CFG_IN:
@@ -4118,133 +4821,236 @@ static bool hid_asus_ally_raw_event(struct hid_device *hdev, struct ally_handhel
 	return false;
 }
 
-/*
- * Initialize ROG Ally HID extension: this module works alongside
- * the main Asus HID driver to handle Ally-specific features
- * and quirks.
+/**
+ * hid_asus_ally_probe() - Initialize the ROG Ally HID extension
+ * @hdev: HID device
  *
- * returns:
- * Either an ally_handheld struct pointer on success, or an ERR_PTR on failure.
- * The caller is not expected to use the returned pointer, but it should
- * check for errors by using IS_ERR and PTR_ERR and pass to other functions
- * NULL if there was an error.
+ * This module works alongside the main Asus HID driver to handle
+ * Ally-specific features and quirks.
+ *
+ * Return: an ally_handheld struct pointer on success, an ERR_PTR on
+ * failure. The caller is not expected to use the returned pointer, but it
+ * should check for errors by using IS_ERR and PTR_ERR and pass NULL to
+ * other functions if there was an error.
  */
 static struct ally_handheld *hid_asus_ally_probe(struct hid_device *hdev)
 {
-	int ret = 0, ep = ally_get_endpoint_address(hdev);
+	unsigned long flags;
+	int ret, ep = ally_get_endpoint_address(hdev);
+	struct usb_device *udev;
 	struct ally_config *ally_cfg;
 	struct hid_input *hidinput;
 
 	if (ep < 0)
 		return ERR_PTR(ep);
 
-	scoped_guard(mutex, &ally_data_mutex)
-		switch (ep) {
-		case HID_ALLY_INTF_CFG_IN:
-			ally_drvdata.cfg_hdev = hdev;
+	if (!hid_is_usb(hdev))
+		return ERR_PTR(-ENODEV);
 
-			/*
-			 * This function assumes the asus-specific initialization
-			 * to have been performed already at this point.
-			 */
-			ret = ally_gamepad_check_ready(&ally_drvdata, hdev);
-			if (ret < 0) {
-				hid_err(hdev, "ROG Ally device is not ready: %d\n", ret);
-				return ERR_PTR(ret);
-			}
+	/*
+	 * The ROG Ally controller is integrated into a handheld PC, so at
+	 * most one device can exist and the shared global state relies on
+	 * that: reject a probe from a different USB device, or a spoofed
+	 * peripheral could overwrite the state of the real controller. The
+	 * recorded device is dropped when the last interface of the
+	 * controller is unbound, so the re-enumeration the embedded
+	 * controller performs after a suspend cycle (it cuts the controller
+	 * power when powersave is enabled) is still accepted.
+	 */
+	udev = interface_to_usbdev(to_usb_interface(hdev->dev.parent));
 
-			ally_cfg = ally_config_create(hdev, &ally_drvdata);
-			if (IS_ERR(ally_cfg)) {
-				hid_err(hdev, "Failed to create Ally cfg: %ld\n",
-					PTR_ERR(ally_cfg));
-				ally_drvdata.cfg_hdev = NULL;
-				return ERR_PTR(PTR_ERR(ally_cfg));
-			}
-			ally_drvdata.config = ally_cfg;
+	spin_lock_irqsave(&ally_data_lock, flags);
+	if (ally_drvdata.udev && ally_drvdata.udev != udev) {
+		spin_unlock_irqrestore(&ally_data_lock, flags);
+		hid_err(hdev, "A ROG Ally controller is already connected\n");
+		return ERR_PTR(-ENODEV);
+	}
+	if (!ally_drvdata.udev) {
+		usb_get_dev(udev);
+		ally_drvdata.udev = udev;
+	}
+	spin_unlock_irqrestore(&ally_data_lock, flags);
 
-			ret = hid_asus_ally_init(hdev, &ally_drvdata);
-			if (ret < 0) {
-				ally_config_remove(hdev, &ally_drvdata);
-				ally_drvdata.config = NULL;
-				ally_drvdata.cfg_hdev = NULL;
-				return ERR_PTR(ret);
-			}
-
-			break;
-		case HID_ALLY_X_INTF_IN:
-			ally_drvdata.ally_x_hdev = hdev;
-			/* This will create and populate ally_x_input */
-			ret = ally_x_setup_input(hdev, &ally_drvdata);
-			if (ret) {
-				hid_err(hdev, "Failed to create Ally X gamepad device.\n");
-				ally_drvdata.ally_x_hdev = NULL;
-				return ERR_PTR(ret);
-			}
-			break;
-		case HID_ALLY_INTF_KEYBOARD_IN:
-			ally_drvdata.keyboard_hdev = hdev;
-			if (!list_empty(&hdev->inputs)) {
-				hidinput = list_first_entry(&hdev->inputs, struct hid_input, list);
-				ally_drvdata.keyboard_input = hidinput->input;
-			}
-			break;
-		default:
-			/* This is normally supposed to happen */
-			break;
+	/*
+	 * The interface initialization sleeps (it performs USB transfers),
+	 * so it must run before taking the spinlock guarding the shared
+	 * state; pointers are published only once it succeeded.
+	 */
+	switch (ep) {
+	case HID_ALLY_INTF_CFG_IN:
+		/*
+		 * This function assumes the asus-specific initialization
+		 * to have been performed already at this point.
+		 */
+		ret = ally_gamepad_check_ready(&ally_drvdata, hdev);
+		if (ret < 0) {
+			hid_err(hdev, "ROG Ally device is not ready: %d\n", ret);
+			ally_put_udev_if_orphaned();
+			return ERR_PTR(ret);
 		}
+
+		ally_cfg = ally_config_create(hdev, &ally_drvdata);
+		if (IS_ERR(ally_cfg)) {
+			hid_err(hdev, "Failed to create Ally cfg: %ld\n",
+				PTR_ERR(ally_cfg));
+			ally_put_udev_if_orphaned();
+			return ERR_PTR(PTR_ERR(ally_cfg));
+		}
+
+		ret = hid_asus_ally_init(hdev, &ally_drvdata);
+		if (ret < 0) {
+			ally_put_udev_if_orphaned();
+			return ERR_PTR(ret);
+		}
+
+		spin_lock_irqsave(&ally_data_lock, flags);
+		ally_drvdata.config = ally_cfg;
+		ally_drvdata.cfg_hdev = hdev;
+		spin_unlock_irqrestore(&ally_data_lock, flags);
+		break;
+	case HID_ALLY_X_INTF_IN:
+		/* This will create and populate ally_x_input */
+		ret = ally_x_setup_input(hdev, &ally_drvdata);
+		if (ret) {
+			hid_err(hdev, "Failed to create Ally X gamepad device.\n");
+			ally_put_udev_if_orphaned();
+			return ERR_PTR(ret);
+		}
+
+		/*
+		 * Make sure rumble starts disabled: this is the interface that
+		 * owns the force-feedback output report. Failure is non-critical.
+		 */
+		ret = ally_x_send_ff_off(&ally_drvdata, hdev);
+		if (ret < 0)
+			hid_warn(hdev, "Failed to disable force-feedback: %d\n", ret);
+
+		break;
+	case HID_ALLY_INTF_KEYBOARD_IN:
+		spin_lock_irqsave(&ally_data_lock, flags);
+		ally_drvdata.keyboard_hdev = hdev;
+		if (!list_empty(&hdev->inputs)) {
+			hidinput = list_first_entry(&hdev->inputs, struct hid_input, list);
+			ally_drvdata.keyboard_input = hidinput->input;
+		}
+		spin_unlock_irqrestore(&ally_data_lock, flags);
+		break;
+	default:
+		/* This is normally supposed to happen */
+		break;
+	}
 
 	return &ally_drvdata;
 }
 
 static void hid_asus_ally_remove(struct hid_device *hdev, struct ally_handheld *ally)
 {
+	struct input_dev *x_input = NULL;
+	struct ally_config *cfg = NULL;
+	unsigned long flags;
+	bool owns_xpad;
+	bool owns_cfg;
+
 	if (!ally)
 		return;
 
 	/*
 	 * Any of the three interfaces can own an input_dev the resume work
 	 * reports through, and they are torn down in an arbitrary order, so
-	 * drain it before clearing anything. Cancel outside ally_data_mutex so
-	 * a handler that wants the mutex cannot deadlock against us.
+	 * drain it before clearing anything. Cancel outside ally_data_lock so
+	 * a handler that wants the lock cannot deadlock against us.
 	 */
 	cancel_delayed_work_sync(&ally->resume_work);
 
-	scoped_guard(mutex, &ally_data_mutex) {
-		if (ally->ally_x_hdev == hdev) {
-			scoped_guard(spinlock_irqsave, &ally->ff_lock)
-				ally->ff_work_initialized = false;
-			cancel_work_sync(&ally->ff_work);
-			ally->ally_x_input = NULL;
-			ally->ally_x_hdev = NULL;
-		}
+	spin_lock_irqsave(&ally_data_lock, flags);
+	owns_xpad = ally->ally_x_hdev == hdev;
+	spin_unlock_irqrestore(&ally_data_lock, flags);
+
+	if (owns_xpad) {
+		/*
+		 * Stop queueing force-feedback work before the gamepad
+		 * pointers are cleared: play_effect() tests the flag under the
+		 * same lock, so no work can be queued past the cancel below.
+		 */
+		scoped_guard(spinlock_irqsave, &ally->ff_lock)
+			ally->ff_work_initialized = false;
 
 		/*
-		 * The keyboard interface is torn down before the config one, and
-		 * its input_dev is freed with it. handle_ally_event() and
-		 * ally_resume_work_fn() both report keys through it from the
-		 * config endpoint, so drop the references here or they dangle.
+		 * cancel_work_sync() may sleep: keep it out of ally_data_lock,
+		 * but run it before the pointers are cleared so in-flight work
+		 * cannot outlive the interface it sends through.
 		 */
-		if (ally->keyboard_hdev == hdev) {
-			ally->keyboard_input = NULL;
-			ally->keyboard_hdev = NULL;
-		}
+		cancel_work_sync(&ally->ff_work);
 
-		if (ally->cfg_hdev == hdev) {
-			ally_config_remove(hdev, ally);
-			ally->cfg_hdev = NULL;
-			ally->config = NULL;
-		}
+		/*
+		 * The input core can no longer stop effects through the
+		 * disabled work: quiesce any rumble still playing ourselves,
+		 * or the device would keep vibrating after being unbound.
+		 */
+		if (ally_x_send_ff_off(ally, hdev) < 0)
+			hid_warn(hdev, "Failed to stop force-feedback\n");
 	}
+
+	spin_lock_irqsave(&ally_data_lock, flags);
+	if (owns_xpad) {
+		ally->ally_x_input = NULL;
+		ally->ally_x_hdev = NULL;
+	}
+
+	/*
+	 * The keyboard interface is torn down before the config one, and
+	 * its input_dev is freed with it. handle_ally_event() and
+	 * ally_resume_work_fn() both report keys through it from the
+	 * config endpoint, so drop the references here or they dangle.
+	 */
+	if (ally->keyboard_hdev == hdev) {
+		x_input = ally->ally_x_input;
+		ally->ally_x_input = NULL;
+		ally->keyboard_input = NULL;
+		ally->keyboard_hdev = NULL;
+	}
+
+	owns_cfg = ally->cfg_hdev == hdev;
+	if (owns_cfg) {
+		cfg = ally->config;
+		ally->cfg_hdev = NULL;
+		ally->config = NULL;
+	}
+
+	spin_unlock_irqrestore(&ally_data_lock, flags);
+
+	/*
+	 * The config teardown removes sysfs groups and takes sleeping locks:
+	 * it must not run under ally_data_lock. The config pointer has been
+	 * unpublished above, so no new sysfs callback can find it while the
+	 * groups are being removed.
+	 */
+	if (owns_cfg)
+		ally_config_remove(hdev, cfg);
+
+	if (x_input)
+		input_unregister_device(x_input);
+
+	/*
+	 * Drop the recorded USB device when the last interface of the
+	 * controller has been unbound: the driver is then ready to accept
+	 * the controller again when it reconnects.
+	 */
+	ally_put_udev_if_orphaned();
 }
 
 static int hid_asus_ally_reset_resume(struct hid_device *hdev, struct ally_handheld *ally)
 {
-	int ep = ally_get_endpoint_address(hdev);
-	int ret;
+	int ep, ret;
 
+	/*
+	 * The extensions failed to probe and the device is operating as a
+	 * generic HID device: do not fail the resume because of that.
+	 */
 	if (!ally)
-		return -EINVAL;
+		return 0;
 
+	ep = ally_get_endpoint_address(hdev);
 	if (ep != HID_ALLY_INTF_CFG_IN)
 		return 0;
 
@@ -4535,9 +5341,9 @@ static int asus_raw_event(struct hid_device *hdev,
 	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD) {
 		/*
 		 * Return -1 to suppress further processing by the generic HID
-		 * input parser for reports we fully handle for the Gamepad (0x0B).
-		 * If we let 0x0B fallthrough then the default parser creates a
-		 * generic gamepad causing Steam Input overlaps (i.e. L1 stuck on screenshot).
+		 * input parser for reports we fully handle for the Gamepad (0x0B):
+		 * letting 0x0B reach the default parser creates a generic gamepad
+		 * causing Steam Input overlaps (i.e. L1 stuck on screenshot).
 		 */
 		if (hid_asus_ally_raw_event(hdev, drvdata->rog_ally, report, data, size))
 			return -1;
@@ -6371,7 +7177,7 @@ static int asus_input_mapping(struct hid_device *hdev,
 		case 0xa5: asus_map_key_clear(KEY_F15);		break; /* ROG Ally left back */
 		case 0xa6: asus_map_key_clear(KEY_F16);		break; /* ROG Ally QAM button */
 		case 0xa7: asus_map_key_clear(KEY_F17);		break; /* ROG Ally ROG long-press */
-		case 0xa8: asus_map_key_clear(KEY_F18);		break;
+		case 0xa8: asus_map_key_clear(KEY_F18);		break; /* ROG Ally ROG long-press-release */
 
 		default:
 			/* ASUS lazily declares 256 usages, ignore the rest,
@@ -6465,7 +7271,15 @@ static int asus_start_multitouch(struct hid_device *hdev)
 	return 0;
 }
 
-static int asus_initialize_reports(struct hid_device *hdev)
+/*
+ * Initialize the reports of the device.
+ *
+ * Failures are intentionally not fatal: asus_kbd_init() tolerates a wrong
+ * handshake until this is verified to work for all devices, so a failure
+ * is only reported and the initialization of the remaining reports is
+ * still attempted.
+ */
+static void asus_initialize_reports(struct hid_device *hdev)
 {
 	int ret;
 
@@ -6477,8 +7291,6 @@ static int asus_initialize_reports(struct hid_device *hdev)
 					 asus_report_id_init[r], ret);
 		}
 	}
-
-	return 0;
 }
 
 static int __maybe_unused asus_resume(struct hid_device *hdev)
@@ -6511,11 +7323,8 @@ static int __maybe_unused asus_reset_resume(struct hid_device *hdev)
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	int ret;
 
-	ret = asus_initialize_reports(hdev);
-	if (ret) {
-		hid_err(hdev, "Asus initialize reports failed: %d\n", ret);
-		return ret;
-	}
+	if (!drvdata->tp)
+		asus_initialize_reports(hdev);
 
 	if (drvdata->tp)
 		return asus_start_multitouch(hdev);
@@ -6642,11 +7451,8 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return ret;
 	}
 
-	ret = asus_initialize_reports(hdev);
-	if (ret) {
-		hid_err(hdev, "Asus initialize reports failed: %d\n", ret);
-		goto err_stop_hw;
-	}
+	if (!drvdata->tp)
+		asus_initialize_reports(hdev);
 
 	/* Laptops keyboard backlight is always at 0x5a */
 	if (is_vendor && (drvdata->quirks & QUIRK_USE_KBD_BACKLIGHT) &&
@@ -6710,6 +7516,9 @@ err_stop_hw:
 		asus_usb_rgb_remove(drvdata->usb_rgb_dev);
 		drvdata->usb_rgb_dev = NULL;
 	}
+
+	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD)
+		hid_asus_ally_remove(hdev, drvdata->rog_ally);
 
 	asus_worker_stop(drvdata->worker);
 	hid_hw_stop(hdev);
