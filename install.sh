@@ -246,6 +246,12 @@ if [ ! -f "$MODULE_FILE" ]; then
     error "Build failed! $MODULE_FILE not found."
 fi
 
+if [ -d "audio" ]; then
+    log "Building audio modules using headers at ${KDIR}..."
+    "${AS_BUILDER[@]}" make -C audio clean KDIR="${KDIR}"
+    "${AS_BUILDER[@]}" make -C audio all KDIR="${KDIR}"
+fi
+
 log "Compressing module..."
 "${AS_BUILDER[@]}" zstd -f "$MODULE_FILE"
 # The Makefile only builds the stub on kernels whose asus-wmi lacks the
@@ -278,6 +284,46 @@ elif [ -e "${INSTALL_PATH}/${STUB_ZST}" ]; then
     # in modules.dep and would fail to insert here, taking hid-asus with it.
     log "Removing stale ${STUB_ZST} left by a previous install..."
     rm -f "${INSTALL_PATH}/${STUB_ZST}"
+fi
+
+if [ -d "audio" ]; then
+    log "Installing audio modules to /lib/modules/${KVER}/kernel/..."
+    base_kdir="/lib/modules/${KVER}/kernel"
+    audio_mods=(
+        "audio/snd-acp-config.ko:sound/soc/amd/snd-acp-config.ko.zst"
+        "audio/snd-soc-acpi-amd-match.ko:sound/soc/amd/acp/snd-soc-acpi-amd-match.ko.zst"
+        "audio/snd-soc-sdw-utils.ko:sound/soc/sdw_utils/snd-soc-sdw-utils.ko.zst"
+        "audio/snd-soc-tas2783-sdw.ko:sound/soc/codecs/snd-soc-tas2783-sdw.ko.zst"
+        "audio/snd-soc-rt721-sdca.ko:sound/soc/codecs/snd-soc-rt721-sdca.ko.zst"
+        "audio/snd-acp-sdw-legacy-mach.ko:sound/soc/amd/acp/snd-acp-sdw-legacy-mach.ko.zst"
+        "audio/snd-pci-ps.ko:sound/soc/amd/ps/snd-pci-ps.ko.zst"
+    )
+    for entry in "${audio_mods[@]}"; do
+        src="${entry%%:*}"
+        rel="${entry##*:}"
+        dst="${base_kdir}/${rel}"
+        if [ -f "$src" ]; then
+            "${AS_BUILDER[@]}" zstd -f "$src"
+            zst="${src}.zst"
+            if [ -f "$dst" ]; then
+                if [ ! -f "${dst}.bak" ] || [ "$FORCE_BACKUP" = true ]; then
+                    log "Backing up stock $rel..."
+                    cp -f "$dst" "${dst}.bak"
+                fi
+            fi
+            mkdir -p "$(dirname "$dst")"
+            cp -f "$zst" "$dst"
+        fi
+    done
+
+    fw_dir="/lib/firmware/ti/audio/tas2783"
+    if [ -d "$fw_dir" ]; then
+        log "Setting up TAS2783 firmware symlinks for ASUS RC74XA (1043:1954)..."
+        ln -sf 1AC4-1-0-0x8.bin.zst "$fw_dir/1954-1-0-0x8.bin.zst"
+        ln -sf 1AC4-1-0-0xB.bin.zst "$fw_dir/1954-1-0-0xB.bin.zst"
+        ln -sf 1AC4-0-0-0x8.bin.zst "$fw_dir/1954-0-0-0x8.bin.zst"
+        ln -sf 1AC4-0-0-0xB.bin.zst "$fw_dir/1954-0-0-0xB.bin.zst"
+    fi
 fi
 
 log "Updating dependency map..."
@@ -412,6 +458,15 @@ fi
 log "Installation complete!"
 log "Checking dmesg for Ally X registration..."
 dmesg | grep -i "asus" | tail -n 5 || true
+
+if [ -d "audio" ]; then
+    log "Audio modules installed for AMD ACP 7.0 / SoundWire."
+    if [ -d "/sys/bus/soundwire/devices" ] && [ "$(ls -1 /sys/bus/soundwire/devices/ 2>/dev/null | wc -l)" -gt 0 ]; then
+        log "SoundWire devices enumerated: $(ls -1 /sys/bus/soundwire/devices/ | tr '\n' ' ')"
+    else
+        warn "SoundWire audio requires a system reboot to initialize ACP 7.0 hardware: 'sudo reboot'"
+    fi
+fi
 
 log "Note: SteamOS updates wipe /etc/modprobe.d, which un-blocks the stock"
 log "driver and lets it silently reclaim interfaces on the next probe. Always"

@@ -54,6 +54,35 @@ if [ -f "$BACKUP_FILE" ]; then
     cp -f "$BACKUP_FILE" "$TARGET_FILE"
     rm -f "$BACKUP_FILE"
     rm -f "$STUB_TARGET"
+
+    base_kdir="/lib/modules/$(uname -r)/kernel"
+    audio_mods=(
+        "sound/soc/amd/snd-acp-config.ko.zst"
+        "sound/soc/amd/acp/snd-soc-acpi-amd-match.ko.zst"
+        "sound/soc/sdw_utils/snd-soc-sdw-utils.ko.zst"
+        "sound/soc/codecs/snd-soc-tas2783-sdw.ko.zst"
+        "sound/soc/codecs/snd-soc-rt721-sdca.ko.zst"
+        "sound/soc/amd/acp/snd-acp-sdw-legacy-mach.ko.zst"
+        "sound/soc/amd/ps/snd-pci-ps.ko.zst"
+    )
+    for rel in "${audio_mods[@]}"; do
+        dst="${base_kdir}/${rel}"
+        bak="${dst}.bak"
+        if [ -f "$bak" ]; then
+            log "Restoring stock $rel from backup..."
+            cp -f "$bak" "$dst"
+            rm -f "$bak"
+        fi
+    done
+
+    fw_dir="/lib/firmware/ti/audio/tas2783"
+    for fw in 1954-1-0-0x8.bin.zst 1954-1-0-0xB.bin.zst 1954-0-0-0x8.bin.zst 1954-0-0-0xB.bin.zst; do
+        if [ -L "$fw_dir/$fw" ]; then
+            log "Removing firmware symlink $fw..."
+            rm -f "$fw_dir/$fw"
+        fi
+    done
+
     log "Restoration complete."
 else
     warn "No local backup found at $BACKUP_FILE."

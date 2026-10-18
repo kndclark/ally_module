@@ -17,6 +17,12 @@ endif
 all:
 	make -C $(KDIR) M=$(PWD) modules CONFIG_DEBUG_INFO_BTF_MODULES=
 
+audio:
+	$(MAKE) -C audio all
+
+audio-clean:
+	$(MAKE) -C audio clean
+
 clean:
 	@if [ -d "$(KDIR)" ]; then \
 		make -C $(KDIR) M=$(PWD) clean; \
