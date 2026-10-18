@@ -448,6 +448,7 @@ enum asus_usb_rgb_effect {
 	ASUS_USB_RGB_EFFECT_STROBE = 10,
 	ASUS_USB_RGB_EFFECT_COMET = 11,
 	ASUS_USB_RGB_EFFECT_FLASH = 12,
+	ASUS_USB_RGB_EFFECT_REACTIVE = 14,
 	ASUS_USB_RGB_EFFECT_MAX,
 };
 
@@ -664,6 +665,7 @@ static const char *const asus_usb_rgb_effect_strings[ASUS_USB_RGB_EFFECT_MAX] = 
 	[ASUS_USB_RGB_EFFECT_STROBE] = "strobe",
 	[ASUS_USB_RGB_EFFECT_COMET] = "comet",
 	[ASUS_USB_RGB_EFFECT_FLASH] = "flash",
+	[ASUS_USB_RGB_EFFECT_REACTIVE] = "reactive",
 };
 
 /*
@@ -706,7 +708,8 @@ static const struct asus_usb_rgb_hw_desc asus_usb_rgb_hw_ally = {
 			     BIT(ASUS_USB_RGB_EFFECT_BREATHING) |
 			     BIT(ASUS_USB_RGB_EFFECT_COLOR_CYCLE) |
 			     BIT(ASUS_USB_RGB_EFFECT_RAINBOW) |
-			     BIT(ASUS_USB_RGB_EFFECT_STROBE),
+			     BIT(ASUS_USB_RGB_EFFECT_STROBE) |
+			     BIT(ASUS_USB_RGB_EFFECT_REACTIVE),
 };
 
 struct asus_usb_rgb_hw_match {
@@ -5994,7 +5997,11 @@ static int asus_usb_rgb_send_zone_effect(struct asus_usb_rgb_zone *zone)
 		report.bg_green = state->enabled ? state->bg_green : 0;
 		report.bg_blue = state->enabled ? state->bg_blue : 0;
 	}
-	report.speed = asus_usb_rgb_speed_to_hw(state->speed);
+	if (state->effect == ASUS_USB_RGB_EFFECT_STROBE ||
+	    state->effect == ASUS_USB_RGB_EFFECT_STATIC)
+		report.speed = 0;
+	else
+		report.speed = asus_usb_rgb_speed_to_hw(state->speed);
 	report.direction = state->direction;
 
 	memcpy(out, &report, sizeof(report));
