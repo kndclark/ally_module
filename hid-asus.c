@@ -132,8 +132,8 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define ASUS_USB_RGB_CMD_APPLY	0xb4
 #define ASUS_USB_RGB_CMD_SET	0xb5
 
-#define ASUS_USB_RGB_DIRECTION_REVERSE	0x00
-#define ASUS_USB_RGB_DIRECTION_FORWARD	0x01
+#define ASUS_USB_RGB_DIRECTION_FORWARD	0x00
+#define ASUS_USB_RGB_DIRECTION_REVERSE	0x01
 
 /* Global hardware brightness control (report 0x5d) */
 #define ASUS_USB_RGB_BRIGHTNESS_CMD1	0xba
@@ -6357,8 +6357,8 @@ static ssize_t asus_usb_rgb_zone_enabled_index_show(struct device *dev,
 }
 
 static const char *const asus_usb_rgb_direction_strings[] = {
-	[ASUS_USB_RGB_DIRECTION_REVERSE] = "reverse",
 	[ASUS_USB_RGB_DIRECTION_FORWARD] = "forward",
+	[ASUS_USB_RGB_DIRECTION_REVERSE] = "reverse",
 };
 
 static ssize_t asus_usb_rgb_zone_direction_show(struct device *dev,
