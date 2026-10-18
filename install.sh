@@ -377,6 +377,21 @@ if [ "$INSTALL_AUDIO" = true ]; then
         ln -sf 1AC4-0-0-0x8.bin.zst "$fw_dir/1954-0-0-0x8.bin.zst"
         ln -sf 1AC4-0-0-0xB.bin.zst "$fw_dir/1954-0-0-0xB.bin.zst"
     fi
+
+    # Install UCM2 configurations for TAS2783 (missing in stock SteamOS alsa-ucm-conf)
+    ucm_base="/usr/share/alsa/ucm2"
+    if [ -d "$ucm_base" ]; then
+        if [ -f "ucm2/sof-soundwire/tas2783.conf" ]; then
+            log "Installing TAS2783 UCM profile to $ucm_base/sof-soundwire/..."
+            mkdir -p "$ucm_base/sof-soundwire"
+            cp -f "ucm2/sof-soundwire/tas2783.conf" "$ucm_base/sof-soundwire/tas2783.conf"
+        fi
+        if [ -f "ucm2/codecs/tas2783/init.conf" ]; then
+            log "Installing TAS2783 codec init to $ucm_base/codecs/tas2783/..."
+            mkdir -p "$ucm_base/codecs/tas2783"
+            cp -f "ucm2/codecs/tas2783/init.conf" "$ucm_base/codecs/tas2783/init.conf"
+        fi
+    fi
 fi
 
 # Emergency Boot Guard Installation
@@ -548,6 +563,10 @@ if [ "$INSTALL_AUDIO" = true ]; then
     log "Audio modules installed for AMD ACP 7.0 / SoundWire."
     if [ -d "/sys/bus/soundwire/devices" ] && [ "$(ls -1 /sys/bus/soundwire/devices/ 2>/dev/null | wc -l)" -gt 0 ]; then
         log "SoundWire devices enumerated: $(ls -1 /sys/bus/soundwire/devices/ | tr '\n' ' ')"
+        if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+            log "Refreshing PipeWire audio services for user '$TARGET_USER'..."
+            runuser -u "$TARGET_USER" -- systemctl --user restart pipewire wireplumber 2>/dev/null || true
+        fi
     else
         warn "SoundWire audio requires a system reboot to initialize ACP 7.0 hardware: 'sudo reboot'"
     fi

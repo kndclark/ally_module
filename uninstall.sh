@@ -92,6 +92,12 @@ for fw in 1954-1-0-0x8.bin.zst 1954-1-0-0xB.bin.zst 1954-0-0-0x8.bin.zst 1954-0-
     fi
 done
 
+# Remove TAS2783 UCM profiles
+log "Removing TAS2783 UCM profiles..."
+rm -f /usr/share/alsa/ucm2/sof-soundwire/tas2783.conf
+rm -f /usr/share/alsa/ucm2/codecs/tas2783/init.conf
+rmdir /usr/share/alsa/ucm2/codecs/tas2783 2>/dev/null || true
+
 # Remove emergency recovery guard service
 log "Removing emergency recovery guard service..."
 rm -f /etc/systemd/system/emergency.target.wants/ally-emergency-recovery.service \
