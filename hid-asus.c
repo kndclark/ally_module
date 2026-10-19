@@ -7427,6 +7427,11 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	if (drvdata->quirks & QUIRK_NO_INIT_REPORTS)
 		hdev->quirks |= HID_QUIRK_NO_INIT_REPORTS;
 
+	if ((drvdata->quirks & QUIRK_ROG_ALLY_XPAD) && hid_is_usb(hdev)) {
+		if (ally_get_endpoint_address(hdev) == HID_ALLY_X_INTF_IN)
+			drvdata->quirks |= QUIRK_SKIP_INPUT_MAPPING;
+	}
+
 	drvdata->hdev = hdev;
 
 	if (drvdata->quirks & (QUIRK_T100CHI | QUIRK_T90CHI)) {
