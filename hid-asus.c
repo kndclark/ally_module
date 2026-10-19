@@ -982,7 +982,11 @@ static bool handle_ally_event(struct hid_device *hdev, struct ally_handheld *all
 		case 0xA8:
 			keycode = KEY_F18;
 			break;
+		case 0xEC:
+			/* Command acknowledgement packets from MCU */
+			return false;
 		default:
+			hid_dbg(hdev, "X20 VENDOR UNMAPPED: %*ph\n", size, data);
 			return false;
 		}
 
@@ -1119,6 +1123,11 @@ static int ally_detect_capabilities(struct hid_device *hdev, struct ally_handhel
 	scoped_guard(mutex, &cfg->config_mutex) {
 		cfg->is_ally_x = (hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY_X);
 
+		/*
+		 * RC74XA reports capability absent (0x0C returns 0x00), so
+		 * the driver never sends CMD_SET_XBOX_CONTROLLER (5A D1 0B 01 01).
+		 * The gamepad functions without it.
+		 */
 		cfg->xbox_controller_support =
 			ally_check_capability(hdev, ally, CMD_CHECK_XBOX_SUPPORT);
 		cfg->user_cal_support =
