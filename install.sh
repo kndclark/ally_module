@@ -29,14 +29,46 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 # --- Arguments ---
 FORCE_BACKUP=false
 CHECK_ONLY=false
+AUDIO_OVERRIDE="" # "yes", "no", or empty for auto-detect
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --force) FORCE_BACKUP=true ;;
         --check) CHECK_ONLY=true ;;
+        --audio) AUDIO_OVERRIDE="yes" ;;
+        --no-audio) AUDIO_OVERRIDE="no" ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
+
+# Hardware detection for models requiring out-of-tree audio (e.g. X20 / RC74XA)
+BOARD_NAME=$(cat /sys/devices/virtual/dmi/id/board_name 2>/dev/null || cat /sys/class/dmi/id/board_name 2>/dev/null || echo "")
+PRODUCT_NAME=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
+
+# The stock asus-armoury has power limits for RC73XA only; RC74XA gets
+# -ENODEV on every ppt_* attribute, so TDP control needs our build.
+INSTALL_ARMOURY=false
+if [ -d "platform/asus-armoury" ] && { [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; }; then
+    INSTALL_ARMOURY=true
+    log "Hardware detected: RC74XA. asus-armoury with RC74XA power limits enabled."
+fi
+
+INSTALL_AUDIO=false
+if [ -d "audio" ]; then
+    if [ "$AUDIO_OVERRIDE" = "yes" ]; then
+        INSTALL_AUDIO=true
+        log "Audio driver installation explicitly enabled via --audio."
+    elif [ "$AUDIO_OVERRIDE" = "no" ]; then
+        INSTALL_AUDIO=false
+        log "Audio driver installation disabled via --no-audio."
+    elif [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; then
+        INSTALL_AUDIO=true
+        log "Hardware detected: ROG Xbox Ally X (RC74XA). SoundWire audio installation enabled."
+    else
+        INSTALL_AUDIO=false
+        log "Hardware detected: ${BOARD_NAME:-$PRODUCT_NAME} (stock audio already functional, skipping out-of-tree audio)."
+    fi
+fi
 
 # Confirm that every ROG Ally HID interface is bound to our driver ("asus"),
 # not the stock in-kernel one ("asus_rog_ally", from hid-asus-ally.ko). This is
@@ -225,7 +257,8 @@ if [ -z "${KVER}" ]; then
 fi
 
 KDIR="/lib/modules/${KVER}/build"
-INSTALL_PATH="/lib/modules/${KVER}/kernel/drivers/hid/"
+UPDATES_BASE="/lib/modules/${KVER}/updates/ally"
+INSTALL_PATH="${UPDATES_BASE}/drivers/hid"
 
 # Compiling needs no privileges, and building as root leaves root-owned
 # objects behind that make the next unprivileged build fail in MODPOST with
@@ -246,8 +279,43 @@ if [ ! -f "$MODULE_FILE" ]; then
     error "Build failed! $MODULE_FILE not found."
 fi
 
+if [ "$INSTALL_AUDIO" = true ]; then
+    log "Building audio modules using headers at ${KDIR}..."
+    "${AS_BUILDER[@]}" make -C audio clean KDIR="${KDIR}"
+    "${AS_BUILDER[@]}" make -C audio all KDIR="${KDIR}"
+fi
+
+if [ "$INSTALL_ARMOURY" = true ]; then
+    log "Building asus-armoury using headers at ${KDIR}..."
+    "${AS_BUILDER[@]}" make -C platform/asus-armoury clean KDIR="${KDIR}"
+    "${AS_BUILDER[@]}" make -C platform/asus-armoury all KDIR="${KDIR}"
+    [ -f platform/asus-armoury/asus-armoury.ko ] || error "Build failed! asus-armoury.ko not found."
+fi
+
+# Pre-flight Symbol & ABI Gate
+log "Running pre-flight symbol verification gate..."
+PREFLIGHT_TARGETS=("$MODULE_FILE")
+if [ "$INSTALL_ARMOURY" = true ]; then
+    PREFLIGHT_TARGETS+=("platform/asus-armoury/asus-armoury.ko")
+fi
+if [ "$INSTALL_AUDIO" = true ]; then
+    for f in audio/*.ko; do
+        [ -f "$f" ] && PREFLIGHT_TARGETS+=("$f")
+    done
+fi
+if [ -f "scripts/preflight_symbol_check.py" ]; then
+    if ! python3 scripts/preflight_symbol_check.py "${PREFLIGHT_TARGETS[@]}" --symvers "${KDIR}/Module.symvers"; then
+        error "Pre-flight symbol check failed! Aborting installation to prevent kernel oops/boot-loop."
+    fi
+else
+    warn "scripts/preflight_symbol_check.py not found; skipping pre-flight gate."
+fi
+
 log "Compressing module..."
 "${AS_BUILDER[@]}" zstd -f "$MODULE_FILE"
+if [ "$INSTALL_ARMOURY" = true ]; then
+    "${AS_BUILDER[@]}" zstd -f platform/asus-armoury/asus-armoury.ko
+fi
 # The Makefile only builds the stub on kernels whose asus-wmi lacks the
 # hid-asus listener API; on the ones that have it the stub is a duplicate
 # GPL export that modprobe refuses, so its absence here is the normal case.
@@ -255,30 +323,137 @@ if [ -f "$STUB_FILE" ]; then
     "${AS_BUILDER[@]}" zstd -f "$STUB_FILE"
 fi
 
-# Backup logic
+# Ensure stock kernel modules under /lib/modules/${KVER}/kernel/ are pristine
+# and not overwritten by previous versions.
+restore_stock_kernel_modules() {
+    local target_kdir="/lib/modules/${KVER}/kernel"
+    local stock_dir="/home/${TARGET_USER}/stock_modules"
+    local files_to_check=(
+        "drivers/hid/hid-asus.ko.zst"
+        "sound/soc/amd/snd-acp-config.ko.zst"
+        "sound/soc/amd/acp/snd-soc-acpi-amd-match.ko.zst"
+        "sound/soc/sdw_utils/snd-soc-sdw-utils.ko.zst"
+        "sound/soc/codecs/snd-soc-tas2783-sdw.ko.zst"
+        "sound/soc/codecs/snd-soc-rt721-sdca.ko.zst"
+        "sound/soc/amd/acp/snd-acp-sdw-legacy-mach.ko.zst"
+        "sound/soc/amd/ps/snd-pci-ps.ko.zst"
+    )
+    for rel in "${files_to_check[@]}"; do
+        local target="${target_kdir}/${rel}"
+        local bak="${target}.bak"
+        if [ -f "$bak" ]; then
+            log "Restoring stock $rel from backup (.bak)..."
+            mv -f "$bak" "$target"
+        elif [ -d "$stock_dir" ]; then
+            local cand=$(find "$stock_dir" -type f -name "$(basename "$target")" 2>/dev/null | head -n 1)
+            if [ -n "$cand" ] && [ -f "$cand" ]; then
+                if ! cmp -s "$cand" "$target" 2>/dev/null; then
+                    log "Restoring pristine stock $rel from extracted official package..."
+                    cp -f "$cand" "$target"
+                fi
+            fi
+        fi
+    done
+}
+restore_stock_kernel_modules
+
+# Install to updates/ally directory (SteamOS search order: updates > extramodules > built-in)
 mkdir -p "$INSTALL_PATH"
-BACKUP_FILE="${INSTALL_PATH}/${MODULE_ZST}.bak"
-TARGET_FILE="${INSTALL_PATH}/${MODULE_ZST}"
-
-if [ -f "$TARGET_FILE" ]; then
-    if [ ! -f "$BACKUP_FILE" ] || [ "$FORCE_BACKUP" = true ]; then
-        log "Creating backup of original driver at $BACKUP_FILE..."
-        cp -f "$TARGET_FILE" "$BACKUP_FILE"
-    else
-        log "Backup already exists at $BACKUP_FILE. Skipping backup."
-    fi
+log "Installing HID module to $INSTALL_PATH..."
+cp -f "$MODULE_ZST" "${INSTALL_PATH}/${MODULE_ZST}"
+ARMOURY_PATH="${UPDATES_BASE}/drivers/platform/x86"
+if [ "$INSTALL_ARMOURY" = true ]; then
+    log "Installing asus-armoury to $ARMOURY_PATH..."
+    mkdir -p "$ARMOURY_PATH"
+    cp -f platform/asus-armoury/asus-armoury.ko.zst "${ARMOURY_PATH}/asus-armoury.ko.zst"
+elif [ -e "${ARMOURY_PATH}/asus-armoury.ko.zst" ]; then
+    rm -f "${ARMOURY_PATH}/asus-armoury.ko.zst"
 fi
-
-log "Installing to $INSTALL_PATH..."
-cp -f "$MODULE_ZST" "$TARGET_FILE"
 if [ -f "$STUB_ZST" ]; then
     cp -f "$STUB_ZST" "${INSTALL_PATH}/${STUB_ZST}"
 elif [ -e "${INSTALL_PATH}/${STUB_ZST}" ]; then
-    # A stub left by an install against an older kernel would still be listed
-    # in modules.dep and would fail to insert here, taking hid-asus with it.
-    log "Removing stale ${STUB_ZST} left by a previous install..."
     rm -f "${INSTALL_PATH}/${STUB_ZST}"
 fi
+
+if [ "$INSTALL_AUDIO" = true ]; then
+    log "Installing audio modules to ${UPDATES_BASE}/sound/..."
+    audio_mods=(
+        "audio/snd-acp-config.ko:sound/soc/amd/snd-acp-config.ko.zst"
+        "audio/snd-soc-acpi-amd-match.ko:sound/soc/amd/acp/snd-soc-acpi-amd-match.ko.zst"
+        "audio/snd-soc-sdw-utils.ko:sound/soc/sdw_utils/snd-soc-sdw-utils.ko.zst"
+        "audio/snd-soc-tas2783-sdw.ko:sound/soc/codecs/snd-soc-tas2783-sdw.ko.zst"
+        "audio/snd-soc-rt721-sdca.ko:sound/soc/codecs/snd-soc-rt721-sdca.ko.zst"
+        "audio/snd-acp-sdw-legacy-mach.ko:sound/soc/amd/acp/snd-acp-sdw-legacy-mach.ko.zst"
+        "audio/snd-pci-ps.ko:sound/soc/amd/ps/snd-pci-ps.ko.zst"
+    )
+    for entry in "${audio_mods[@]}"; do
+        src="${entry%%:*}"
+        rel="${entry##*:}"
+        dst="${UPDATES_BASE}/${rel}"
+        if [ -f "$src" ]; then
+            "${AS_BUILDER[@]}" zstd -f "$src"
+            zst="${src}.zst"
+            mkdir -p "$(dirname "$dst")"
+            cp -f "$zst" "$dst"
+        fi
+    done
+
+    fw_dir="/lib/firmware/ti/audio/tas2783"
+    if [ -d "$fw_dir" ]; then
+        log "Setting up TAS2783 firmware symlinks for ASUS RC74XA (1043:1954)..."
+        ln -sf 1AC4-1-0-0x8.bin.zst "$fw_dir/1954-1-0-0x8.bin.zst"
+        ln -sf 1AC4-1-0-0xB.bin.zst "$fw_dir/1954-1-0-0xB.bin.zst"
+        ln -sf 1AC4-0-0-0x8.bin.zst "$fw_dir/1954-0-0-0x8.bin.zst"
+        ln -sf 1AC4-0-0-0xB.bin.zst "$fw_dir/1954-0-0-0xB.bin.zst"
+    fi
+
+    # Install UCM2 configurations for TAS2783 (missing in stock SteamOS alsa-ucm-conf)
+    ucm_base="/usr/share/alsa/ucm2"
+    if [ -d "$ucm_base" ]; then
+        if [ -f "ucm2/sof-soundwire/tas2783.conf" ]; then
+            log "Installing TAS2783 UCM profile to $ucm_base/sof-soundwire/..."
+            mkdir -p "$ucm_base/sof-soundwire"
+            cp -f "ucm2/sof-soundwire/tas2783.conf" "$ucm_base/sof-soundwire/tas2783.conf"
+        fi
+        if [ -f "ucm2/codecs/tas2783/init.conf" ]; then
+            log "Installing TAS2783 codec init to $ucm_base/codecs/tas2783/..."
+            mkdir -p "$ucm_base/codecs/tas2783"
+            cp -f "ucm2/codecs/tas2783/init.conf" "$ucm_base/codecs/tas2783/init.conf"
+        fi
+    fi
+fi
+
+# Emergency Boot Guard Installation
+install_emergency_guard() {
+    local svc_file="/etc/systemd/system/ally-emergency-recovery.service"
+    local emergency_wants="/etc/systemd/system/emergency.target.wants"
+    local rescue_wants="/etc/systemd/system/rescue.target.wants"
+
+    log "Installing emergency boot guard service..."
+    if [ -f "systemd/ally-emergency-recovery.service" ]; then
+        cp -f "systemd/ally-emergency-recovery.service" "$svc_file"
+    else
+        cat <<'EOF' > "$svc_file"
+[Unit]
+Description=ROG Ally X Out-Of-Tree Module Emergency Recovery Guard
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=emergency.target rescue.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'rm -rf /lib/modules/*/updates/ally /lib/firmware/ti/audio/tas2783/1954-*.bin.zst && depmod -a'
+RemainAfterExit=no
+
+[Install]
+WantedBy=emergency.target rescue.target
+EOF
+    fi
+    mkdir -p "$emergency_wants" "$rescue_wants"
+    ln -sf "$svc_file" "${emergency_wants}/ally-emergency-recovery.service"
+    ln -sf "$svc_file" "${rescue_wants}/ally-emergency-recovery.service"
+}
+install_emergency_guard
 
 log "Updating dependency map..."
 depmod -a
@@ -412,6 +587,19 @@ fi
 log "Installation complete!"
 log "Checking dmesg for Ally X registration..."
 dmesg | grep -i "asus" | tail -n 5 || true
+
+if [ "$INSTALL_AUDIO" = true ]; then
+    log "Audio modules installed for AMD ACP 7.0 / SoundWire."
+    if [ -d "/sys/bus/soundwire/devices" ] && [ "$(ls -1 /sys/bus/soundwire/devices/ 2>/dev/null | wc -l)" -gt 0 ]; then
+        log "SoundWire devices enumerated: $(ls -1 /sys/bus/soundwire/devices/ | tr '\n' ' ')"
+        if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+            log "Refreshing PipeWire audio services for user '$TARGET_USER'..."
+            runuser -u "$TARGET_USER" -- systemctl --user restart pipewire wireplumber 2>/dev/null || true
+        fi
+    else
+        warn "SoundWire audio requires a system reboot to initialize ACP 7.0 hardware: 'sudo reboot'"
+    fi
+fi
 
 log "Note: SteamOS updates wipe /etc/modprobe.d, which un-blocks the stock"
 log "driver and lets it silently reclaim interfaces on the next probe. Always"

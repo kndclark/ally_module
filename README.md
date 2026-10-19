@@ -117,6 +117,20 @@ interface shows no driver at all, the most common cause is a leftover
 
 ---
 
+### Audio (ROG Xbox Ally X / RC74XA)
+
+The ASUS ROG Xbox Ally X (RC74XA) uses SoundWire audio with dual Texas Instruments TAS2783 smart amplifiers and a Realtek ALC721 / RT721 codec on AMD ACP 7.0 (Strix Point). Stock SteamOS kernels do not yet configure SoundWire on this board, leaving internal audio non-functional.
+
+This repository includes out-of-tree audio drivers ported from Matthew Schwartz's audio branch (`matts/7.2/rog-ally-x20-audio`), providing:
+- SoundWire probe override and machine driver entry for ACP 7.0 on ASUS RC74XA
+- TAS2783 smart amplifier driver with UEFI Speaker ID detection and volume persistence across resets
+- RT721 SDCA codec driver with PS0 power state synchronization
+- SoundWire utility support for DisCo port lists
+
+Special thanks and credit to **Matthew Schwartz** (<matthew.schwartz@linux.dev>) for developing and providing these fixes, as well as upstream contributors Fan Wu, Baojun Xu, Oder Chiou, Shuming Fan, Jack Yu, Antoine Monnet, and Andrey Golovko.
+
+---
+
 ## Differences from the kernel-tree version
 
 This out-of-tree build is kept byte-identical to the upstream submission except
@@ -138,8 +152,8 @@ list to include the Ally.
 ## Credits
 
 Built on the ASUS HID driver work of **Luke Jones**, **Denis Benato (NeroReflex)**,
-and **Derek Clark (pastaq)**, and on protocol findings from the ROG Ally reverse-engineering
-community.
+and **Derek Clark (pastaq)**, audio drivers by **Matthew Schwartz**, and on protocol
+findings from the ROG Ally reverse-engineering community.
 
 Hardware protocol notes and captures live in the companion
 [rog-ally-reverse-engineering](https://github.com/kndclark/rog-ally-reverse-engineering)
