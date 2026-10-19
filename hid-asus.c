@@ -6062,8 +6062,8 @@ static int asus_usb_rgb_apply_brightness(struct asus_usb_rgb_zone *zone)
 {
 	struct asus_usb_rgb_dev *rgb = zone->parent;
 	struct asus_usb_rgb_zone_state *state;
-	u8 buf[] = { rgb->desc->brightness_report_id, ASUS_USB_RGB_BRIGHTNESS_CMD1,
-		     ASUS_USB_RGB_BRIGHTNESS_CMD2, ASUS_USB_RGB_BRIGHTNESS_CMD3, 0x00 };
+	u8 feat_buf[ROG_ALLY_REPORT_SIZE] = {};
+	u8 out_buf[ROG_ALLY_REPORT_SIZE] = {};
 	int ret = 0;
 	u8 level;
 
@@ -6089,10 +6089,35 @@ static int asus_usb_rgb_apply_brightness(struct asus_usb_rgb_zone *zone)
 	if (level == rgb->last_hw_level)
 		return 0;
 
-	buf[4] = level;
+	out_buf[0] = FEATURE_KBD_LED_REPORT_ID1; /* 0x5d */
+	out_buf[1] = ASUS_USB_RGB_BRIGHTNESS_CMD1;
+	out_buf[2] = ASUS_USB_RGB_BRIGHTNESS_CMD2;
+	out_buf[3] = ASUS_USB_RGB_BRIGHTNESS_CMD3;
+	out_buf[4] = level;
 
-	scoped_guard(mutex, &rgb->io_mutex)
-		ret = ally_dev_set_report(rgb->hdev, buf, sizeof(buf));
+	feat_buf[0] = FEATURE_KBD_REPORT_ID; /* 0x5a */
+	feat_buf[1] = ASUS_USB_RGB_BRIGHTNESS_CMD1;
+	feat_buf[2] = ASUS_USB_RGB_BRIGHTNESS_CMD2;
+	feat_buf[3] = ASUS_USB_RGB_BRIGHTNESS_CMD3;
+	feat_buf[4] = level;
+
+	scoped_guard(mutex, &rgb->io_mutex) {
+		/*
+		 * Send the primary brightness feature reports (0x5a and 0x5d).
+		 * These use the USB control endpoint and succeed reliably without
+		 * requiring the interface to be held open by userspace.
+		 */
+		ret = ally_dev_set_report(rgb->hdev, feat_buf, sizeof(feat_buf));
+		if (ret >= 0)
+			ally_dev_set_report(rgb->hdev, out_buf, sizeof(out_buf));
+
+		/*
+		 * Also attempt interrupt OUT delivery on ep4 matching Armoury Crate.
+		 * Any error is non-fatal since the feature
+		 * reports already applied the hardware level.
+		 */
+		ally_dev_output_report(rgb->hdev, out_buf, sizeof(out_buf));
+	}
 
 	if (ret >= 0)
 		rgb->last_hw_level = level;
