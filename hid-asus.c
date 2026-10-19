@@ -556,6 +556,7 @@ struct asus_drvdata {
 	unsigned int kbd_backlight_brightness;
 	struct ally_handheld *rog_ally;
 	struct asus_usb_rgb_dev *usb_rgb_dev;
+	bool has_xbox_features;
 	const struct asus_touchpad_info *tp;
 	struct power_supply *battery;
 	struct power_supply_desc battery_desc;
@@ -649,6 +650,7 @@ enum ally_command_codes {
 	CMD_CHECK_GYRO_TO_JOYSTICK      = 0x16,
 	CMD_CHECK_ANTI_DEADZONE         = 0x17,
 	CMD_SET_ANTI_DEADZONE           = 0x18,
+	CMD_CHECK_XBOX_LED_SUPPORT      = 0x1B,
 };
 
 static const char *const asus_usb_rgb_effect_strings[ASUS_USB_RGB_EFFECT_MAX] = {
@@ -708,8 +710,7 @@ static const struct asus_usb_rgb_hw_desc asus_usb_rgb_hw_ally = {
 			     BIT(ASUS_USB_RGB_EFFECT_BREATHING) |
 			     BIT(ASUS_USB_RGB_EFFECT_COLOR_CYCLE) |
 			     BIT(ASUS_USB_RGB_EFFECT_RAINBOW) |
-			     BIT(ASUS_USB_RGB_EFFECT_STROBE) |
-			     BIT(ASUS_USB_RGB_EFFECT_REACTIVE),
+			     BIT(ASUS_USB_RGB_EFFECT_STROBE),
 };
 
 struct asus_usb_rgb_hw_match {
@@ -5895,6 +5896,9 @@ static int asus_aura_query_caps(struct hid_device *hdev, struct asus_aura_caps *
 		caps->mode_mask_low = resp[20];
 		caps->mode_mask_high = resp[21];
 		asus_aura_decode_effect_mask(caps);
+		/* MCU runmode capability byte 19 (0x13) non-0xFF indicates Reactive support */
+		if (resp[19] != 0xff)
+			set_bit(ASUS_USB_RGB_EFFECT_REACTIVE, caps->effects);
 
 		if (!test_bit(ASUS_USB_RGB_EFFECT_STATIC, caps->effects)) {
 			bitmap_zero(caps->effects, ASUS_USB_RGB_EFFECT_MAX);
@@ -5938,13 +5942,9 @@ static int asus_aura_query_status(struct hid_device *hdev, struct asus_aura_caps
 static bool asus_usb_rgb_effect_supported(struct asus_usb_rgb_dev *rgb,
 					  enum asus_usb_rgb_effect effect)
 {
-	if (!rgb->caps.valid) {
-		if (rgb->desc->supported_effects)
-			return effect < ASUS_USB_RGB_EFFECT_MAX &&
-			       rgb->desc->supported_effects & BIT(effect);
+	if (!rgb->caps.valid)
 		return effect < ASUS_USB_RGB_EFFECT_MAX &&
 		       asus_usb_rgb_effect_strings[effect];
-	}
 
 	return test_bit(effect, rgb->caps.effects);
 }
@@ -6633,8 +6633,11 @@ static void asus_usb_rgb_resume_work_fn(struct work_struct *work)
 		asus_usb_rgb_zone_queue_update(&rgb->zones[i], true);
 }
 
+static bool ally_check_xbox_led_support(struct hid_device *hdev);
+
 static struct asus_usb_rgb_dev *asus_usb_rgb_create(struct hid_device *hdev)
 {
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	struct asus_usb_rgb_dev *rgb;
 	const struct asus_usb_rgb_hw_desc *desc;
 	int i;
@@ -6675,6 +6678,16 @@ static struct asus_usb_rgb_dev *asus_usb_rgb_create(struct hid_device *hdev)
 				rgb->caps.keyboard_type, rgb->caps.region_bits,
 				rgb->caps.feature_bits);
 		hid_hw_close(hdev);
+	}
+
+	if (!rgb->caps.valid && desc->supported_effects) {
+		for (i = 0; i < ASUS_USB_RGB_EFFECT_MAX; i++) {
+			if (desc->supported_effects & BIT(i))
+				set_bit(i, rgb->caps.effects);
+		}
+		if (drvdata && drvdata->has_xbox_features)
+			set_bit(ASUS_USB_RGB_EFFECT_REACTIVE, rgb->caps.effects);
+		rgb->caps.valid = true;
 	}
 
 	for (i = 0; i < desc->zone_count; i++) {
@@ -6725,6 +6738,47 @@ static void asus_usb_rgb_resume(struct asus_usb_rgb_dev *rgb)
 	}
 }
 
+
+static bool ally_check_xbox_led_support(struct hid_device *hdev)
+{
+	u8 *set_buf __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
+	u8 *get_buf __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
+	int ret;
+
+	if (!set_buf || !get_buf)
+		return false;
+
+	set_buf[0] = HID_ALLY_SET_REPORT_ID;
+	set_buf[1] = HID_ALLY_FEATURE_CODE_PAGE;
+	set_buf[2] = CMD_CHECK_XBOX_LED_SUPPORT;
+	set_buf[3] = 0x03;
+
+	ret = hid_hw_raw_request(hdev, HID_ALLY_SET_REPORT_ID, set_buf,
+				 ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
+				 HID_REQ_SET_REPORT);
+	if (ret < 0) {
+		hid_warn(hdev, "Xbox LED support query SET_REPORT failed: %d\n", ret);
+		return false;
+	}
+
+	usleep_range(5000, 10000);
+
+	get_buf[0] = HID_ALLY_SET_REPORT_ID;
+	ret = hid_hw_raw_request(hdev, HID_ALLY_SET_REPORT_ID, get_buf,
+				 ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
+				 HID_REQ_GET_REPORT);
+	if (ret < 0) {
+		hid_warn(hdev, "Xbox LED support query GET_REPORT failed: %d\n", ret);
+		return false;
+	}
+
+	hid_dbg(hdev, "Xbox LED support query returned %d, resp: %*ph\n",
+		ret, 8, get_buf);
+
+	return (get_buf[1] == HID_ALLY_FEATURE_CODE_PAGE &&
+		get_buf[2] == CMD_CHECK_XBOX_LED_SUPPORT &&
+		(get_buf[5] & 0x08));
+}
 
 static void asus_kbd_backlight_set(struct asus_hid_listener *listener, int brightness)
 {
@@ -7554,6 +7608,9 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		else
 			drvdata->rog_ally = ally;
 	}
+
+	if (is_vendor && (drvdata->quirks & QUIRK_ROG_ALLY_XPAD))
+		drvdata->has_xbox_features = ally_check_xbox_led_support(hdev);
 
 	if (!drvdata->usb_rgb_dev && asus_usb_rgb_can_initialize(drvdata, is_vendor)) {
 		drvdata->usb_rgb_dev = asus_usb_rgb_create(hdev);
