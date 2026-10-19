@@ -827,6 +827,22 @@ static inline int ally_dev_get_report(struct hid_device *hdev, u8 *out, size_t l
 		HID_FEATURE_REPORT, HID_REQ_GET_REPORT);
 }
 
+static inline int ally_dev_output_report(struct hid_device *hdev, const u8 *buf, size_t len)
+{
+	u8 *dmabuf __free(kfree) = kmemdup(buf, len, GFP_KERNEL);
+	int ret;
+
+	if (!dmabuf)
+		return -ENOMEM;
+
+	ret = hid_hw_output_report(hdev, dmabuf, len);
+	if (ret == -ENOSYS)
+		ret = hid_hw_raw_request(hdev, buf[0], dmabuf, len,
+					 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
+
+	return ret;
+}
+
 static void ally_resume_work_fn(struct work_struct *work)
 {
 	struct ally_handheld *ally = container_of(work, struct ally_handheld,
@@ -4518,9 +4534,10 @@ static void ally_x_input_close(struct input_dev *dev)
  * @buf: buffer containing the report to send
  * @len: length of the report
  *
- * The gamepad interface consumes force-feedback packets as output reports,
- * unlike the config interface which expects feature reports: a rumble packet
- * sent as HID_REQ_SET_REPORT would be rejected by the hardware.
+ * The gamepad interface consumes force-feedback packets as output reports.
+ * Because Interface 5 lacks an interrupt OUT endpoint, hid_hw_output_report()
+ * returns -ENOSYS; fallback to a SET_REPORT control transfer on endpoint 0 per
+ * the USB HID specification.
  *
  * Return: count of data transferred, negative if error
  */
@@ -4528,13 +4545,9 @@ static int ally_x_send_ff_report(struct ally_handheld *ally,
 				 struct hid_device *hdev,
 				 const u8 *buf, size_t len)
 {
-	u8 *dmabuf __free(kfree) = kmemdup(buf, len, GFP_KERNEL);
-	if (!dmabuf)
-		return -ENOMEM;
-
 	guard(mutex)(&ally->intf_mutex);
 
-	return hid_hw_output_report(hdev, dmabuf, len);
+	return ally_dev_output_report(hdev, buf, len);
 }
 
 static int ally_x_send_ff_off(struct ally_handheld *ally, struct hid_device *hdev)
