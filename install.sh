@@ -45,6 +45,14 @@ done
 BOARD_NAME=$(cat /sys/devices/virtual/dmi/id/board_name 2>/dev/null || cat /sys/class/dmi/id/board_name 2>/dev/null || echo "")
 PRODUCT_NAME=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
 
+# The stock asus-armoury has power limits for RC73XA only; RC74XA gets
+# -ENODEV on every ppt_* attribute, so TDP control needs our build.
+INSTALL_ARMOURY=false
+if [ -d "platform/asus-armoury" ] && { [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; }; then
+    INSTALL_ARMOURY=true
+    log "Hardware detected: RC74XA. asus-armoury with RC74XA power limits enabled."
+fi
+
 INSTALL_AUDIO=false
 if [ -d "audio" ]; then
     if [ "$AUDIO_OVERRIDE" = "yes" ]; then
@@ -277,9 +285,19 @@ if [ "$INSTALL_AUDIO" = true ]; then
     "${AS_BUILDER[@]}" make -C audio all KDIR="${KDIR}"
 fi
 
+if [ "$INSTALL_ARMOURY" = true ]; then
+    log "Building asus-armoury using headers at ${KDIR}..."
+    "${AS_BUILDER[@]}" make -C platform/asus-armoury clean KDIR="${KDIR}"
+    "${AS_BUILDER[@]}" make -C platform/asus-armoury all KDIR="${KDIR}"
+    [ -f platform/asus-armoury/asus-armoury.ko ] || error "Build failed! asus-armoury.ko not found."
+fi
+
 # Pre-flight Symbol & ABI Gate
 log "Running pre-flight symbol verification gate..."
 PREFLIGHT_TARGETS=("$MODULE_FILE")
+if [ "$INSTALL_ARMOURY" = true ]; then
+    PREFLIGHT_TARGETS+=("platform/asus-armoury/asus-armoury.ko")
+fi
 if [ "$INSTALL_AUDIO" = true ]; then
     for f in audio/*.ko; do
         [ -f "$f" ] && PREFLIGHT_TARGETS+=("$f")
@@ -295,6 +313,9 @@ fi
 
 log "Compressing module..."
 "${AS_BUILDER[@]}" zstd -f "$MODULE_FILE"
+if [ "$INSTALL_ARMOURY" = true ]; then
+    "${AS_BUILDER[@]}" zstd -f platform/asus-armoury/asus-armoury.ko
+fi
 # The Makefile only builds the stub on kernels whose asus-wmi lacks the
 # hid-asus listener API; on the ones that have it the stub is a duplicate
 # GPL export that modprobe refuses, so its absence here is the normal case.
@@ -340,6 +361,14 @@ restore_stock_kernel_modules
 mkdir -p "$INSTALL_PATH"
 log "Installing HID module to $INSTALL_PATH..."
 cp -f "$MODULE_ZST" "${INSTALL_PATH}/${MODULE_ZST}"
+ARMOURY_PATH="${UPDATES_BASE}/drivers/platform/x86"
+if [ "$INSTALL_ARMOURY" = true ]; then
+    log "Installing asus-armoury to $ARMOURY_PATH..."
+    mkdir -p "$ARMOURY_PATH"
+    cp -f platform/asus-armoury/asus-armoury.ko.zst "${ARMOURY_PATH}/asus-armoury.ko.zst"
+elif [ -e "${ARMOURY_PATH}/asus-armoury.ko.zst" ]; then
+    rm -f "${ARMOURY_PATH}/asus-armoury.ko.zst"
+fi
 if [ -f "$STUB_ZST" ]; then
     cp -f "$STUB_ZST" "${INSTALL_PATH}/${STUB_ZST}"
 elif [ -e "${INSTALL_PATH}/${STUB_ZST}" ]; then
