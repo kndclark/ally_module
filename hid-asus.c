@@ -521,6 +521,7 @@ struct asus_usb_rgb_hw_desc {
 };
 
 struct asus_usb_rgb_dev;
+struct ally_xbox_led;
 
 struct asus_usb_rgb_zone {
 	struct asus_usb_rgb_dev *parent;
@@ -556,6 +557,7 @@ struct asus_drvdata {
 	unsigned int kbd_backlight_brightness;
 	struct ally_handheld *rog_ally;
 	struct asus_usb_rgb_dev *usb_rgb_dev;
+	struct ally_xbox_led *xbox_led;
 	bool has_xbox_features;
 	const struct asus_touchpad_info *tp;
 	struct power_supply *battery;
@@ -636,6 +638,7 @@ enum ally_command_codes {
 	CMD_SET_TRIGGER_RANGE           = 0x05,
 	CMD_SET_VIBRATION_INTENSITY     = 0x06,
 	CMD_LED_CONTROL                 = 0x08,
+	CMD_SET_LED_POWER               = 0x09,
 	CMD_CHECK_READY                 = 0x0A,
 	CMD_SET_XBOX_CONTROLLER         = 0x0B,
 	CMD_CHECK_XBOX_SUPPORT          = 0x0C,
@@ -651,6 +654,8 @@ enum ally_command_codes {
 	CMD_CHECK_ANTI_DEADZONE         = 0x17,
 	CMD_SET_ANTI_DEADZONE           = 0x18,
 	CMD_CHECK_XBOX_LED_SUPPORT      = 0x1B,
+	CMD_SET_XBOX_LED_BRIGHTNESS     = 0x20,
+	CMD_SET_XBOX_LED_EFFECT         = 0x21,
 };
 
 static const char *const asus_usb_rgb_effect_strings[ASUS_USB_RGB_EFFECT_MAX] = {
@@ -6738,6 +6743,228 @@ static void asus_usb_rgb_resume(struct asus_usb_rgb_dev *rgb)
 	}
 }
 
+/*
+ * ROG Xbox Ally X (RC74XA) Guide Button LED control
+ */
+struct ally_xbox_led {
+	struct hid_device *hdev;
+	struct led_classdev cdev;
+	struct mutex lock;
+	u8 brightness;
+	u8 effect;
+	u8 speed;
+};
+
+/*
+ * CMD_SET_LED_POWER flags: the system states in which the MCU keeps its
+ * LEDs lit. Bit assignment per asusctl (rog-aura) for the Ally family.
+ */
+#define ALLY_LED_POWER_BOOT		BIT(0)
+#define ALLY_LED_POWER_AWAKE		BIT(1)
+#define ALLY_LED_POWER_SLEEP		BIT(2)
+#define ALLY_LED_POWER_SHUTDOWN		BIT(3)
+
+/*
+ * ally_xbox_led_set_power() - Enable the Xbox logo LED in every power state
+ *
+ * The MCU gates the Xbox logo LED on its LED power-state flags, and the
+ * RC74XA firmware default leaves that zone unlit in every state after the
+ * power-on flash. Brightness and effect commands are accepted but have no
+ * visible result until the flags are set. Armoury Crate sends this once at
+ * service start, so no USB capture of its UI contains it.
+ *
+ * The four low bits follow the Ally documentation; the zone-to-bit mapping
+ * of the Xbox logo on RC74XA has not been isolated, and 0xff is the value
+ * verified to light it. Sent once per probe, not on resume: the flags are
+ * kept by the MCU and are the kind of setting the vendor tool writes only
+ * when it changes.
+ */
+static int ally_xbox_led_set_power(struct hid_device *hdev)
+{
+	u8 buf[ROG_ALLY_REPORT_SIZE] = {
+		HID_ALLY_SET_REPORT_ID, HID_ALLY_FEATURE_CODE_PAGE,
+		CMD_SET_LED_POWER, 0x01, 0xff,
+	};
+	int ret;
+
+	ret = ally_dev_set_report(hdev, buf, sizeof(buf));
+	if (ret < 0)
+		hid_warn(hdev, "Failed to set Xbox LED power state: %d\n", ret);
+
+	return ret;
+}
+
+static int ally_xbox_led_set_effect(struct ally_xbox_led *led)
+{
+	u8 e_buf[ROG_ALLY_REPORT_SIZE] = {
+		HID_ALLY_SET_REPORT_ID, HID_ALLY_FEATURE_CODE_PAGE,
+		CMD_SET_XBOX_LED_EFFECT, 0x02,
+		led->effect, led->speed,
+	};
+	int ret;
+
+	guard(mutex)(&led->lock);
+
+	ret = ally_dev_set_report(led->hdev, e_buf, sizeof(e_buf));
+	if (ret < 0)
+		hid_warn(led->hdev, "Xbox LED effect SET_REPORT failed: %d\n", ret);
+
+	hid_dbg(led->hdev, "Applied Xbox LED effect: 0x%02x, speed: 0x%02x (ret=%d)\n",
+		led->effect, led->speed, ret);
+
+	return ret;
+}
+
+static int ally_xbox_led_set_brightness(struct ally_xbox_led *led)
+{
+	u8 b_buf_5d[ROG_ALLY_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1, /* 0x5D */
+		HID_ALLY_FEATURE_CODE_PAGE,
+		CMD_SET_XBOX_LED_BRIGHTNESS, 0x01,
+		led->brightness,
+	};
+	int ret;
+
+	guard(mutex)(&led->lock);
+
+	/* Send to interrupt OUT ep4 matching Armoury Crate captures */
+	ret = ally_dev_output_report(led->hdev, b_buf_5d, sizeof(b_buf_5d));
+	if (ret < 0)
+		hid_warn(led->hdev, "Xbox LED brightness output report failed: %d\n", ret);
+
+	hid_dbg(led->hdev, "Applied Xbox LED brightness: %u (ret=%d)\n",
+		led->brightness, ret);
+
+	return ret < 0 ? ret : 0;
+}
+
+static int ally_xbox_led_apply(struct ally_xbox_led *led)
+{
+	int ret;
+
+	ret = ally_xbox_led_set_effect(led);
+	if (ret < 0)
+		return ret;
+
+	return ally_xbox_led_set_brightness(led);
+}
+
+static int ally_xbox_led_set_blocking(struct led_classdev *cdev,
+				      enum led_brightness brightness)
+{
+	struct ally_xbox_led *led = container_of(cdev, struct ally_xbox_led, cdev);
+
+	if (brightness > 3)
+		brightness = 3;
+
+	led->brightness = (u8)brightness;
+	return ally_xbox_led_set_brightness(led);
+}
+
+static ssize_t effect_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct ally_xbox_led *led = container_of(cdev, struct ally_xbox_led, cdev);
+	const char *name;
+
+	switch (led->effect) {
+	case 0x00: name = "static"; break;
+	case 0x01: name = "breathing"; break;
+	case 0x0A: name = "strobing"; break;
+	default:   name = "unknown"; break;
+	}
+
+	return sysfs_emit(buf, "%s\n", name);
+}
+
+static ssize_t effect_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct ally_xbox_led *led = container_of(cdev, struct ally_xbox_led, cdev);
+	u8 eff;
+	int ret;
+
+	if (sysfs_streq(buf, "static") || sysfs_streq(buf, "0"))
+		eff = 0x00;
+	else if (sysfs_streq(buf, "breathing") || sysfs_streq(buf, "breathe") || sysfs_streq(buf, "1"))
+		eff = 0x01;
+	else if (sysfs_streq(buf, "strobing") || sysfs_streq(buf, "strobe") || sysfs_streq(buf, "10"))
+		eff = 0x0A;
+	else
+		return -EINVAL;
+
+	led->effect = eff;
+	ret = ally_xbox_led_set_effect(led);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(effect);
+
+static ssize_t available_effects_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "static breathing strobing\n");
+}
+static DEVICE_ATTR_RO(available_effects);
+
+static ssize_t speed_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct ally_xbox_led *led = container_of(cdev, struct ally_xbox_led, cdev);
+	const char *name;
+
+	switch (led->speed) {
+	case 0x0D: name = "slow"; break;
+	case 0x08: name = "normal"; break;
+	case 0x04: name = "fast"; break;
+	default:   name = "normal"; break;
+	}
+
+	return sysfs_emit(buf, "%s\n", name);
+}
+
+static ssize_t speed_store(struct device *dev, struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct ally_xbox_led *led = container_of(cdev, struct ally_xbox_led, cdev);
+	u8 spd;
+	int ret;
+
+	if (sysfs_streq(buf, "slow") || sysfs_streq(buf, "13"))
+		spd = 0x0D;
+	else if (sysfs_streq(buf, "normal") || sysfs_streq(buf, "8"))
+		spd = 0x08;
+	else if (sysfs_streq(buf, "fast") || sysfs_streq(buf, "4"))
+		spd = 0x04;
+	else
+		return -EINVAL;
+
+	led->speed = spd;
+	ret = ally_xbox_led_set_effect(led);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(speed);
+
+static ssize_t available_speeds_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "slow normal fast\n");
+}
+static DEVICE_ATTR_RO(available_speeds);
+
+static struct attribute *ally_xbox_led_attrs[] = {
+	&dev_attr_effect.attr,
+	&dev_attr_available_effects.attr,
+	&dev_attr_speed.attr,
+	&dev_attr_available_speeds.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(ally_xbox_led);
 
 static bool ally_check_xbox_led_support(struct hid_device *hdev)
 {
@@ -6779,6 +7006,59 @@ static bool ally_check_xbox_led_support(struct hid_device *hdev)
 		get_buf[2] == CMD_CHECK_XBOX_LED_SUPPORT &&
 		(get_buf[5] & 0x08));
 }
+
+static struct ally_xbox_led *ally_xbox_led_create(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_xbox_led *led;
+	int ret;
+
+	if (!drvdata || !drvdata->has_xbox_features)
+		return NULL;
+
+	led = devm_kzalloc(&hdev->dev, sizeof(*led), GFP_KERNEL);
+	if (!led)
+		return ERR_PTR(-ENOMEM);
+
+	led->hdev = hdev;
+	mutex_init(&led->lock);
+	led->brightness = 0; /* Default dark at probe */
+	led->effect = 0x00;  /* Default static */
+	led->speed = 0x08;   /* Default normal */
+
+	led->cdev.name = "ally:white:xbox_logo";
+	led->cdev.max_brightness = 3;
+	led->cdev.brightness = led->brightness;
+	led->cdev.brightness_set_blocking = ally_xbox_led_set_blocking;
+	led->cdev.groups = ally_xbox_led_groups;
+
+	ret = devm_led_classdev_register(&hdev->dev, &led->cdev);
+	if (ret) {
+		hid_err(hdev, "Failed to register Xbox logo LED: %d\n", ret);
+		return ERR_PTR(ret);
+	}
+
+	ally_xbox_led_set_power(hdev);
+	ally_xbox_led_apply(led);
+
+	return led;
+}
+
+static void ally_xbox_led_remove(struct ally_xbox_led *led)
+{
+	if (!led)
+		return;
+
+	led->brightness = 0;
+	ally_xbox_led_set_brightness(led);
+}
+
+static void ally_xbox_led_resume(struct ally_xbox_led *led)
+{
+	if (led)
+		ally_xbox_led_apply(led);
+}
+
 
 static void asus_kbd_backlight_set(struct asus_hid_listener *listener, int brightness)
 {
@@ -7449,6 +7729,7 @@ static int __maybe_unused asus_resume(struct hid_device *hdev)
 	}
 
 	asus_usb_rgb_resume(drvdata->usb_rgb_dev);
+	ally_xbox_led_resume(drvdata->xbox_led);
 
 	return 0;
 }
@@ -7473,6 +7754,7 @@ static int __maybe_unused asus_reset_resume(struct hid_device *hdev)
 	}
 
 	asus_usb_rgb_resume(drvdata->usb_rgb_dev);
+	ally_xbox_led_resume(drvdata->xbox_led);
 
 	return 0;
 }
@@ -7609,8 +7891,19 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 			drvdata->rog_ally = ally;
 	}
 
-	if (is_vendor && (drvdata->quirks & QUIRK_ROG_ALLY_XPAD))
+	if (is_vendor && (drvdata->quirks & QUIRK_ROG_ALLY_XPAD)) {
 		drvdata->has_xbox_features = ally_check_xbox_led_support(hdev);
+		if (drvdata->has_xbox_features) {
+			drvdata->xbox_led = ally_xbox_led_create(hdev);
+			if (IS_ERR(drvdata->xbox_led)) {
+				hid_warn(hdev, "Failed to create Xbox logo LED: %ld\n",
+					 PTR_ERR(drvdata->xbox_led));
+				drvdata->xbox_led = NULL;
+			} else {
+				hid_dbg(hdev, "Created Xbox logo LED control\n");
+			}
+		}
+	}
 
 	if (!drvdata->usb_rgb_dev && asus_usb_rgb_can_initialize(drvdata, is_vendor)) {
 		drvdata->usb_rgb_dev = asus_usb_rgb_create(hdev);
@@ -7660,6 +7953,11 @@ err_stop_hw:
 		drvdata->usb_rgb_dev = NULL;
 	}
 
+	if (drvdata->xbox_led) {
+		ally_xbox_led_remove(drvdata->xbox_led);
+		drvdata->xbox_led = NULL;
+	}
+
 	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD)
 		hid_asus_ally_remove(hdev, drvdata->rog_ally);
 
@@ -7671,6 +7969,11 @@ err_stop_hw:
 static void asus_remove(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+
+	if (drvdata->xbox_led) {
+		ally_xbox_led_remove(drvdata->xbox_led);
+		drvdata->xbox_led = NULL;
+	}
 
 	if (drvdata->usb_rgb_dev) {
 		asus_usb_rgb_remove(drvdata->usb_rgb_dev);
