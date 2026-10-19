@@ -954,6 +954,18 @@ static bool handle_ctrl_alt_del(struct hid_device *hdev,
 	return false;
 }
 
+/*
+ * The ROG Xbox Ally keeps the Ally's vendor code for its Armoury Crate button
+ * but SteamOS consumes it as KEY_PROG1 (inputplumber's ally_type2 map), the
+ * Ally's F16 convention being reserved for the Command Center button.
+ */
+static bool ally_is_xbox_ally(void)
+{
+	return dmi_match(DMI_BOARD_NAME, "RC73XA") ||
+	       dmi_match(DMI_BOARD_NAME, "RC73YA") ||
+	       dmi_match(DMI_BOARD_NAME, "RC74XA");
+}
+
 static bool handle_ally_event(struct hid_device *hdev, struct ally_handheld *ally,
 			      u8 *data, int size)
 {
@@ -974,7 +986,7 @@ static bool handle_ally_event(struct hid_device *hdev, struct ally_handheld *all
 			keycode = KEY_RECORD;
 			break;
 		case 0xA6:
-			keycode = KEY_F16;
+			keycode = ally_is_xbox_ally() ? KEY_PROG1 : KEY_F16;
 			break;
 		case 0xA7:
 			keycode = KEY_F17;
@@ -4958,6 +4970,13 @@ static struct ally_handheld *hid_asus_ally_probe(struct hid_device *hdev)
 		if (!list_empty(&hdev->inputs)) {
 			hidinput = list_first_entry(&hdev->inputs, struct hid_input, list);
 			ally_drvdata.keyboard_input = hidinput->input;
+			/*
+			 * Vendor button events are reported on this device. Its
+			 * descriptor declares the keyboard page's F13-F24, which
+			 * covers the Ally's F16-F19 codes, but not KEY_PROG1.
+			 */
+			if (ally_is_xbox_ally())
+				input_set_capability(hidinput->input, EV_KEY, KEY_PROG1);
 		}
 		spin_unlock_irqrestore(&ally_data_lock, flags);
 		break;
