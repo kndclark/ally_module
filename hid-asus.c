@@ -969,6 +969,10 @@ static bool handle_ally_event(struct hid_device *hdev, struct ally_handheld *all
 		case 0x38:
 			keycode = KEY_F19;
 			break;
+		case 0xA0:
+		case 0xA4:
+			keycode = KEY_RECORD;
+			break;
 		case 0xA6:
 			keycode = KEY_F16;
 			break;
@@ -7191,6 +7195,8 @@ static int asus_input_mapping(struct hid_device *hdev,
 		case 0xa6: asus_map_key_clear(KEY_F16);		break; /* ROG Ally QAM button */
 		case 0xa7: asus_map_key_clear(KEY_F17);		break; /* ROG Ally ROG long-press */
 		case 0xa8: asus_map_key_clear(KEY_F18);		break; /* ROG Ally ROG long-press-release */
+		case 0xa0:
+		case 0xa4: asus_map_key_clear(KEY_RECORD);	break; /* ROG Xbox Ally X Share button (tap/hold) */
 
 		default:
 			/* ASUS lazily declares 256 usages, ignore the rest,
