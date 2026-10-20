@@ -56,11 +56,11 @@ for led in /sys/class/leds/asus::*; do
     [ "$MODE" = "--list" ] && continue
 
     say "-- enabling, static red"
-    wr "$led/enabled" 1
+    wr "$led/enabled" true
     wr "$led/effect" static
-    wr "$led/effects_palette" ff0000
+    wr "$led/effects_palette" "#ff0000"
     sleep 2; ask "rings solid red?"
-    wr "$led/effects_palette" 00ff00
+    wr "$led/effects_palette" "#00ff00"
     sleep 2; ask "rings solid green?"
 
     for e in $(rd "$led/effect_index"); do
@@ -84,9 +84,9 @@ PY
     fi
 
     say "-- enabled=0"
-    wr "$led/enabled" 0
+    wr "$led/enabled" false
     sleep 2; ask "rings off?"
-    wr "$led/enabled" 1
+    wr "$led/enabled" true
     wr "$led/effect" static
 done
 say ""
