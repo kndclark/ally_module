@@ -32,9 +32,13 @@ make the zone look dead out of the box:
    animation (rainbow, pulse) freezes until a supported mode is written.
 3. **`enabled=false` does not turn the rings off.** Only brightness 0 or a
    zeroed colour does on this MCU.
-4. **The first `direct_buffer` frame after `effect=direct` is dropped**
-   (shows the previous Aura colour); every later frame is applied correctly.
-   See "Direct mode" below. _(confirmation pending: direct_first_frame.py)_
+4. **Direct mode: one wrong frame, not isolated.** Twice, the first
+   `direct_buffer` frame written after `effect=direct` showed the previous
+   Aura colour instead; every later frame was right, and a clean
+   static -> direct switch applied its first frame correctly. Both misses
+   followed an unsupported-effect freeze (item 2) earlier in the same
+   session, so this may be the latched firmware rather than the LampArray
+   path. Channel and lamp order are correct (see "Direct mode").
 
 ## Probe data
 
@@ -93,9 +97,12 @@ show as such, and single-lamp frames map
 | 2 | right stick, bottom ring |
 | 3 | right stick, top ring |
 
-The only miss was the first frame written after switching to `direct`, which
-showed the colour of the previous Aura effect instead. Leaving `direct`
-(`effect=static`) hands the rings back to that Aura colour, visible as a
+Three direct-mode sessions: in two, the first frame after `effect=direct`
+showed the colour of the previous Aura effect (an all-red frame showed
+green; an all-blue frame showed the yellow-green of a frozen `flash`), and
+all later frames were correct. In the third, with a clean `static` (#0000ff)
+immediately before, the first red frame applied at once. Leaving `direct`
+(`effect=static`) hands the rings back to the Aura colour, visible as a
 flash before brightness 0.
 
 ## Also worth knowing
