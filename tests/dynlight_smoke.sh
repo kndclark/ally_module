@@ -40,6 +40,13 @@ for led in /sys/class/leds/asus::*; do
     [ -e "$led" ] || continue
     say ""
     say "==== $led"
+    if [ ! -e "$led/effect_index" ]; then
+        say "    (not a Dynamic Lighting node; attributes: $(ls "$led" | tr '\n' ' '))"
+        for a in brightness max_brightness mode mode_index interval; do
+            [ -e "$led/$a" ] && say "    $a: $(rd "$led/$a")"
+        done
+        continue
+    fi
     for a in zone_type led_count effect effect_index speed speed_range direction direction_index \
              enabled enabled_index effects_palette max_palette_entries power_states power_states_index \
              brightness max_brightness; do
