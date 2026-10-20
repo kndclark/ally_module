@@ -16,5 +16,5 @@ else
 fi
 sudo rm -f "${DEST}/leds/led-class-dynamic.ko.zst" /etc/modprobe.d/ally-dynlight.conf
 sudo depmod -a "$KVER"
-sync
+sudo sync -f "$DEST"   # this filesystem only: a global sync waits on the SD card too
 echo "[dynlight] files restored and synced; reboot to switch back (no hot-unload: it crashed this kernel once)."

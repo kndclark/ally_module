@@ -58,7 +58,7 @@ fi
 # Everything above must be on disk before any module is touched: a crash
 # during the reload (2026-10-19) rolled back the unsynced files and left a
 # modules.dep that named a module which no longer existed.
-sync
+sudo sync -f "$DEST"   # this filesystem only: a global sync waits on the SD card too
 
 # Never hot-unload a hid-asus on this machine: the 2026-10-19 reload ended
 # in a kernel crash and reboot. If any hid-asus is loaded, the switch
