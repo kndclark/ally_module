@@ -55,6 +55,12 @@ for led in /sys/class/leds/asus::*; do
     [ -e "$led/direct_buffer" ] && say "    direct_buffer: present ($(stat -c %s "$led/direct_buffer") bytes)"
     [ "$MODE" = "--list" ] && continue
 
+    say "-- brightness: the PR writes this byte straight to the firmware (0-3), so 255 is out of range"
+    wr "$led/brightness" 255
+    sleep 1; ask "rings lit at brightness 255?"
+    wr "$led/brightness" 3
+    sleep 1; ask "rings lit at brightness 3?"
+
     say "-- enabling, static red"
     wr "$led/enabled" true
     wr "$led/effect" static
@@ -88,6 +94,7 @@ PY
     sleep 2; ask "rings off?"
     wr "$led/enabled" true
     wr "$led/effect" static
+    wr "$led/brightness" 0
 done
 say ""
 say "== log saved to $LOG"
