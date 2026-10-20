@@ -51,7 +51,7 @@ for dev, phys in nodes():
                 clear(fd); time.sleep(0.05)
                 n = send(fd, how, req); time.sleep(0.1)
                 r = get(fd)
-                answered = r[:len(req)] == bytes(req) and any(r[len(req):20])
+                answered = r[1:4] == bytes(req[1:4]) and any(r[4:20])  # firmware rewrites byte 5
                 print(f"   {label} via {how:17s} sent={n:>3}  reply={r[:16].hex(' ')}  {'ANSWER' if answered else 'no answer'}")
             except OSError as e:
                 print(f"   {label} via {how:17s} -> {e.strerror}")
