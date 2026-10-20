@@ -1,160 +1,62 @@
-# ROG Ally X Driver (`hid-asus`)
+# ally_dynlight: OGC PR #17 Dynamic Lighting on the ROG Ally, out of tree
 
-An enhanced build of the Linux `hid-asus` kernel driver for the **ASUS ROG Ally X**
-(`0b05:1b4c`) on SteamOS, adding joystick-ring RGB control, SteamOS Game Mode
-integration, and suspend/resume stability.
+A test build of [OpenGamingCollective/linux-unstable PR #17](https://github.com/OpenGamingCollective/linux-unstable/pull/17)
+(Dynamic Lighting LED class + hid-asus Aura / LampArray / Slash / AniMe) for the
+SteamOS 7.2.x kernel on the ROG Ally X and ROG Xbox Ally X. It exists to answer
+one question from NeroReflex: does the generic Aura keyboard path in that PR
+drive the Ally's joystick rings with no Ally-specific code?
 
-It builds on the upstream ROG Ally work by Denis Benato (NeroReflex) and Luke Jones.
-Changes here are developed against, and periodically upstreamed into, that tree.
+Forked from [ally_module](https://github.com/kndclark/ally_module) for its build
+scaffolding. The ally_module driver (Nero's series plus the X20 work) is
+**not** part of this build, and the PR is tested the way linux-unstable
+itself would run it: hid-asus alone, hid-asus-ally blacklisted.
 
----
+## What is in here
 
-## What this adds
-
-### Joystick-ring RGB
-
-The Ally X's two joystick rings are exposed as a single multicolor LED device at
-`/sys/class/leds/go_s:rgb:joystick_rings`, driven over the Aura `0x5A`/`0x5D`
-protocol.
-
-| Attribute | Purpose |
+| File | Origin |
 |---|---|
-| `effect` / `effect_index` | Animation; readable list of what this device supports |
-| `multi_intensity` / `multi_index` | Per-channel colour (`red green blue`) |
-| `brightness` / `max_brightness` | Overall brightness, `0`-`100` |
-| `speed` / `speed_range` | Animation speed, `0`-`100` |
-| `direction` / `direction_index` | `forward` or `reverse` for directional effects |
-| `enabled` / `enabled_index` | Output on/off |
+| `hid-asus.c`, `hid-ids.h` | PR #17 head `fb149ab7`, byte-identical |
+| `led-class-dynamic.c` | PR #17, plus one marked shim (see below) |
+| `include/linux/led-dynamic-lighting.h` | PR #17, plus the matching shim |
+| `dynlight_compat.h` | two defines the 7.2.7 headers lack (`LED_DYNAMIC_LIGHTING`, `cmp_int`) |
+| `docs/` | the PR's sysfs ABI documents, for attribute names |
+| `tests/dynlight_smoke.sh` | on-device walk-through, logs what the rings do |
+| `tests/lamparray_probe.py`, `tests/lamparray_coexist.py`, `tests/aura_caps_probe.py` | earlier probes of the same hardware paths |
 
-Five effects are supported on this model: **`monocolor`, `breathe`, `chroma`,
-`rainbow`, `strobe`**. The driver advertises them through `effect_index`, so
-userspace never has to hardcode the list.
+**The shim.** Upstream adds a `led_dynamic` back-pointer to `struct led_classdev`
+in `include/linux/leds.h`. An out-of-tree module cannot grow the kernel's
+struct, so `led-class-dynamic.c` keeps a small `cdev -> ldev` table and
+`lcdev_to_dldev()` looks it up. Behaviour is unchanged; every site is marked
+`OUT-OF-TREE SHIM`. The PR's KUnit test and Kconfig are not carried.
 
-The LED registers as `LED_COLOR_ID_RGB` rather than the generic
-`LED_COLOR_ID_MULTI`, so userspace can tell that the rings reproduce arbitrary
-colours rather than merely having several channels.
+## Expected behaviour, predicted from captures before any run
 
-**The rings start dark.** Zone state is pushed to the hardware as soon as the
-device registers, so a lit default would light the rings on every cold boot
-before the desktop restores the user's own settings. This matches `hid-playstation`,
-which likewise leaves intensities at zero until userspace asks for something.
+- Both devices answer the PR's Aura probe (`5d 05 20 31 00 20`), so an
+  `asus::keyboard` Dynamic Lighting node should appear on the vendor interface.
+  The reply's byte 9 is `0x02`, which the PR reads as a 4-zone keyboard.
+- The PR also registers `asus::slash` whenever report `0x5e` exists; the Ally's
+  vendor interface has it, so expect a Slash LED that controls nothing.
+- Xbox Ally X: USB interface 0 carries LampArray report ids 1-6 on vendor page
+  `0xff59`, which the PR's detector accepts, so expect "LampArray direct RGB
+  backend" in dmesg and interface 0 losing its hidraw node.
+- Ally X: interface 0 is a real LampArray (page `0x59`) but has no report id 4,
+  so the PR falls back to Aura `0xbc` for direct mode.
+- "highlight" sends mode `0x06`; the X20's Reactive effect is `0x0e`.
 
-### SteamOS Game Mode integration
+## Use
 
-Steam's LED panel recognises devices by a fixed list of sysfs names and effect
-strings, neither of which is documented. Two consequences shape this driver:
-
-- The LED device is named `go_s:rgb:joystick_rings`. Steam enumerates exactly
-  three paths and this is one of them; under any other name the RGB menu does
-  not appear at all.
-- The solid-colour effect is called `monocolor`. Steam only renders its colour
-  picker for effect names it knows, and `monocolor` is on that list while
-  `static` is not. `static` is still accepted when writing, for tools that use
-  the wider ecosystem's vocabulary.
-
-This vocabulary matches the upstream Lenovo Legion Go / Go S drivers, which is
-the convention Valve's client is written against.
-
-### Suspend and resume
-
-- **Non-blocking init.** MCU setup runs from a `delayed_work` queue rather than
-  sleeping in the resume path, so the driver never stalls kernel resume while
-  waiting for the controller to become ready.
-- **State restoration.** LED effect, colour, and brightness are re-applied on
-  wake, which the MCU otherwise loses.
-- **Button state reset.** Vendor buttons (Armoury Crate, Command Center) are
-  force-released during re-initialisation so a key held across suspend cannot
-  stick.
-
-### Input handling
-
-`asus_raw_event()` returns `-1` for Ally vendor reports it has fully handled.
-Without this the same physical button is reported twice - once by the HID core
-from the report descriptor, once by the driver - which userspace sees as a
-double press.
-
----
-
-## Requirements
-
-- ROG Ally X (`0b05:1b4c`). Other Ally models are partially supported by the
-  shared code paths but are not tested here.
-- A password set for the `deck` user - SteamOS needs one for `sudo`.
-- Clone somewhere under `/home/deck/` so the checkout survives SteamOS updates.
-
-## Installing
-
-```bash
-cd ally_module
-sudo ./install.sh
+```
+./install.sh            # build on the device, pre-flight symbols, install, reload
+tests/dynlight_smoke.sh # interactive walk-through; answers go to a log file
+./uninstall.sh          # put the ally_module hid-asus.ko.zst back
 ```
 
-The script unlocks the read-only filesystem, installs build dependencies,
-compiles the module out of tree against your running kernel, backs up the stock
-driver, and reloads. Compilation runs as your own user, so the checkout stays
-buildable afterwards.
+`install.sh` keeps the displaced `hid-asus.ko.zst` as `*.bak-ally_module` and
+`uninstall.sh` restores it. Modules go to `/lib/modules/$(uname -r)/updates/ally/`.
 
-Useful flags:
-
-```bash
-sudo ./install.sh --check     # report which driver owns each interface, change nothing
-sudo ./uninstall.sh           # restore the stock driver from backup
-```
-
-> **After a SteamOS update:** system updates replace the kernel and revert
-> drivers. Re-run `sudo ./install.sh` to reinstall.
-
-### Checking it worked
-
-```bash
-sudo ./install.sh --check
-cat /sys/class/leds/go_s:rgb:joystick_rings/effect_index
-```
-
-`--check` should report every ROG Ally interface bound to our driver. If an
-interface shows no driver at all, the most common cause is a leftover
-`blacklist hid_asus` in `/etc/modprobe.d/` - `--check` looks for that and says so.
-
----
-
-### Audio (ROG Xbox Ally X / RC74XA)
-
-The ASUS ROG Xbox Ally X (RC74XA) uses SoundWire audio with dual Texas Instruments TAS2783 smart amplifiers and a Realtek ALC721 / RT721 codec on AMD ACP 7.0 (Strix Point). Stock SteamOS kernels do not yet configure SoundWire on this board, leaving internal audio non-functional.
-
-This repository includes out-of-tree audio drivers ported from Matthew Schwartz's audio branch (`matts/7.2/rog-ally-x20-audio`), providing:
-- SoundWire probe override and machine driver entry for ACP 7.0 on ASUS RC74XA
-- TAS2783 smart amplifier driver with UEFI Speaker ID detection and volume persistence across resets
-- RT721 SDCA codec driver with PS0 power state synchronization
-- SoundWire utility support for DisCo port lists
-
-Special thanks and credit to **Matthew Schwartz** (<matthew.schwartz@linux.dev>) for developing and providing these fixes, as well as upstream contributors Fan Wu, Baojun Xu, Oder Chiou, Shuming Fan, Jack Yu, Antoine Monnet, and Andrey Golovko.
-
----
-
-## Differences from the kernel-tree version
-
-This out-of-tree build is kept byte-identical to the upstream submission except
-for four deliberate accommodations, so changes can move between the two freely:
-
-| Difference | Reason |
-|---|---|
-| Local `asus-wmi.h` and `zenbook_compat.h` includes | Headers the SteamOS kernel does not ship |
-| `kzalloc_obj(*attr, GFP_KERNEL)` | This kernel predates the single-argument form |
-| `go_s:rgb:` LED name prefix | Steam's device allowlist; upstream uses `asus:rgb:` |
-| `asus-wmi-stub` module | Satisfies WMI symbols without the full platform driver |
-
-The LED name spoof is marked `NOT FOR UPSTREAM` in the source. It exists because
-Valve's client matches on a hardcoded list; the correct long-term fix is for that
-list to include the Ally.
-
----
-
-## Credits
-
-Built on the ASUS HID driver work of **Luke Jones**, **Denis Benato (NeroReflex)**,
-and **Derek Clark (pastaq)**, audio drivers by **Matthew Schwartz**, and on protocol
-findings from the ROG Ally reverse-engineering community.
-
-Hardware protocol notes and captures live in the companion
-[rog-ally-reverse-engineering](https://github.com/kndclark/rog-ally-reverse-engineering)
-repository.
+Local compile check without the device: extract the matching SteamOS headers
+package (`linux-neptune-72-headers-7.2.7.valve1-1`) and run
+`make KDIR=<extracted>/usr/lib/modules/<kver>/build`. GCC 15 rejects the
+`__counted_by_ptr` attribute those GCC-16-built headers use; undefining
+`CONFIG_CC_HAS_COUNTED_BY_PTR` in the extracted `include/generated/autoconf.h`
+is enough for a smoke build.

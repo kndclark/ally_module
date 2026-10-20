@@ -1,0 +1,153 @@
+What:		/sys/class/leds/<led>/direction
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read/write
+		Animation propagation direction. Outputs or accepts one of
+		``left``, ``right``, ``up``, or ``down``. Only visible when the driver supports
+		directional animations.
+
+What:		/sys/class/leds/<led>/direction_index
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read
+		Space-separated list of supported animation directions.
+		Only visible when the driver supports directional animations.
+
+What:		/sys/class/leds/<led>/direct_buffer
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	write-only (binary)
+		Raw packed per-LED stream. The default layout is 3 bytes per
+		LED (R, G, B in sequence); drivers may advertise a different
+		stride (for example 1 byte per LED on mono matrices) via
+		``led_count`` and the driver's documented sample size.
+		Writing transmits a direct frame bypassing hardware effect
+		generators. On success, if the driver publishes an effect
+		named ``direct``, the class selects that effect. The complete
+		write must total exactly (led_count * sample_size) bytes;
+		kernfs may deliver that payload in PAGE_SIZE chunks starting
+		at offset 0. Only visible when the driver implements direct
+		streaming.
+
+What:		/sys/class/leds/<led>/effect
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read/write
+		Currently selected hardware or driver-synthesized animation
+		effect. Reading outputs the effect name. Writing a name from
+		``effect_index`` selects that effect. Names are defined by the
+		driver, not by a global enum; userspace must read
+		``effect_index``. Any active trigger is automatically detached
+		upon switching effects.
+
+What:		/sys/class/leds/<led>/effect_index
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read
+		Space-separated list of animation effect names supported by
+		this LED. The vocabulary is defined by the driver. Lighting
+		off is not an effect; use ``enabled``.
+
+What:		/sys/class/leds/<led>/effects_palette
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read/write
+		Multi-color stacked palette used by multi-color animation
+		effects. Reading outputs space-separated 24-bit hex colors
+		(``#RRGGBB``). Writing accepts a space-separated sequence of
+		hex triplets. The number of entries must not exceed
+		``max_palette_entries``. This is the multi-color stack.
+		``brightness`` remains intensity. Drivers must not encode
+		lighting-off, or a change of the persisted color, as
+		``brightness`` 0: removing a trigger sets brightness to
+		LED_OFF. Only visible when the driver supports programmable
+		palettes.
+
+What:		/sys/class/leds/<led>/enabled
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read/write
+		Lighting engine on/off as ``true`` or ``false``. Independent
+		from ``effect``: disabling turns the lights off without
+		forgetting the selected effect. Only visible when the driver
+		implements a dedicated enable callback.
+
+What:		/sys/class/leds/<led>/enabled_index
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read
+		Space-separated list of values accepted by ``enabled``
+		(``false true``). Only visible when the driver implements a
+		dedicated enable callback.
+
+What:		/sys/class/leds/<led>/led_count
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read
+		Total number of individual, addressable LEDs in this zone.
+
+What:		/sys/class/leds/<led>/max_palette_entries
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read
+		Maximum number of palette entries accepted by
+		``effects_palette``. Only visible when the driver supports
+		programmable palettes.
+
+What:		/sys/class/leds/<led>/power_states
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read/write
+		Space-separated list of currently enabled persistence power
+		states. Writing a space-separated list of state names replaces
+		the active bitmask (an empty list clears all enabled states).
+		Only visible on devices supporting power state configuration.
+
+What:		/sys/class/leds/<led>/power_states_index
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read
+		Space-separated list of system power states supported for
+		lighting persistence (``boot``, ``awake``, ``sleep``,
+		``shutdown``). Only visible on devices supporting power state
+		configuration.
+
+What:		/sys/class/leds/<led>/speed
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read/write
+		Current animation speed level (integer within ``speed_range``).
+		Only visible when the driver supports adjustable speed.
+
+What:		/sys/class/leds/<led>/speed_range
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read
+		Minimum and maximum animation speed level accepted by
+		``speed``. Formatted as ``<min>-<max>``. Only visible when the
+		driver supports adjustable speed.
+
+What:		/sys/class/leds/<led>/zone_type
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	read
+		Driver-defined string describing the physical topology of
+		this lighting zone. Example values include ``generic``,
+		``keyboard``, ``keyboard_per_key``, ``logo``, and ``lightbar``.
+		When the driver does not set a zone string, the node reports
+		``unknown``.

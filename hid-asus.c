@@ -22,24 +22,18 @@
 
 #include <linux/acpi.h>
 #include <linux/cleanup.h>
-#include <linux/device.h>
 #include <linux/dmi.h>
 #include <linux/hid.h>
-#include <linux/jiffies.h>
-#include <linux/list.h>
 #include <linux/module.h>
-#include <linux/mutex.h>
-#include "asus-wmi.h"
-#include "zenbook_compat.h"
-#include <linux/types.h>
+#include <linux/platform_data/x86/asus-wmi.h>
 #include <linux/input/mt.h>
 #include <linux/usb.h> /* For to_usb_interface for T100 touchpad intf check */
 #include <linux/power_supply.h>
-#include <linux/stddef.h>
-#include <linux/sysfs.h>
 #include <linux/leds.h>
+#include <linux/led-dynamic-lighting.h>
+#include <linux/sort.h>
+#include <linux/string.h>
 #include <linux/unaligned.h>
-#include <linux/led-class-multicolor.h>
 
 #include "hid-ids.h"
 
@@ -47,9 +41,8 @@ MODULE_AUTHOR("Yusuke Fujimaki <usk.fujimaki@gmail.com>");
 MODULE_AUTHOR("Brendan McGrath <redmcg@redmandi.dyndns.org>");
 MODULE_AUTHOR("Victor Vlasenko <victor.vlasenko@sysgears.com>");
 MODULE_AUTHOR("Frederik Wenigwieser <frederik.wenigwieser@gmail.com>");
+MODULE_AUTHOR("Marco Scardovi <scardracs@disroot.org>");
 MODULE_AUTHOR("Denis Benato <denis.benato@linux.dev>");
-MODULE_AUTHOR("Luke Jones <luke@ljones.dev>");
-MODULE_AUTHOR("Khamunetri Clark <khamunetriclark@gmail.com>");
 MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 
 #define T100_TPAD_INTF 2
@@ -63,23 +56,168 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define FEATURE_KBD_REPORT_SIZE 64
 #define FEATURE_KBD_LED_REPORT_ID1 0x5d
 #define FEATURE_KBD_LED_REPORT_ID2 0x5e
-
 #define ROG_ALLY_REPORT_SIZE 64
 #define ROG_ALLY_X_MIN_MCU 313
 #define ROG_ALLY_MIN_MCU 319
 
-#define HID_ALLY_INTF_KEYBOARD_IN 0x81
-#define HID_ALLY_INTF_CFG_IN 0x83
-#define HID_ALLY_X_INTF_IN 0x87
+#define AURA_FEATURE_REPORT_SIZE	64
+#define ASUS_AURA_MAX_EFFECTS		13
 
-#define HID_ALLY_GET_REPORT_ID 0x0D
-#define HID_ALLY_SET_REPORT_ID 0x5A
-#define HID_ALLY_FEATURE_CODE_PAGE 0xD1
+/*
+ * AniMe Matrix (USB 0x193b, feature report 0x5e). Packet layout and DMI
+ * board matching follow asusctl rog-anime / reverse-engineering notes.
+ */
+#define ASUS_ANIME_PACKET_SIZE		640
+#define ASUS_ANIME_BLOCK_START		7
+#define ASUS_ANIME_BLOCK_END		634
+#define ASUS_ANIME_PANE_LEN		(ASUS_ANIME_BLOCK_END - ASUS_ANIME_BLOCK_START)
+#define ASUS_ANIME_STRIX_PANE1_LEN	490
+#define ASUS_ANIME_MAX_LEDS		(ASUS_ANIME_PANE_LEN * 3)
+#define ASUS_ANIME_MAX_EFFECTS		9
 
-#define HID_ALLY_X_INPUT_REPORT_SIZE 16
-#define HID_ALLY_X_INPUT_REPORT 0x0B
+enum asus_anime_type {
+	ASUS_ANIME_GA401 = 0,
+	ASUS_ANIME_GA402,
+	ASUS_ANIME_GU604,
+	ASUS_ANIME_G635L,
+	ASUS_ANIME_G835L,
+	ASUS_ANIME_UNKNOWN,
+};
 
-#define HID_ALLY_READY_MAX_TRIES 6
+enum asus_pid_193b_kind {
+	ASUS_PID_193B_NONE = 0,
+	ASUS_PID_193B_SLASH,
+	ASUS_PID_193B_ANIME,
+};
+
+#define AURA_CMD_PROBE			0x05
+#define AURA_CMD_RUN_MODE		0x9e
+#define AURA_CMD_SET_EFFECT		0xb3
+#define AURA_CMD_COMMIT			0xb4
+#define AURA_CMD_SET			0xb5
+#define AURA_CMD_ZONE_ENABLE	0xc0
+#define AURA_CMD_DIRECT			0xbc
+#define AURA_CMD_POWER			0xbd
+
+#define AURA_ZONE_ACTIVATE_KEYBOARD	0x00
+#define AURA_ZONE_ACTIVATE_LIGHTBAR	0x01
+
+#define AURA_POWER_CMD_ENABLE		0x01
+
+/* Power Byte 0: Logo (even bits) & Keyboard (odd bits) */
+#define AURA_POWER_LOGO_BOOT		BIT(0)
+#define AURA_POWER_KBD_BOOT			BIT(1)
+#define AURA_POWER_LOGO_AWAKE		BIT(2)
+#define AURA_POWER_KBD_AWAKE		BIT(3)
+#define AURA_POWER_LOGO_SLEEP		BIT(4)
+#define AURA_POWER_KBD_SLEEP		BIT(5)
+#define AURA_POWER_LOGO_SHUTDOWN	BIT(6)
+#define AURA_POWER_KBD_SHUTDOWN	BIT(7)
+#define AURA_POWER_MASK_LOGO_ALL	(AURA_POWER_LOGO_BOOT | \
+					 AURA_POWER_LOGO_AWAKE | \
+					 AURA_POWER_LOGO_SLEEP | \
+					 AURA_POWER_LOGO_SHUTDOWN)
+#define AURA_POWER_MASK_KBD_LOGO_ALL	0xff
+
+/* Power Byte 1: Chassis Lightbar */
+#define AURA_POWER_LB_AUX		BIT(0)
+#define AURA_POWER_LB_BOOT		BIT(1)
+#define AURA_POWER_LB_AWAKE		BIT(2)
+#define AURA_POWER_LB_SLEEP		BIT(3)
+#define AURA_POWER_LB_SHUTDOWN		BIT(4)
+#define AURA_POWER_MASK_LIGHTBAR_ALL	0x1f
+
+/* Power Byte 2: Lid Display Bezel / Lid segments */
+#define AURA_POWER_LID_BOOT			BIT(0)
+#define AURA_POWER_LID_AWAKE		BIT(1)
+#define AURA_POWER_LID_SLEEP		BIT(2)
+#define AURA_POWER_LID_SHUTDOWN		BIT(3)
+#define AURA_POWER_LID_PERSISTENCE	0xd0
+#define AURA_POWER_MASK_LID_ALL		(AURA_POWER_LID_PERSISTENCE | 0x0f)
+
+/* Power Byte 3: Rear Glow */
+#define AURA_POWER_REAR_BOOT		BIT(0)
+#define AURA_POWER_REAR_AWAKE		BIT(1)
+#define AURA_POWER_REAR_SLEEP		BIT(2)
+#define AURA_POWER_REAR_SHUTDOWN	BIT(3)
+#define AURA_POWER_MASK_REAR_ALL	0x0f
+
+#define AURA_ZONE_ALL			0x00
+#define AURA_ZONE_KEY1			0x01
+#define AURA_ZONE_KEY2			0x02
+#define AURA_ZONE_KEY3			0x03
+#define AURA_ZONE_KEY4			0x04
+#define AURA_ZONE_LOGO			0x05
+#define AURA_ZONE_BAR_LEFT		0x06
+#define AURA_ZONE_BAR_RIGHT		0x07
+#define AURA_ZONE_KEYBOARD_CHANNEL	0x01
+#define AURA_ZONE_LIGHTBAR_CHANNEL	0x04
+
+#define AURA_EFFECT_STATIC		0x00
+#define AURA_EFFECT_BREATHING		0x01
+#define AURA_EFFECT_SPECTRUM_CYCLE	0x02
+#define AURA_EFFECT_RAINBOW		0x03
+#define AURA_EFFECT_STARS			0x04
+#define AURA_EFFECT_RAIN			0x05
+#define AURA_EFFECT_REACTIVE		0x06
+#define AURA_EFFECT_LASER			0x07
+#define AURA_EFFECT_RIPPLE		0x08
+#define AURA_EFFECT_PULSE			0x0a
+#define AURA_EFFECT_COMET			0x0b
+#define AURA_EFFECT_FLASH			0x0c
+
+#define AURA_SPEED_SLOW			0xe1
+#define AURA_SPEED_MED			0xeb
+#define AURA_SPEED_FAST			0xf5
+
+#define ROG_STRIX_LEDS_PER_PKT		16
+#define ROG_STRIX_PERKEY_FULL_PKTS	10
+#define ROG_STRIX_PERKEY_FINAL_PKT_LEDS	8
+#define ROG_STRIX_PERKEY_PACKETS	(ROG_STRIX_PERKEY_FULL_PKTS + 1)
+#define ROG_STRIX_DIRECT_LEDS \
+	((ROG_STRIX_PERKEY_FULL_PKTS * ROG_STRIX_LEDS_PER_PKT) + \
+	 ROG_STRIX_PERKEY_FINAL_PKT_LEDS)
+#define ROG_STRIX_DIRECT_BUF_SIZE	(ROG_STRIX_DIRECT_LEDS * 3)
+#define ROG_STRIX_LIGHTBAR_LEDS		12
+#define ROG_STRIX_LIGHTBAR_BUF_SIZE	(ROG_STRIX_LIGHTBAR_LEDS * 3)
+#define ROG_STRIX_4ZONE_KBD_LEDS	4
+#define ROG_STRIX_4ZONE_KBD_BUF_SIZE	(ROG_STRIX_4ZONE_KBD_LEDS * 3)
+#define ROG_STRIX_4ZONE_LIGHTBAR_LEDS	6
+#define ROG_STRIX_4ZONE_LIGHTBAR_BUF_SIZE \
+					(ROG_STRIX_4ZONE_LIGHTBAR_LEDS * 3)
+#define ROG_STRIX_4ZONE_DIRECT_KBD_OFFSET	9
+#define ROG_STRIX_4ZONE_DIRECT_LB_OFFSET	27
+#define ROG_STRIX_PERKEY_DIRECT_PAYLOAD_OFFSET	9
+
+#define AURA_DIRECT_FRAME_PERKEY	0x00
+#define AURA_DIRECT_FRAME_ZONED		0x01
+#define AURA_DIRECT_ROUTING_DEFAULT	0x01
+#define AURA_DIRECT_CHUNK_FLAG		0x01
+
+/*
+ * Microsoft HID Lighting Illumination / LampArray (Usage Page 0x59).
+ *
+ * Linux Dynamic Lighting (led-class-dynamic / asus::*) is the userspace ABI.
+ * On some Strix N-KEY devices (e.g. G614PR) Aura feature 0xBC cannot address
+ * the chassis lightbar independently; the sibling LampArray interface is the
+ * correct direct-RGB backend (same path Windows DL / G-Helper LampArray use).
+ * When LampArray is absent, callers fall back to Aura 0xBC. Firmware effects
+ * (0xb3) remain on the Aura report ID 0x5d interface.
+ *
+ * The LampArray USB interface is bound without hidraw so lighting stays
+ * exclusively under this driver.
+ */
+#define ASUS_LAMPARRAY_MAX_LAMPS	64
+#define ASUS_LAMPARRAY_MULTI_MAX	8
+#define ASUS_LAMPARRAY_PURPOSE_CONTROL	0x01
+#define ASUS_LAMPARRAY_FLAG_COMPLETE	0x01
+#define ASUS_LAMPARRAY_RID_ATTR		0x01
+#define ASUS_LAMPARRAY_RID_REQUEST	0x02
+#define ASUS_LAMPARRAY_RID_RESPONSE	0x03
+#define ASUS_LAMPARRAY_RID_MULTI	0x04
+#define ASUS_LAMPARRAY_RID_CONTROL	0x06
+#define AURA_ZONE_ACTIVATE_LAMPARRAY	0x03
+#define AURA_ZONE_RELEASE_LAMPARRAY	0x04
 
 /* Spurious HID codes sent by QUIRK_ROG_NKEY_KEYBOARD devices */
 #define ASUS_SPURIOUS_CODE_0XEA 0xea
@@ -127,38 +265,6 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define QUIRK_HID_FN_LOCK		BIT(14)
 #define QUIRK_FILTER_CAMERA_COMPANION	BIT(15)
 
-/* Ally LED report commands */
-#define ASUS_USB_RGB_CMD_CONFIG	0xb3
-#define ASUS_USB_RGB_CMD_APPLY	0xb4
-#define ASUS_USB_RGB_CMD_SET	0xb5
-
-#define ASUS_USB_RGB_DIRECTION_FORWARD	0x00
-#define ASUS_USB_RGB_DIRECTION_REVERSE	0x01
-
-/* Global hardware brightness control (report 0x5d) */
-#define ASUS_USB_RGB_BRIGHTNESS_CMD1	0xba
-#define ASUS_USB_RGB_BRIGHTNESS_CMD2	0xc5
-#define ASUS_USB_RGB_BRIGHTNESS_CMD3	0xc4
-#define ASUS_USB_RGB_HW_LEVEL_MAX	3
-#define ASUS_USB_RGB_HW_LEVEL_NONE	0xff
-
-/* Ally LED effect speed (hardware register values) */
-#define ASUS_USB_RGB_SPEED_SLOW	0xe1
-#define ASUS_USB_RGB_SPEED_MED	0xeb
-#define ASUS_USB_RGB_SPEED_FAST	0xf5
-
-/* Aura firmware capability detection (feature report 0x5d) */
-#define ASUS_AURA_CAP_REPORT_ID		0x5d
-#define ASUS_AURA_CAP_CMD		0x9e
-#define ASUS_AURA_CAP_SUBCMD		0x01
-#define ASUS_AURA_CAP_SEL_1		0x20
-#define ASUS_AURA_CAP_SEL_2		0x15
-#define ASUS_AURA_STATUS_CMD		0x05
-#define ASUS_AURA_SIG_LEN		15
-#define ASUS_AURA_FEATURE_MIN_LEN	22
-#define ASUS_AURA_STATUS_MIN_LEN	15
-
-
 #define I2C_KEYBOARD_QUIRKS			(QUIRK_FIX_NOTEBOOK_REPORT | \
 						 QUIRK_NO_INIT_REPORTS | \
 						 QUIRK_NO_CONSUMER_USAGES)
@@ -167,14 +273,6 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 						 QUIRK_IS_MULTITOUCH)
 
 #define TRKID_SGN       ((TRKID_MAX + 1) >> 1)
-
-#define ALLY_DEVICE_ATTR_WO(_name, _sysfs_name)				\
-	struct device_attribute dev_attr_##_name =				\
-		__ATTR(_sysfs_name, 0200, NULL, _name##_store)
-
-#define ALLY_DEVICE_ATTR_RW(_name, _sysfs_name)				\
-	struct device_attribute dev_attr_##_name =				\
-		__ATTR(_sysfs_name, 0644, _name##_show, _name##_store)
 
 enum asus_work_action_type {
 	FN_LOCK_SYNC,
@@ -220,345 +318,26 @@ struct asus_touchpad_info {
 	int report_size;
 };
 
-struct ally_joystick_resp_curve_param {
-	u8 move;
-	u8 resp;
-} __packed;
-
-struct ally_joystick_resp_curve {
-	struct ally_joystick_resp_curve_param entry_1;
-	struct ally_joystick_resp_curve_param entry_2;
-	struct ally_joystick_resp_curve_param entry_3;
-	struct ally_joystick_resp_curve_param entry_4;
-} __packed;
-
-/* Button identifiers for the turbo attribute system */
-enum ally_button_id {
-	ALLY_BTN_A,
-	ALLY_BTN_B,
-	ALLY_BTN_X,
-	ALLY_BTN_Y,
-	ALLY_BTN_LB,
-	ALLY_BTN_RB,
-	ALLY_BTN_DU,
-	ALLY_BTN_DD,
-	ALLY_BTN_DL,
-	ALLY_BTN_DR,
-	ALLY_BTN_J0B,
-	ALLY_BTN_J1B,
-	ALLY_BTN_MENU,
-	ALLY_BTN_VIEW,
-	ALLY_BTN_M1,
-	ALLY_BTN_M2,
-	ALLY_BTN_MAX
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+struct asus_lamparray_lamp {
+	u16 id;
+	s32 x;
+	bool keyboard;
 };
-
-/* Names for the button directories in sysfs */
-static const char *const ally_button_names[ALLY_BTN_MAX] = {
-	[ALLY_BTN_A] = "btn_a",
-	[ALLY_BTN_B] = "btn_b",
-	[ALLY_BTN_X] = "btn_x",
-	[ALLY_BTN_Y] = "btn_y",
-	[ALLY_BTN_LB] = "btn_lb",
-	[ALLY_BTN_RB] = "btn_rb",
-	[ALLY_BTN_DU] = "dpad_up",
-	[ALLY_BTN_DD] = "dpad_down",
-	[ALLY_BTN_DL] = "dpad_left",
-	[ALLY_BTN_DR] = "dpad_right",
-	[ALLY_BTN_J0B] = "btn_l3",
-	[ALLY_BTN_J1B] = "btn_r3",
-	[ALLY_BTN_MENU] = "btn_menu",
-	[ALLY_BTN_VIEW] = "btn_view",
-	[ALLY_BTN_M1] = "btn_m1",
-	[ALLY_BTN_M2] = "btn_m2",
-};
-
-/*
- * Button turbo parameters structure
- * Each button can have:
- * - turbo: Turbo press interval in multiples of 50ms (0 = disabled, 1-20 = 50ms-1000ms)
- * - toggle: Toggle interval (0 = disabled)
- */
-struct ally_btn_turbo_params {
-	u8 turbo;
-	u8 toggle;
-} __packed;
-
-#define ALLY_TURBO_PERIOD_MIN 0
-#define ALLY_TURBO_PERIOD_MAX 20
-#define ALLY_TOGGLE_PERIOD_MIN 0
-#define ALLY_TOGGLE_PERIOD_MAX 255
-
-/* Collection of all button turbo settings */
-struct ally_turbo_config {
-	struct ally_btn_turbo_params btn_du;
-	struct ally_btn_turbo_params btn_dd;
-	struct ally_btn_turbo_params btn_dl;
-	struct ally_btn_turbo_params btn_dr;
-	struct ally_btn_turbo_params btn_j0b;
-	struct ally_btn_turbo_params btn_j1b;
-	struct ally_btn_turbo_params btn_lb;
-	struct ally_btn_turbo_params btn_rb;
-	struct ally_btn_turbo_params btn_a;
-	struct ally_btn_turbo_params btn_b;
-	struct ally_btn_turbo_params btn_x;
-	struct ally_btn_turbo_params btn_y;
-	struct ally_btn_turbo_params btn_view;
-	struct ally_btn_turbo_params btn_menu;
-	struct ally_btn_turbo_params btn_m2;
-	struct ally_btn_turbo_params btn_m1;
-};
-
-struct button_remap_attr;
-struct ally_button_mapping;
-
-struct ally_btn_sysfs_entry {
-	struct attribute_group group;
-	struct attribute *attrs[8]; /* turbo + ranges + remap + macro + remap_index + NULL */
-	/*
-	 * The entries are created while hid_asus_ally_probe() is still running,
-	 * before asus_probe() publishes drvdata->rog_ally: carrying the shared
-	 * state pointer here avoids dereferencing that not-yet-assigned field.
-	 */
-	struct ally_handheld *ally;
-	struct ally_config *cfg;
-	struct hid_device *hdev;
-	enum ally_button_id btn;
-	struct device_attribute attr_turbo_period;
-	struct device_attribute attr_toggle_period;
-	struct button_remap_attr *remap_attr;
-	struct button_remap_attr *macro_attr;
-	struct device_attribute attr_remap_index;
-};
-
-struct ally_config {
-	/* Must be locked if the data is being changed */
-	struct mutex config_mutex;
-	bool initialized;
-
-	/* Device capabilities flags */
-	bool is_ally_x;
-	bool xbox_controller_support;
-	bool user_cal_support;
-	bool turbo_support;
-	bool resp_curve_support;
-	bool dir_to_btn_support;
-	bool gyro_support;
-	bool anti_deadzone_support;
-
-	/* Current settings */
-	bool xbox_controller_enabled;
-	u8 gamepad_mode;
-	u8 left_deadzone;
-	u8 left_outer_threshold;
-	u8 right_deadzone;
-	u8 right_outer_threshold;
-	u8 left_anti_deadzone;
-	u8 right_anti_deadzone;
-	u8 left_trigger_min;
-	u8 left_trigger_max;
-	u8 right_trigger_min;
-	u8 right_trigger_max;
-
-	/* Vibration settings */
-	u8 vibration_intensity_left;
-	u8 vibration_intensity_right;
-
-	struct ally_turbo_config turbo;
-	struct ally_btn_sysfs_entry *button_entries;
-	/* Button mappings for each gamepad mode, indexed by gamepad_mode */
-	struct ally_button_mapping *button_mappings;
-
-	struct ally_joystick_resp_curve left_curve;
-	struct ally_joystick_resp_curve right_curve;
-};
-
-/* XInput force-feedback report (output report 0x0d, gamepad interface) */
-struct ff_data {
-	u8 enable;
-	u8 magnitude_left;
-	u8 magnitude_right;
-	u8 magnitude_strong;
-	u8 magnitude_weak;
-	u8 pulse_sustain_10ms;
-	u8 pulse_release_10ms;
-	u8 loop_count;
-} __packed;
-
-struct ff_report {
-	u8 report_id;
-	struct ff_data ff;
-} __packed;
-
-struct ally_handheld {
-	/* All read/write to IN interfaces must lock */
-	struct mutex intf_mutex;
-	/*
-	 * USB device of the connected controller, held with a reference:
-	 * at most one ROG Ally can exist, so probes from any other USB
-	 * device are rejected to protect the shared state.
-	 */
-	struct usb_device *udev;
-	struct hid_device *cfg_hdev;
-
-	struct input_dev *ally_x_input;
-	struct hid_device *ally_x_hdev;
-
-	struct ff_report ff_packet;
-	struct work_struct ff_work;
-	/* Serializes ff_packet and update_ff between play_effect and ff_work */
-	spinlock_t ff_lock;
-	bool ff_work_initialized;
-	bool update_ff;
-
-	struct hid_device *keyboard_hdev;
-	struct input_dev *keyboard_input;
-
-	u8 cad_sequence_state;
-	unsigned long cad_last_event_time;
-
-	struct delayed_work resume_work;
-
-	struct ally_config *config;
-};
-
-enum asus_aura_zone {
-	ASUS_AURA_ZONE_NONE = 0,
-	ASUS_AURA_ZONE_KEY1 = 1,
-	ASUS_AURA_ZONE_KEY2 = 2,
-	ASUS_AURA_ZONE_KEY3 = 3,
-	ASUS_AURA_ZONE_KEY4 = 4,
-	ASUS_AURA_ZONE_LOGO = 5,
-	ASUS_AURA_ZONE_BAR_LEFT = 6,
-	ASUS_AURA_ZONE_BAR_RIGHT = 7,
-	ASUS_AURA_ZONE_JOYSTICK_RING = 8,
-	ASUS_AURA_ZONE_MAX,
-};
-
-enum asus_usb_rgb_effect {
-	ASUS_USB_RGB_EFFECT_STATIC = 0,
-	ASUS_USB_RGB_EFFECT_BREATHING = 1,
-	ASUS_USB_RGB_EFFECT_COLOR_CYCLE = 2,
-	ASUS_USB_RGB_EFFECT_RAINBOW = 3,
-	ASUS_USB_RGB_EFFECT_STAR = 4,
-	ASUS_USB_RGB_EFFECT_RAIN = 5,
-	ASUS_USB_RGB_EFFECT_HIGHLIGHT = 6,
-	ASUS_USB_RGB_EFFECT_LASER = 7,
-	ASUS_USB_RGB_EFFECT_RIPPLE = 8,
-	ASUS_USB_RGB_EFFECT_STROBE = 10,
-	ASUS_USB_RGB_EFFECT_COMET = 11,
-	ASUS_USB_RGB_EFFECT_FLASH = 12,
-	ASUS_USB_RGB_EFFECT_REACTIVE = 14,
-	ASUS_USB_RGB_EFFECT_MAX,
-};
-
-/* Ally LED effect packet (command 0xb3) */
-struct asus_usb_rgb_report {
-	u8 report_id;
-	u8 cmd;
-	u8 zone;
-	u8 effect;
-	u8 red;
-	u8 green;
-	u8 blue;
-	u8 speed;
-	u8 direction;
-	u8 pad1;
-	u8 bg_red;
-	u8 bg_green;
-	u8 bg_blue;
-} __packed;
-
-struct asus_usb_rgb_zone_state {
-	enum asus_usb_rgb_effect effect;
-	u8 speed;
-	u8 red;
-	u8 green;
-	u8 blue;
-	u8 bg_red;
-	u8 bg_green;
-	u8 bg_blue;
-	u8 direction;
-	u8 brightness;
-	bool enabled;
-	bool initialized;
-};
-
-#define ASUS_RGB_HW_MAX_ZONES 8
-
-/*
- * Runtime-detected Aura firmware capabilities. Populated by querying the
- * 0x9e feature report at probe time; falls back to the static effect table
- * when the firmware does not implement the query.
- */
-struct asus_aura_caps {
-	bool valid;
-	u8 mode_mask_low;
-	u8 mode_mask_high;
-	u8 keyboard_type;
-	u8 region_bits;
-	u8 feature_bits;
-	DECLARE_BITMAP(effects, ASUS_USB_RGB_EFFECT_MAX);
-};
-
-struct asus_usb_rgb_hw_desc {
-	const char *name;
-	enum asus_aura_zone zones[ASUS_RGB_HW_MAX_ZONES];
-	u8 zone_count;
-	u8 effect_report_id;
-	/* 0x5a on keyboards, 0x5d on the Ally joystick rings */
-	u8 brightness_report_id;
-	u8 config_cmd;
-	u8 set_cmd;
-	u8 apply_cmd;
-	/* Fallback effect mask for firmware that answers no capability query */
-	u16 supported_effects;
-	/*
-	 * Colors exposed through multi_intensity: 3 for a single color set,
-	 * 6 to also expose the background color used by two-color effects.
-	 */
-	u8 color_components;
-};
-
-struct asus_usb_rgb_dev;
-struct ally_xbox_led;
-
-struct asus_usb_rgb_zone {
-	struct asus_usb_rgb_dev *parent;
-	enum asus_aura_zone zone_id;
-	struct led_classdev_mc mc_cdev;
-	struct mc_subled subled_info[6];
-	struct delayed_work work;
-	spinlock_t lock;
-	bool removed;
-	bool update_color;
-	bool update_effect;
-};
-
-struct asus_usb_rgb_dev {
-	struct hid_device *hdev;
-	const struct asus_usb_rgb_hw_desc *desc;
-	struct asus_aura_caps caps;
-	struct delayed_work resume_work;
-	struct mutex io_mutex;
-	spinlock_t lock;
-	bool removed;
-	u8 last_hw_level;
-	struct asus_usb_rgb_zone zones[ASUS_RGB_HW_MAX_ZONES];
-};
-
+#endif
 
 struct asus_drvdata {
 	unsigned long quirks;
+	struct led_classdev slash_led;
+	bool has_slash_led;
+	u8 slash_mode;
+	u8 slash_brightness;
+	u8 slash_interval;
 	struct hid_device *hdev;
 	struct input_dev *input;
 	struct input_dev *tp_kbd_input;
 	struct asus_worker *worker;
 	unsigned int kbd_backlight_brightness;
-	struct ally_handheld *rog_ally;
-	struct asus_usb_rgb_dev *usb_rgb_dev;
-	struct ally_xbox_led *xbox_led;
-	bool has_xbox_features;
 	const struct asus_touchpad_info *tp;
 	struct power_supply *battery;
 	struct power_supply_desc battery_desc;
@@ -568,6 +347,65 @@ struct asus_drvdata {
 	unsigned long battery_next_query;
 	struct asus_hid_listener listener;
 	bool fn_lock;
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	struct mutex aura_lock; /* Serializes Aura HID reports and buffers */
+	u8 *aura_buf;
+	/*
+	 * 0 until the first successful write on that report id, then the HID
+	 * path that worked. 0x5d and 0x5e are cached separately.
+	 */
+	u8 aura_write_5d;
+	u8 aura_write_5e;
+	bool kbd_power_on;
+	bool lb_power_on;
+	u32 kbd_power_states;
+	u32 lb_power_states;
+	struct led_classdev_dynamic dldev_kbd;
+	struct led_classdev_dynamic dldev_lightbar;
+	struct dl_rgb kbd_palette[2];
+	struct dl_rgb lightbar_palette[2];
+	const char *effects_kbd[ASUS_AURA_MAX_EFFECTS];
+	const char *effects_lightbar[ASUS_AURA_MAX_EFFECTS];
+	bool has_dldev_kbd;
+	bool has_dldev_lightbar;
+	bool kbd_effect_set;
+	bool lightbar_effect_set;
+	bool boot_effect_valid;
+	u8 boot_zone;
+	u8 boot_mode;
+	u8 boot_r;
+	u8 boot_g;
+	u8 boot_b;
+	u8 boot_r2;
+	u8 boot_g2;
+	u8 boot_b2;
+	u8 boot_speed;
+	u8 boot_direction;
+	bool is_strix_4zone;
+	bool has_lightbar;
+	u8 kbd_direct_buf[ROG_STRIX_4ZONE_KBD_BUF_SIZE];
+	u8 lb_direct_buf[ROG_STRIX_LIGHTBAR_BUF_SIZE];
+	bool kbd_direct_valid;
+	bool lb_direct_valid;
+	struct hid_device *lamparray_hdev;
+	u8 *lamparray_buf;
+	size_t lamparray_buf_len;
+	u8 lamparray_rid_base;
+	unsigned int lamparray_count;
+	bool lamparray_controlled;
+	bool lamparray_unavailable;
+	struct asus_lamparray_lamp *lamparray_lamps;
+	struct led_classdev_dynamic dldev_anime;
+	const char *effects_anime[ASUS_ANIME_MAX_EFFECTS];
+	bool has_dldev_anime;
+	enum asus_anime_type anime_type;
+	u8 anime_boot;
+	u8 anime_awake;
+	u8 anime_sleep;
+	u8 anime_shutdown;
+	bool anime_builtin;
+	u8 *anime_buf;
+#endif
 };
 
 static int asus_report_battery(struct asus_drvdata *, u8 *, int);
@@ -630,4500 +468,11 @@ static const struct asus_touchpad_info medion_e1239t_tp = {
 	.report_size = 32 /* 2 byte header + 5 * 5 + 5 byte footer */,
 };
 
-enum ally_command_codes {
-	CMD_SET_GAMEPAD_MODE            = 0x01,
-	CMD_SET_MAPPING                 = 0x02,
-	CMD_SET_JOYSTICK_MAPPING        = 0x03,
-	CMD_SET_JOYSTICK_DEADZONE       = 0x04,
-	CMD_SET_TRIGGER_RANGE           = 0x05,
-	CMD_SET_VIBRATION_INTENSITY     = 0x06,
-	CMD_LED_CONTROL                 = 0x08,
-	CMD_SET_LED_POWER               = 0x09,
-	CMD_CHECK_READY                 = 0x0A,
-	CMD_SET_XBOX_CONTROLLER         = 0x0B,
-	CMD_CHECK_XBOX_SUPPORT          = 0x0C,
-	CMD_USER_CAL_DATA               = 0x0D,
-	CMD_CHECK_USER_CAL_SUPPORT      = 0x0E,
-	CMD_SET_TURBO_PARAMS            = 0x0F,
-	CMD_CHECK_TURBO_SUPPORT         = 0x10,
-	CMD_CHECK_RESP_CURVE_SUPPORT    = 0x12,
-	CMD_SET_RESP_CURVE              = 0x13,
-	CMD_CHECK_DIR_TO_BTN_SUPPORT    = 0x14,
-	CMD_SET_GYRO_PARAMS             = 0x15,
-	CMD_CHECK_GYRO_TO_JOYSTICK      = 0x16,
-	CMD_CHECK_ANTI_DEADZONE         = 0x17,
-	CMD_SET_ANTI_DEADZONE           = 0x18,
-	CMD_CHECK_XBOX_LED_SUPPORT      = 0x1B,
-	CMD_SET_XBOX_LED_BRIGHTNESS     = 0x20,
-	CMD_SET_XBOX_LED_EFFECT         = 0x21,
-};
-
-static const char *const asus_usb_rgb_effect_strings[ASUS_USB_RGB_EFFECT_MAX] = {
-	[ASUS_USB_RGB_EFFECT_STATIC] = "monocolor",
-	[ASUS_USB_RGB_EFFECT_BREATHING] = "breathe",
-	[ASUS_USB_RGB_EFFECT_COLOR_CYCLE] = "chroma",
-	[ASUS_USB_RGB_EFFECT_RAINBOW] = "rainbow",
-	[ASUS_USB_RGB_EFFECT_STAR] = "star",
-	[ASUS_USB_RGB_EFFECT_RAIN] = "rain",
-	[ASUS_USB_RGB_EFFECT_HIGHLIGHT] = "highlight",
-	[ASUS_USB_RGB_EFFECT_LASER] = "laser",
-	[ASUS_USB_RGB_EFFECT_RIPPLE] = "ripple",
-	[9] = NULL,
-	[ASUS_USB_RGB_EFFECT_STROBE] = "strobe",
-	[ASUS_USB_RGB_EFFECT_COMET] = "comet",
-	[ASUS_USB_RGB_EFFECT_FLASH] = "flash",
-	[ASUS_USB_RGB_EFFECT_REACTIVE] = "reactive",
-};
-
-/*
- * Firmware effect mask bit -> kernel effect enum. Armoury Crate's internal
- * mode numbering differs from the wire values, so an explicit table is
- * required. Byte 20 holds bits 0-7, byte 21 holds bits 8-12.
- */
-static const struct {
-	u8 mask_low_bit;
-	u8 mask_high_bit;
-	enum asus_usb_rgb_effect effect;
-} asus_aura_fw_mode_map[] = {
-	{ 0x01, 0x00, ASUS_USB_RGB_EFFECT_STATIC },
-	{ 0x02, 0x00, ASUS_USB_RGB_EFFECT_BREATHING },
-	{ 0x04, 0x00, ASUS_USB_RGB_EFFECT_COLOR_CYCLE },
-	{ 0x08, 0x00, ASUS_USB_RGB_EFFECT_RAINBOW },
-	{ 0x10, 0x00, ASUS_USB_RGB_EFFECT_STAR },
-	{ 0x20, 0x00, ASUS_USB_RGB_EFFECT_RAIN },
-	{ 0x40, 0x00, ASUS_USB_RGB_EFFECT_HIGHLIGHT },
-	{ 0x80, 0x00, ASUS_USB_RGB_EFFECT_LASER },
-	{ 0x00, 0x01, ASUS_USB_RGB_EFFECT_RIPPLE },
-	{ 0x00, 0x02, ASUS_USB_RGB_EFFECT_STROBE },
-	{ 0x00, 0x08, ASUS_USB_RGB_EFFECT_COMET },
-	{ 0x00, 0x10, ASUS_USB_RGB_EFFECT_FLASH },
-};
-
-static const struct asus_usb_rgb_hw_desc asus_usb_rgb_hw_ally = {
-	.name = "rog_ally",
-	.zones = {
-		ASUS_AURA_ZONE_JOYSTICK_RING,
-	},
-	.zone_count = 1,
-	.effect_report_id = FEATURE_KBD_REPORT_ID,
-	.brightness_report_id = FEATURE_KBD_LED_REPORT_ID1,
-	.config_cmd = ASUS_USB_RGB_CMD_CONFIG,
-	.set_cmd = ASUS_USB_RGB_CMD_SET,
-	.apply_cmd = ASUS_USB_RGB_CMD_APPLY,
-	.color_components = 3,
-	.supported_effects = BIT(ASUS_USB_RGB_EFFECT_STATIC) |
-			     BIT(ASUS_USB_RGB_EFFECT_BREATHING) |
-			     BIT(ASUS_USB_RGB_EFFECT_COLOR_CYCLE) |
-			     BIT(ASUS_USB_RGB_EFFECT_RAINBOW) |
-			     BIT(ASUS_USB_RGB_EFFECT_STROBE),
-};
-
-struct asus_usb_rgb_hw_match {
-	u16 product_id;
-	const struct asus_usb_rgb_hw_desc *desc;
-};
-
-static const struct asus_usb_rgb_hw_match asus_usb_rgb_hw_matches[] = {
-	{
-		.product_id = USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY,
-		.desc = &asus_usb_rgb_hw_ally,
-	},
-	{
-		.product_id = USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY_X,
-		.desc = &asus_usb_rgb_hw_ally,
-	},
-};
-
-
-/* XInput rumble magnitudes use the hardware's 0..100 intensity range. */
-#define ALLY_FF_MAX_INTENSITY 100
-
-enum ally_gamepad_mode_index {
-	ALLY_GAMEPAD_MODE_GAMEPAD = 0x01,
-	ALLY_GAMEPAD_MODE_KEYBOARD = 0x02,
-};
-
-static const char *const ally_gamepad_mode_text[] = {
-	"gamepad", "desktop"
-};
-
-static const u8 ally_gamepad_mode[] = {
-	ALLY_GAMEPAD_MODE_GAMEPAD,
-	ALLY_GAMEPAD_MODE_KEYBOARD
-};
-
-static const u8 ALLY_FORCE_FEEDBACK_OFF[] = {
-	0x0D, 0x0F, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEB
-};
-static_assert(sizeof(struct ff_report) == sizeof(ALLY_FORCE_FEEDBACK_OFF));
-
-/*
- * The ROG Ally device presents multiple USB interfaces (keyboard, mouse, gamepad,
- * and custom configuration interface) that bind to the same module. Since only
- * one ROG Ally device can be connected at a time, we use a single global static
- * ally_handheld structure to share state across these separate HID interfaces.
- */
-static void ally_resume_work_fn(struct work_struct *work);
-static void ally_x_ff_work_fn(struct work_struct *work);
-
-/*
- * Changes to ally_drvdata must lock: the raw_event callbacks, which may
- * run in atomic (URB completion) context, also take this lock, so it must
- * be a spinlock.
- */
-static DEFINE_SPINLOCK(ally_data_lock);
-static struct ally_handheld ally_drvdata = {
-	.intf_mutex = __MUTEX_INITIALIZER(ally_drvdata.intf_mutex),
-	/*
-	 * Initialised statically so it is always safe to cancel, whichever
-	 * of the interfaces probed or failed to probe.
-	 */
-	.resume_work = __DELAYED_WORK_INITIALIZER(ally_drvdata.resume_work,
-						  ally_resume_work_fn, 0),
-	/*
-	 * Initialised statically for the same reason as resume_work: remove()
-	 * drains the work whichever of the interfaces probed or failed to
-	 * probe, so it must be safe to cancel unconditionally.
-	 */
-	.ff_work = __WORK_INITIALIZER(ally_drvdata.ff_work, ally_x_ff_work_fn),
-	.ff_lock = __SPIN_LOCK_UNLOCKED(ally_drvdata.ff_lock),
-};
-
-/*
- * Drop the recorded USB device if no Ally interface is bound anymore:
- * probe failures never run remove(), so without this cleanup a failed
- * probe would leave a stale record behind and the driver would then
- * reject the real controller when it reconnects.
- */
-static void ally_put_udev_if_orphaned(void)
-{
-	struct usb_device *udev;
-	unsigned long flags;
-
-	spin_lock_irqsave(&ally_data_lock, flags);
-	if (!ally_drvdata.udev || ally_drvdata.keyboard_hdev ||
-	    ally_drvdata.cfg_hdev || ally_drvdata.ally_x_hdev) {
-		spin_unlock_irqrestore(&ally_data_lock, flags);
-		return;
-	}
-
-	udev = ally_drvdata.udev;
-	ally_drvdata.udev = NULL;
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	usb_put_dev(udev);
-}
-
 static const u8 asus_report_id_init[] = {
 	FEATURE_KBD_REPORT_ID,
 	FEATURE_KBD_LED_REPORT_ID1,
 	FEATURE_KBD_LED_REPORT_ID2
 };
-
-static inline int ally_dev_set_report(struct hid_device *hdev, const u8 *buf, size_t len)
-{
-	u8 *dmabuf __free(kfree) = kmemdup(buf, len, GFP_KERNEL);
-	if (!dmabuf)
-		return -ENOMEM;
-
-	return hid_hw_raw_request(hdev, buf[0], dmabuf, len,
-					HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
-}
-
-static inline int ally_dev_get_report(struct hid_device *hdev, u8 *out, size_t len)
-{
-	return hid_hw_raw_request(hdev, HID_ALLY_GET_REPORT_ID, out, len,
-		HID_FEATURE_REPORT, HID_REQ_GET_REPORT);
-}
-
-static inline int ally_dev_output_report(struct hid_device *hdev, const u8 *buf, size_t len)
-{
-	u8 *dmabuf __free(kfree) = kmemdup(buf, len, GFP_KERNEL);
-	int ret;
-
-	if (!dmabuf)
-		return -ENOMEM;
-
-	ret = hid_hw_output_report(hdev, dmabuf, len);
-	if (ret == -ENOSYS)
-		ret = hid_hw_raw_request(hdev, buf[0], dmabuf, len,
-					 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
-
-	return ret;
-}
-
-static void ally_resume_work_fn(struct work_struct *work)
-{
-	struct ally_handheld *ally = container_of(work, struct ally_handheld,
-						  resume_work.work);
-	struct input_dev *keyboard_input, *x_input;
-	unsigned long flags;
-
-	/*
-	 * Snapshot the very pointers that get dereferenced under the lock
-	 * protecting them, and take a reference on each input_dev: probe
-	 * sets keyboard_hdev even when the interface exposes no input_dev,
-	 * removal clears the two fields one after the other, and the input
-	 * devices are freed with their own interface.
-	 */
-	spin_lock_irqsave(&ally_data_lock, flags);
-	keyboard_input = input_get_device(ally->keyboard_input);
-	x_input = input_get_device(ally->ally_x_input);
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	/*
-	 * Force release all vendor buttons to prevent "stuck" ghosting on
-	 * resume (workaround for Ally X USB re-probing during suspend/resume).
-	 */
-	if (keyboard_input) {
-		input_report_key(keyboard_input, KEY_F16, 0);
-		input_report_key(keyboard_input, KEY_F17, 0);
-		input_report_key(keyboard_input, KEY_F18, 0);
-		input_report_key(keyboard_input, KEY_F19, 0);
-		input_report_key(keyboard_input, KEY_F20, 0);
-		input_report_key(keyboard_input, KEY_PROG1, 0);
-		input_sync(keyboard_input);
-		input_put_device(keyboard_input);
-	}
-
-	if (x_input) {
-		input_report_key(x_input, KEY_F16, 0);
-		input_report_key(x_input, KEY_F17, 0);
-		input_report_key(x_input, KEY_F18, 0);
-		input_report_key(x_input, KEY_PROG1, 0);
-		input_sync(x_input);
-		input_put_device(x_input);
-	}
-}
-
-/**
- * handle_ctrl_alt_del() - detect a left button long press
- * @hdev: HID device the report arrived on
- * @ally: ally handheld structure holding the sequence state
- * @data: raw report buffer, rewritten in place when the sequence matches
- * @size: length of @data in bytes
- *
- * The Ally left button emits a sequence of ctrl+alt+del events. Capture that
- * and emit only a single code for that single event.
- *
- * Return: true iff the event has been managed
- */
-static bool handle_ctrl_alt_del(struct hid_device *hdev,
-				struct ally_handheld *ally, u8 *data, int size)
-{
-	bool time_is_past = time_after(jiffies, ally->cad_last_event_time + msecs_to_jiffies(100));
-
-	if (size < 16 || data[0] != 0x01)
-		return false;
-
-	if (ally->cad_sequence_state > 0 && time_is_past)
-		ally->cad_sequence_state = 0;
-
-	ally->cad_last_event_time = jiffies;
-
-	switch (ally->cad_sequence_state) {
-	case 0:
-		if (data[1] == 0x01 && data[2] == 0x00 && data[3] == 0x00) {
-			ally->cad_sequence_state = 1;
-			data[1] = 0x00;
-			return true;
-		}
-		break;
-	case 1:
-		if (data[1] == 0x05 && data[2] == 0x00 && data[3] == 0x00) {
-			ally->cad_sequence_state = 2;
-			data[1] = 0x00;
-			return true;
-		}
-		break;
-	case 2:
-		if (data[1] == 0x05 && data[2] == 0x00 && data[3] == 0x4c) {
-			ally->cad_sequence_state = 3;
-			data[1] = 0x00;
-			data[3] = 0x6F; // F20;
-			return true;
-		}
-		break;
-	case 3:
-		if (data[1] == 0x04 && data[2] == 0x00 && data[3] == 0x4c) {
-			ally->cad_sequence_state = 4;
-			data[1] = data[3] = 0x00;
-			return true;
-		}
-		break;
-	case 4:
-		if (data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x4c) {
-			ally->cad_sequence_state = 5;
-			data[3] = 0x00;
-			return true;
-		}
-		break;
-	}
-	ally->cad_sequence_state = 0;
-	return false;
-}
-
-/*
- * The ROG Xbox Ally keeps the Ally's vendor code for its Armoury Crate button
- * but SteamOS consumes it as KEY_PROG1 (inputplumber's ally_type2 map), the
- * Ally's F16 convention being reserved for the Command Center button.
- */
-static bool ally_is_xbox_ally(void)
-{
-	return dmi_match(DMI_BOARD_NAME, "RC73XA") ||
-	       dmi_match(DMI_BOARD_NAME, "RC73YA") ||
-	       dmi_match(DMI_BOARD_NAME, "RC74XA");
-}
-
-static bool handle_ally_event(struct hid_device *hdev, struct ally_handheld *ally,
-			      u8 *data, int size)
-{
-	struct input_dev *keyboard_input;
-	unsigned long flags;
-	int keycode = 0;
-
-	if (size < 2)
-		return false;
-
-	if (data[0] == 0x5A) {
-		switch (data[1]) {
-		case 0x38:
-			keycode = KEY_F19;
-			break;
-		case 0xA0:
-		case 0xA4:
-			keycode = KEY_RECORD;
-			break;
-		case 0xA6:
-			keycode = ally_is_xbox_ally() ? KEY_PROG1 : KEY_F16;
-			break;
-		case 0xA7:
-			keycode = KEY_F17;
-			break;
-		case 0xA8:
-			keycode = KEY_F18;
-			break;
-		case 0xEC:
-			/* Command acknowledgement packets from MCU */
-			return false;
-		default:
-			hid_dbg(hdev, "X20 VENDOR UNMAPPED: %*ph\n", size, data);
-			return false;
-		}
-
-		/*
-		 * Take a reference on the input_dev before dropping the lock:
-		 * the keyboard interface can be unbound concurrently, and its
-		 * input_dev is freed with it.
-		 */
-		spin_lock_irqsave(&ally_data_lock, flags);
-		keyboard_input = input_get_device(ally->keyboard_input);
-		spin_unlock_irqrestore(&ally_data_lock, flags);
-
-		if (!keyboard_input)
-			return false;
-
-		input_report_key(keyboard_input, keycode, 1);
-		input_sync(keyboard_input);
-		input_report_key(keyboard_input, keycode, 0);
-		input_sync(keyboard_input);
-		input_put_device(keyboard_input);
-		return true;
-	}
-	return false;
-}
-
-/**
- * ally_gamepad_send_packet() - Send a raw packet to the gamepad device
- * @ally: ally handheld structure
- * @hdev: HID device
- * @buf: buffer containing the packet data
- * @len: length of data to send
- *
- * Return: count of data transferred, negative if error
- */
-static int ally_gamepad_send_packet(struct ally_handheld *ally,
-				    struct hid_device *hdev, const u8 *buf, size_t len)
-{
-	guard(mutex)(&ally->intf_mutex);
-	return ally_dev_set_report(hdev, buf, len);
-}
-
-/**
- * ally_gamepad_send_receive_packet() - Send a packet and receive the response
- * @ally: ally handheld structure
- * @hdev: HID device
- * @buf: buffer containing the packet data to send and receive response in
- * @len: length of buffer
- *
- * Return: count of data transferred, negative if error
- */
-static int ally_gamepad_send_receive_packet(struct ally_handheld *ally,
-					    struct hid_device *hdev,
-					    u8 *buf, size_t len)
-{
-	int ret;
-
-	scoped_guard(mutex, &ally->intf_mutex) {
-		ret = ally_dev_set_report(hdev, buf, len);
-		if (ret >= 0) {
-			memset(buf, 0, len);
-			ret = ally_dev_get_report(hdev, buf, len);
-		}
-	}
-
-	return ret;
-}
-
-/**
- * ally_alloc_cmd() - Construct a command buffer for the gamepad
- * @cmd: Command code to send
- * @payload: Optional payload data to include in the command
- * @payload_size: Size of the payload data
- *
- * The constructed buffer is 64 bytes long, and it is the caller
- * responsibility to free the buffer using kfree().
- *
- * Return: the newly allocated buffer containing the command, or NULL on
- * allocation failure
- */
-static u8 *ally_alloc_cmd(u8 cmd, const u8 *payload, u8 payload_size)
-{
-	u8 *hidbuf = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
-
-	if (!hidbuf)
-		return NULL;
-
-	hidbuf[0] = HID_ALLY_SET_REPORT_ID;
-	hidbuf[1] = HID_ALLY_FEATURE_CODE_PAGE;
-	hidbuf[2] = cmd;
-	hidbuf[3] = payload_size;
-
-	if (payload_size > 0 && payload)
-		memcpy(&hidbuf[4], payload, payload_size);
-
-	return hidbuf;
-}
-
-/**
- * ally_check_capability() - Check if a specific capability is supported
- * @hdev: HID device
- * @ally: ally handheld structure
- * @check_cmd: capability command code to query
- *
- * Return: true if the capability is supported, false otherwise
- */
-static bool ally_check_capability(struct hid_device *hdev, struct ally_handheld *ally,
-				  enum ally_command_codes check_cmd)
-{
-	u8 payload[] = { 0x00 };
-	int ret;
-
-	u8 *buf __free(kfree) = ally_alloc_cmd(check_cmd, payload, sizeof(payload));
-	if (!buf) {
-		hid_err(hdev, "Failed to allocate buffer for capability check.\n");
-		return false;
-	}
-
-	ret = ally_gamepad_send_receive_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-	if (ret < 0) {
-		hid_err(hdev, "Failed to check capability 0x%02x: %d\n", check_cmd, ret);
-		return false;
-	}
-
-	return buf[1] == HID_ALLY_FEATURE_CODE_PAGE && buf[2] == check_cmd &&
-	       buf[4] == 0x01;
-}
-
-static int ally_detect_capabilities(struct hid_device *hdev, struct ally_handheld *ally,
-				    struct ally_config *cfg)
-{
-	if (!hdev || !cfg || !ally)
-		return -EINVAL;
-
-	scoped_guard(mutex, &cfg->config_mutex) {
-		cfg->is_ally_x = (hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY_X);
-
-		/*
-		 * RC74XA reports capability absent (0x0C returns 0x00), so
-		 * the driver never sends CMD_SET_XBOX_CONTROLLER (5A D1 0B 01 01).
-		 * The gamepad functions without it.
-		 */
-		cfg->xbox_controller_support =
-			ally_check_capability(hdev, ally, CMD_CHECK_XBOX_SUPPORT);
-		cfg->user_cal_support =
-			ally_check_capability(hdev, ally, CMD_CHECK_USER_CAL_SUPPORT);
-		cfg->turbo_support =
-			ally_check_capability(hdev, ally, CMD_CHECK_TURBO_SUPPORT);
-		cfg->resp_curve_support =
-			ally_check_capability(hdev, ally, CMD_CHECK_RESP_CURVE_SUPPORT);
-		cfg->dir_to_btn_support =
-			ally_check_capability(hdev, ally, CMD_CHECK_DIR_TO_BTN_SUPPORT);
-		cfg->gyro_support =
-			ally_check_capability(hdev, ally, CMD_CHECK_GYRO_TO_JOYSTICK);
-		cfg->anti_deadzone_support =
-			ally_check_capability(hdev, ally, CMD_CHECK_ANTI_DEADZONE);
-	}
-
-	return 0;
-}
-
-static int ally_set_xbox_controller(struct hid_device *hdev,
-				    struct ally_handheld *ally,
-				    struct ally_config *cfg, bool enabled)
-{
-	u8 payload[] = { enabled ? 0x01 : 0x00 };
-	int ret;
-
-	if (!cfg || !cfg->xbox_controller_support)
-		return -ENODEV;
-
-	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_XBOX_CONTROLLER, payload, sizeof(payload));
-	if (!buf)
-		return -ENOMEM;
-
-	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-	if (ret < 0) {
-		hid_err(hdev, "Failed to set Xbox controller mode: %d\n", ret);
-		return ret;
-	}
-
-	cfg->xbox_controller_enabled = enabled;
-	return 0;
-}
-
-/**
- * ally_get_config() - Get the configuration of the Ally device
- * @ally: ally handheld structure
- *
- * Fetch the configuration published by hid_asus_ally_probe() under
- * ally_data_lock: the pointer is also cleared by hid_asus_ally_remove(),
- * so reading it without the lock would race with interface removal.
- *
- * The returned configuration outlives the sysfs callbacks using it: it is
- * devm-managed on the same device as the sysfs attributes, which are
- * removed before the memory is released.
- *
- * Return: the ally config, or NULL if no configuration is published
- */
-static struct ally_config *ally_get_config(struct ally_handheld *ally)
-{
-	struct ally_config *cfg;
-	unsigned long flags;
-
-	spin_lock_irqsave(&ally_data_lock, flags);
-	cfg = ally->config;
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	return cfg;
-}
-
-static ssize_t xbox_controller_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->xbox_controller_support)
-		return -ENODEV;
-
-	return sysfs_emit(buf, "%d\n", cfg->xbox_controller_enabled ? 1 : 0);
-}
-
-static ssize_t xbox_controller_store(struct device *dev,
-				     struct device_attribute *attr,
-				     const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	bool enabled;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtobool(buf, &enabled);
-	if (ret)
-		return ret;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->xbox_controller_support)
-		return -ENODEV;
-
-	ret = ally_set_xbox_controller(hdev, ally, cfg, enabled);
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-
-static DEVICE_ATTR_RW(xbox_controller);
-
-/**
- * ally_set_gamepad_mode() - Set the gamepad operating mode
- * @ally: ally handheld structure
- * @hdev: HID device
- * @mode: gamepad mode to set
- *
- * Return: 0 on success, negative errno on failure
- */
-static int ally_set_gamepad_mode(struct ally_handheld *ally, struct hid_device *hdev, u8 mode)
-{
-	u8 payload[] = { mode };
-	int ret;
-
-	if (mode < ALLY_GAMEPAD_MODE_GAMEPAD ||
-	    mode > ALLY_GAMEPAD_MODE_KEYBOARD) {
-		hid_err(hdev, "Invalid gamepad mode: %u\n", mode);
-		return -EINVAL;
-	}
-
-	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_GAMEPAD_MODE, payload, sizeof(payload));
-	if (!buf)
-		return -ENOMEM;
-
-	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-	if (ret < 0) {
-		hid_err(hdev, "Failed to set gamepad mode: %d\n", ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-enum btn_map_type {
-	BTN_TYPE_NONE = 0,
-	BTN_TYPE_PAD = 0x01,
-	BTN_TYPE_KB = 0x02,
-	BTN_TYPE_MOUSE = 0x03,
-	BTN_TYPE_MEDIA = 0x05,
-};
-
-struct btn_code_map {
-	unsigned char type;
-	unsigned char value;
-	const char *name;
-};
-
-static const struct btn_code_map ally_btn_codes[] = {
-	{ BTN_TYPE_NONE, 0x00, "NONE" },
-	/* Gamepad button codes */
-	{ BTN_TYPE_PAD, 0x01, "BTN_SOUTH" },
-	{ BTN_TYPE_PAD, 0x02, "BTN_EAST" },
-	{ BTN_TYPE_PAD, 0x03, "BTN_NORTH" },
-	{ BTN_TYPE_PAD, 0x04, "BTN_WEST" },
-	{ BTN_TYPE_PAD, 0x05, "BTN_TL" },
-	{ BTN_TYPE_PAD, 0x06, "BTN_TR" },
-	{ BTN_TYPE_PAD, 0x07, "BTN_THUMBL" },
-	{ BTN_TYPE_PAD, 0x08, "BTN_THUMBR" },
-	{ BTN_TYPE_PAD, 0x09, "ABS_HAT0Y_NEG" },
-	{ BTN_TYPE_PAD, 0x0A, "ABS_HAT0Y_POS" },
-	{ BTN_TYPE_PAD, 0x0B, "ABS_HAT0X_NEG" },
-	{ BTN_TYPE_PAD, 0x0C, "ABS_HAT0X_POS" },
-	{ BTN_TYPE_PAD, 0x0D, "ABS_Z" },
-	{ BTN_TYPE_PAD, 0x0E, "ABS_RZ" },
-	{ BTN_TYPE_PAD, 0x11, "BTN_SELECT" },
-	{ BTN_TYPE_PAD, 0x12, "BTN_START" },
-	{ BTN_TYPE_PAD, 0x13, "BTN_MODE" },
-
-	/* Keyboard button codes */
-	{ BTN_TYPE_KB, 0x8E, "FN_M2" },
-	{ BTN_TYPE_KB, 0x8F, "FN_M1" },
-	{ BTN_TYPE_KB, 0x76, "KEY_ESC" },
-	{ BTN_TYPE_KB, 0x05, "KEY_F1" },
-	{ BTN_TYPE_KB, 0x06, "KEY_F2" },
-	{ BTN_TYPE_KB, 0x04, "KEY_F3" },
-	{ BTN_TYPE_KB, 0x0C, "KEY_F4" },
-	{ BTN_TYPE_KB, 0x03, "KEY_F5" },
-	{ BTN_TYPE_KB, 0x0B, "KEY_F6" },
-	{ BTN_TYPE_KB, 0x80, "KEY_F7" },
-	{ BTN_TYPE_KB, 0x0A, "KEY_F8" },
-	{ BTN_TYPE_KB, 0x01, "KEY_F9" },
-	{ BTN_TYPE_KB, 0x09, "KEY_F10" },
-	{ BTN_TYPE_KB, 0x78, "KEY_F11" },
-	{ BTN_TYPE_KB, 0x07, "KEY_F12" },
-	{ BTN_TYPE_KB, 0x08, "KEY_F13" },
-	{ BTN_TYPE_KB, 0x10, "KEY_F14" },
-	{ BTN_TYPE_KB, 0x18, "KEY_F15" },
-	{ BTN_TYPE_KB, 0x0E, "KEY_GRAVE" }, // backtick
-	{ BTN_TYPE_KB, 0x16, "KEY_1" },
-	{ BTN_TYPE_KB, 0x1E, "KEY_2" },
-	{ BTN_TYPE_KB, 0x26, "KEY_3" },
-	{ BTN_TYPE_KB, 0x25, "KEY_4" },
-	{ BTN_TYPE_KB, 0x2E, "KEY_5" },
-	{ BTN_TYPE_KB, 0x36, "KEY_6" },
-	{ BTN_TYPE_KB, 0x3D, "KEY_7" },
-	{ BTN_TYPE_KB, 0x3E, "KEY_8" },
-	{ BTN_TYPE_KB, 0x46, "KEY_9" },
-	{ BTN_TYPE_KB, 0x45, "KEY_0" },
-	{ BTN_TYPE_KB, 0x4E, "KEY_MINUS" }, // hypen
-	{ BTN_TYPE_KB, 0x55, "KEY_EQUAL" },
-	{ BTN_TYPE_KB, 0x66, "KEY_BACKSPACE" },
-	{ BTN_TYPE_KB, 0x0D, "KEY_TAB" },
-	{ BTN_TYPE_KB, 0x15, "KEY_Q" },
-	{ BTN_TYPE_KB, 0x1D, "KEY_W" },
-	{ BTN_TYPE_KB, 0x24, "KEY_E" },
-	{ BTN_TYPE_KB, 0x2D, "KEY_R" },
-	{ BTN_TYPE_KB, 0x2C, "KEY_T" },
-	{ BTN_TYPE_KB, 0x35, "KEY_Y" },
-	{ BTN_TYPE_KB, 0x3C, "KEY_U" },
-	{ BTN_TYPE_KB, 0x43, "KEY_I" },
-	{ BTN_TYPE_KB, 0x44, "KEY_O" },
-	{ BTN_TYPE_KB, 0x4D, "KEY_P" },
-	{ BTN_TYPE_KB, 0x54, "KEY_LEFTBRACE" },
-	{ BTN_TYPE_KB, 0x5B, "KEY_RIGHTBRACE" },
-	{ BTN_TYPE_KB, 0x5D, "KEY_BACKSLASH" },
-	{ BTN_TYPE_KB, 0x58, "KEY_CAPSLOCK" },
-	{ BTN_TYPE_KB, 0x1C, "KEY_A" },
-	{ BTN_TYPE_KB, 0x1B, "KEY_S" },
-	{ BTN_TYPE_KB, 0x23, "KEY_D" },
-	{ BTN_TYPE_KB, 0x2B, "KEY_F" },
-	{ BTN_TYPE_KB, 0x34, "KEY_G" },
-	{ BTN_TYPE_KB, 0x33, "KEY_H" },
-	{ BTN_TYPE_KB, 0x3B, "KEY_J" },
-	{ BTN_TYPE_KB, 0x42, "KEY_K" },
-	{ BTN_TYPE_KB, 0x4B, "KEY_L" },
-	{ BTN_TYPE_KB, 0x4C, "KEY_SEMICOLON" },
-	{ BTN_TYPE_KB, 0x52, "KEY_APOSTROPHE" },
-	{ BTN_TYPE_KB, 0x5A, "KEY_ENTER" },
-	{ BTN_TYPE_KB, 0x88, "KEY_LEFTSHIFT" },
-	{ BTN_TYPE_KB, 0x1A, "KEY_Z" },
-	{ BTN_TYPE_KB, 0x22, "KEY_X" },
-	{ BTN_TYPE_KB, 0x21, "KEY_C" },
-	{ BTN_TYPE_KB, 0x2A, "KEY_V" },
-	{ BTN_TYPE_KB, 0x32, "KEY_B" },
-	{ BTN_TYPE_KB, 0x31, "KEY_N" },
-	{ BTN_TYPE_KB, 0x3A, "KEY_M" },
-	{ BTN_TYPE_KB, 0x41, "KEY_COMMA" },
-	{ BTN_TYPE_KB, 0x49, "KEY_DOT" },
-	{ BTN_TYPE_KB, 0x4A, "KEY_SLASH" },
-	{ BTN_TYPE_KB, 0x89, "KEY_RIGHTSHIFT" },
-	{ BTN_TYPE_KB, 0x82, "KEY_LEFTMETA" },
-	{ BTN_TYPE_KB, 0x8A, "KEY_LEFTALT" },
-	{ BTN_TYPE_KB, 0x29, "KEY_SPACE" },
-	{ BTN_TYPE_KB, 0x8B, "KEY_RIGHTALT" },
-	{ BTN_TYPE_KB, 0x84, "KEY_COMPOSE" },
-	{ BTN_TYPE_KB, 0x8D, "KEY_RIGHTCTRL" },
-	{ BTN_TYPE_KB, 0xC3, "KEY_SYSRQ" },
-	{ BTN_TYPE_KB, 0x7E, "KEY_SCROLLLOCK" },
-	{ BTN_TYPE_KB, 0x91, "KEY_PAUSE" },
-	{ BTN_TYPE_KB, 0xC2, "KEY_INSERT" },
-	{ BTN_TYPE_KB, 0x94, "KEY_HOME" },
-	{ BTN_TYPE_KB, 0x96, "KEY_PAGEUP" },
-	{ BTN_TYPE_KB, 0xC0, "KEY_DELETE" },
-	{ BTN_TYPE_KB, 0x95, "KEY_END" },
-	{ BTN_TYPE_KB, 0x97, "KEY_PAGEDOWN" },
-	{ BTN_TYPE_KB, 0x98, "KEY_UP" },
-	{ BTN_TYPE_KB, 0x99, "KEY_DOWN" },
-	{ BTN_TYPE_KB, 0x9A, "KEY_LEFT" },
-	{ BTN_TYPE_KB, 0x9B, "KEY_RIGHT" },
-
-	/* Numpad button codes */
-	{ BTN_TYPE_KB, 0x77, "KEY_NUMLOCK" },
-	{ BTN_TYPE_KB, 0x90, "KEY_KPSLASH" },
-	{ BTN_TYPE_KB, 0x7C, "KEY_KPASTERISK" },
-	{ BTN_TYPE_KB, 0x7B, "KEY_KPMINUS" },
-	{ BTN_TYPE_KB, 0x70, "KEY_KP0" },
-	{ BTN_TYPE_KB, 0x69, "KEY_KP1" },
-	{ BTN_TYPE_KB, 0x72, "KEY_KP2" },
-	{ BTN_TYPE_KB, 0x7A, "KEY_KP3" },
-	{ BTN_TYPE_KB, 0x6B, "KEY_KP4" },
-	{ BTN_TYPE_KB, 0x73, "KEY_KP5" },
-	{ BTN_TYPE_KB, 0x74, "KEY_KP6" },
-	{ BTN_TYPE_KB, 0x6C, "KEY_KP7" },
-	{ BTN_TYPE_KB, 0x75, "KEY_KP8" },
-	{ BTN_TYPE_KB, 0x7D, "KEY_KP9" },
-	{ BTN_TYPE_KB, 0x79, "KEY_KPPLUS" },
-	{ BTN_TYPE_KB, 0x81, "KEY_KPENTER" },
-	{ BTN_TYPE_KB, 0x71, "KEY_KPDOT" },
-
-	/* Mouse button codes */
-	{ BTN_TYPE_MOUSE, 0x01, "BTN_LEFT" },
-	{ BTN_TYPE_MOUSE, 0x02, "BTN_RIGHT" },
-	{ BTN_TYPE_MOUSE, 0x03, "BTN_MIDDLE" },
-	{ BTN_TYPE_MOUSE, 0x04, "REL_WHEEL_HI_RES_UP" },
-	{ BTN_TYPE_MOUSE, 0x05, "REL_WHEEL_HI_RES_DOWN" },
-
-	/* Media button codes */
-	{ BTN_TYPE_MEDIA, 0x16, "MEDIA_SCREENSHOT" },
-	{ BTN_TYPE_MEDIA, 0x19, "MEDIA_SHOW_KEYBOARD" },
-	{ BTN_TYPE_MEDIA, 0x1C, "MEDIA_SHOW_DESKTOP" },
-	{ BTN_TYPE_MEDIA, 0x1E, "MEDIA_START_RECORDING" },
-	{ BTN_TYPE_MEDIA, 0x01, "MEDIA_MIC_OFF" },
-	{ BTN_TYPE_MEDIA, 0x02, "MEDIA_VOL_DOWN" },
-	{ BTN_TYPE_MEDIA, 0x03, "MEDIA_VOL_UP" },
-};
-
-static const size_t keymap_len = ARRAY_SIZE(ally_btn_codes);
-
-static const struct btn_code_map *find_button_by_name(const char *name);
-
-/* Button pair indexes for mapping commands */
-enum btn_pair_index {
-	BTN_PAIR_DPAD_UPDOWN    = 0x01,
-	BTN_PAIR_DPAD_LEFTRIGHT = 0x02,
-	BTN_PAIR_STICK_LR       = 0x03,
-	BTN_PAIR_BUMPER_LR      = 0x04,
-	BTN_PAIR_AB             = 0x05,
-	BTN_PAIR_XY             = 0x06,
-	BTN_PAIR_VIEW_MENU      = 0x07,
-	BTN_PAIR_M1M2           = 0x08,
-	BTN_PAIR_TRIGGER_LR     = 0x09,
-};
-
-struct button_map {
-	const struct btn_code_map *remap;
-	const struct btn_code_map *macro;
-};
-
-struct button_pair_map {
-	enum btn_pair_index pair_index;
-	struct button_map first;
-	struct button_map second;
-};
-
-/* Store button mapping per gamepad mode */
-struct ally_button_mapping {
-	struct button_pair_map button_pairs[9]; /* 9 button pairs */
-};
-
-static void ally_set_default_gamepad_mapping(struct ally_button_mapping *mappings)
-{
-	struct ally_button_mapping *map = &mappings[ALLY_GAMEPAD_MODE_GAMEPAD];
-	int i;
-
-	/* Set all pair indexes and initialize to NONE */
-	for (i = 0; i < 9; i++) {
-		map->button_pairs[i].pair_index = i + 1;
-		map->button_pairs[i].first.remap =
-			find_button_by_name("NONE");
-		map->button_pairs[i].first.macro =
-			find_button_by_name("NONE");
-		map->button_pairs[i].second.remap =
-			find_button_by_name("NONE");
-		map->button_pairs[i].second.macro =
-			find_button_by_name("NONE");
-	}
-
-	map->button_pairs[BTN_PAIR_AB - 1].first.remap =
-		find_button_by_name("BTN_SOUTH");
-	map->button_pairs[BTN_PAIR_AB - 1].second.remap =
-		find_button_by_name("BTN_EAST");
-
-	map->button_pairs[BTN_PAIR_XY - 1].first.remap =
-		find_button_by_name("BTN_NORTH");
-	map->button_pairs[BTN_PAIR_XY - 1].second.remap =
-		find_button_by_name("BTN_WEST");
-
-	map->button_pairs[BTN_PAIR_BUMPER_LR - 1].first.remap =
-		find_button_by_name("BTN_TL");
-	map->button_pairs[BTN_PAIR_BUMPER_LR - 1].second.remap =
-		find_button_by_name("BTN_TR");
-
-	map->button_pairs[BTN_PAIR_STICK_LR - 1].first.remap =
-		find_button_by_name("BTN_THUMBL");
-	map->button_pairs[BTN_PAIR_STICK_LR - 1].second.remap =
-		find_button_by_name("BTN_THUMBR");
-
-	map->button_pairs[BTN_PAIR_DPAD_UPDOWN - 1].first.remap =
-		find_button_by_name("ABS_HAT0Y_NEG");
-	map->button_pairs[BTN_PAIR_DPAD_UPDOWN - 1].second.remap =
-		find_button_by_name("ABS_HAT0Y_POS");
-
-	map->button_pairs[BTN_PAIR_DPAD_LEFTRIGHT - 1].first.remap =
-		find_button_by_name("ABS_HAT0X_NEG");
-	map->button_pairs[BTN_PAIR_DPAD_LEFTRIGHT - 1].second.remap =
-		find_button_by_name("ABS_HAT0X_POS");
-
-	map->button_pairs[BTN_PAIR_TRIGGER_LR - 1].first.remap =
-		find_button_by_name("ABS_Z");
-	map->button_pairs[BTN_PAIR_TRIGGER_LR - 1].second.remap =
-		find_button_by_name("ABS_RZ");
-
-	map->button_pairs[BTN_PAIR_VIEW_MENU - 1].first.remap =
-		find_button_by_name("BTN_SELECT");
-	map->button_pairs[BTN_PAIR_VIEW_MENU - 1].second.remap =
-		find_button_by_name("BTN_START");
-
-	map->button_pairs[BTN_PAIR_M1M2 - 1].first.remap =
-		find_button_by_name("FN_M2");
-	map->button_pairs[BTN_PAIR_M1M2 - 1].second.remap =
-		find_button_by_name("FN_M1");
-}
-
-static void ally_set_default_keyboard_mapping(struct ally_button_mapping *mappings)
-{
-	struct ally_button_mapping *map = &mappings[ALLY_GAMEPAD_MODE_KEYBOARD];
-	int i;
-
-	/* Set all pair indexes and initialize to NONE */
-	for (i = 0; i < 9; i++) {
-		map->button_pairs[i].pair_index = i + 1;
-		map->button_pairs[i].first.remap =
-			find_button_by_name("NONE");
-		map->button_pairs[i].first.macro =
-			find_button_by_name("NONE");
-		map->button_pairs[i].second.remap =
-			find_button_by_name("NONE");
-		map->button_pairs[i].second.macro =
-			find_button_by_name("NONE");
-	}
-
-	/*
-	 * Desktop mode defaults: keyboard and mouse mappings.
-	 * Buttons not listed here (dpad, view, menu) remain NONE.
-	 */
-
-	/* btn_a => KEY_SPACE, btn_b => KEY_E */
-	map->button_pairs[BTN_PAIR_AB - 1].first.remap =
-		find_button_by_name("KEY_SPACE");
-	map->button_pairs[BTN_PAIR_AB - 1].second.remap =
-		find_button_by_name("KEY_E");
-
-	/* btn_x => KEY_R, btn_y => KEY_F */
-	map->button_pairs[BTN_PAIR_XY - 1].first.remap =
-		find_button_by_name("KEY_R");
-	map->button_pairs[BTN_PAIR_XY - 1].second.remap =
-		find_button_by_name("KEY_F");
-
-	/* LB => wheel up, RB => wheel down */
-	map->button_pairs[BTN_PAIR_BUMPER_LR - 1].first.remap =
-		find_button_by_name("REL_WHEEL_HI_RES_UP");
-	map->button_pairs[BTN_PAIR_BUMPER_LR - 1].second.remap =
-		find_button_by_name("REL_WHEEL_HI_RES_DOWN");
-
-	/* left stick click => left click, right stick click => left shift */
-	map->button_pairs[BTN_PAIR_STICK_LR - 1].first.remap =
-		find_button_by_name("BTN_LEFT");
-	map->button_pairs[BTN_PAIR_STICK_LR - 1].second.remap =
-		find_button_by_name("KEY_LEFTSHIFT");
-
-	/* LT => left click, RT => right click */
-	map->button_pairs[BTN_PAIR_TRIGGER_LR - 1].first.remap =
-		find_button_by_name("BTN_LEFT");
-	map->button_pairs[BTN_PAIR_TRIGGER_LR - 1].second.remap =
-		find_button_by_name("BTN_RIGHT");
-
-	/* M2 => FN_M2, M1 => FN_M1 */
-	map->button_pairs[BTN_PAIR_M1M2 - 1].first.remap =
-		find_button_by_name("FN_M2");
-	map->button_pairs[BTN_PAIR_M1M2 - 1].second.remap =
-		find_button_by_name("FN_M1");
-}
-
-static ssize_t gamepad_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 mode_byte;
-	int i;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	mode_byte = cfg->gamepad_mode;
-
-	for (i = 0; i < ARRAY_SIZE(ally_gamepad_mode); i++) {
-		if (ally_gamepad_mode[i] == mode_byte)
-			return sysfs_emit(buf, "%s\n", ally_gamepad_mode_text[i]);
-	}
-
-	return sysfs_emit(buf, "unsupported\n");
-}
-
-static ssize_t gamepad_mode_store(struct device *dev, struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 mode_byte;
-	int mode;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	mode = sysfs_match_string(ally_gamepad_mode_text, buf);
-	if (mode < 0) {
-		hid_err(hdev, "Unknown gamepad mode\n");
-		return mode;
-	}
-
-	/* Convert the index of the text mode array to the byte
-	 * that will be accepted by the ally MCU.
-	 */
-	mode_byte = ally_gamepad_mode[mode];
-
-	guard(mutex)(&cfg->config_mutex);
-
-	ret = ally_set_gamepad_mode(ally, hdev, mode_byte);
-	if (ret < 0)
-		return ret;
-
-	cfg->gamepad_mode = mode_byte;
-
-	/*
-	 * When the gamepad mode changes, the hardware automatically
-	 * resets all button mappings to its internal defaults for the
-	 * new mode.
-	 *
-	 * Refresh the software cache so that subsequent
-	 * reads from sysfs reflect what the firmware is actually
-	 * using.
-	 */
-	if (cfg->button_mappings) {
-		struct ally_button_mapping *mappings = cfg->button_mappings;
-
-		if (mode_byte == ALLY_GAMEPAD_MODE_GAMEPAD)
-			ally_set_default_gamepad_mapping(mappings);
-		else if (mode_byte == ALLY_GAMEPAD_MODE_KEYBOARD)
-			ally_set_default_keyboard_mapping(mappings);
-	}
-
-	hid_dbg(hdev, "Set gamepad mode to %s\n", ally_gamepad_mode_text[mode]);
-
-	return count;
-}
-
-static ssize_t gamepad_mode_index_show(struct device *dev,
-				       struct device_attribute *attr,
-				       char *buf)
-{
-	int i;
-	ssize_t len = 0;
-
-	for (i = 0; i < ARRAY_SIZE(ally_gamepad_mode_text); i++) {
-		if (!ally_gamepad_mode_text[i] || ally_gamepad_mode_text[i][0] == '\0')
-			continue;
-		len += sysfs_emit_at(buf, len, "%s ", ally_gamepad_mode_text[i]);
-	}
-
-	/* Replace the last space with a newline */
-	if (len > 0)
-		buf[len - 1] = '\n';
-
-	return len;
-}
-
-static DEVICE_ATTR_RW(gamepad_mode);
-static DEVICE_ATTR_RO(gamepad_mode_index);
-
-/**
- * ally_apply_gamepad_mode() - Re-send the recorded gamepad mode to the hardware
- * @hdev: HID device
- * @ally: ally handheld structure
- * @cfg: ally config
- *
- * Re-send the gamepad mode currently recorded in the configuration to the
- * hardware: during probe that is the default mode, while a reset resume
- * restores whatever the user last wrote instead of overwriting it. The
- * shared state is accessed under the lock, as sysfs is already live.
- *
- * Return: 0 on success, negative errno on failure
- */
-static int ally_apply_gamepad_mode(struct hid_device *hdev,
-				   struct ally_handheld *ally,
-				   struct ally_config *cfg)
-{
-	scoped_guard(mutex, &cfg->config_mutex)
-		return ally_set_gamepad_mode(ally, hdev, cfg->gamepad_mode);
-}
-
-/**
- * ally_set_vibration_intensity() - Set vibration intensity values
- * @ally: ally handheld structure
- * @hdev: HID device
- * @left: Left motor intensity (0-100)
- * @right: Right motor intensity (0-100)
- *
- * Return: 0 on success, negative errno on failure
- */
-static int ally_set_vibration_intensity(struct ally_handheld *ally,
-					struct hid_device *hdev, u8 left, u8 right)
-{
-	const u8 data[] = { left, right };
-	int ret;
-
-	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_VIBRATION_INTENSITY, data, sizeof(data));
-	if (!buf)
-		return -ENOMEM;
-
-	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-	if (ret < 0) {
-		hid_err(hdev, "Failed to set vibration intensity: %d\n", ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static ssize_t left_vibration_intensity_show(struct device *dev, struct device_attribute *attr,
-					     char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	return sysfs_emit(buf, "%u\n", cfg->vibration_intensity_left);
-}
-
-static ssize_t left_vibration_intensity_store(struct device *dev, struct device_attribute *attr,
-					      const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value > 100)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	ret = ally_set_vibration_intensity(ally, hdev, value,
-					   cfg->vibration_intensity_right);
-	if (ret < 0)
-		return ret;
-
-	cfg->vibration_intensity_left = value;
-
-	return count;
-}
-
-static ssize_t left_vibration_intensity_range_show(struct device *dev,
-						   struct device_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "0 100\n");
-}
-
-static ssize_t right_vibration_intensity_show(struct device *dev, struct device_attribute *attr,
-					      char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	return sysfs_emit(buf, "%u\n", cfg->vibration_intensity_right);
-}
-
-static ssize_t right_vibration_intensity_store(struct device *dev, struct device_attribute *attr,
-					       const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value > 100)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	ret = ally_set_vibration_intensity(ally, hdev,
-					   cfg->vibration_intensity_left, value);
-	if (ret < 0)
-		return ret;
-
-	cfg->vibration_intensity_right = value;
-
-	return count;
-}
-
-static ssize_t right_vibration_intensity_range_show(struct device *dev,
-						    struct device_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "0 100\n");
-}
-
-static struct device_attribute dev_attr_left_vibration_intensity =
-	__ATTR(intensity, 0644, left_vibration_intensity_show, left_vibration_intensity_store);
-
-static struct device_attribute dev_attr_left_vibration_intensity_range =
-	__ATTR(intensity_range, 0444, left_vibration_intensity_range_show, NULL);
-
-static struct device_attribute dev_attr_right_vibration_intensity =
-	__ATTR(intensity, 0644, right_vibration_intensity_show, right_vibration_intensity_store);
-
-static struct device_attribute dev_attr_right_vibration_intensity_range =
-	__ATTR(intensity_range, 0444, right_vibration_intensity_range_show, NULL);
-
-/**
- * ally_set_joystick_thresholds() - Generic function to set joystick ranges
- * @ally: ally handheld structure
- * @hdev: HID device
- * @cfg: ally config
- * @left_it: inner threshold (deadzone) of the left stick (0-50)
- * @left_ot: outer threshold of the left stick (70-100)
- * @right_it: inner threshold (deadzone) of the right stick (0-50)
- * @right_ot: outer threshold of the right stick (70-100)
- *
- * This function sends the command to set both inner and outer threshold
- * for the left and right joysticks.
- *
- * Return: 0 on success, negative errno on failure
- */
-static int ally_set_joystick_thresholds(struct ally_handheld *ally,
-					struct hid_device *hdev, struct ally_config *cfg,
-					u8 left_it, u8 left_ot, u8 right_it, u8 right_ot)
-{
-	const u8 payload[] = { left_it, left_ot, right_it, right_ot };
-	int ret;
-
-	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_JOYSTICK_DEADZONE, payload, sizeof(payload));
-	if (!buf)
-		return -ENOMEM;
-
-	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-	if (ret < 0) {
-		hid_err(hdev, "Failed to set joystick ranges: %d\n", ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static ssize_t left_joystick_inner_threshold_show(struct device *dev, struct device_attribute *attr,
-						  char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	return sysfs_emit(buf, "%u\n", cfg->left_deadzone);
-}
-
-static ssize_t left_joystick_inner_threshold_store(struct device *dev,
-						   struct device_attribute *attr,
-						   const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value > 50)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	ret = ally_set_joystick_thresholds(ally, hdev, cfg,
-					   value,
-					   cfg->left_outer_threshold,
-					   cfg->right_deadzone,
-					   cfg->right_outer_threshold);
-	if (ret)
-		return ret;
-
-	cfg->left_deadzone = value;
-
-	return count;
-}
-
-static ssize_t left_joystick_inner_threshold_range_show(struct device *dev,
-							struct device_attribute *attr,
-							char *buf)
-{
-	return sysfs_emit(buf, "0 50\n");
-}
-
-static ssize_t left_joystick_outer_threshold_show(struct device *dev, struct device_attribute *attr,
-						  char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	return sysfs_emit(buf, "%u\n", cfg->left_outer_threshold);
-}
-
-static ssize_t left_joystick_outer_threshold_store(struct device *dev,
-						   struct device_attribute *attr,
-						   const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value < 70 || value > 100)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	ret = ally_set_joystick_thresholds(ally, hdev, cfg,
-					   cfg->left_deadzone,
-					   value,
-					   cfg->right_deadzone,
-					   cfg->right_outer_threshold);
-	if (ret)
-		return ret;
-
-	cfg->left_outer_threshold = value;
-
-	return count;
-}
-
-static ssize_t left_joystick_outer_threshold_range_show(struct device *dev,
-							struct device_attribute *attr,
-							char *buf)
-{
-	return sysfs_emit(buf, "70 100\n");
-}
-
-static ssize_t right_joystick_inner_threshold_show(struct device *dev,
-						   struct device_attribute *attr,
-						   char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	return sysfs_emit(buf, "%u\n", cfg->right_deadzone);
-}
-
-static ssize_t right_joystick_inner_threshold_store(struct device *dev,
-						    struct device_attribute *attr,
-						    const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value > 50)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	ret = ally_set_joystick_thresholds(ally, hdev, cfg,
-					   cfg->left_deadzone,
-					   cfg->left_outer_threshold,
-					   value,
-					   cfg->right_outer_threshold);
-	if (ret)
-		return ret;
-
-	cfg->right_deadzone = value;
-
-	return count;
-}
-
-static ssize_t right_joystick_inner_threshold_range_show(struct device *dev,
-							 struct device_attribute *attr,
-							 char *buf)
-{
-	return sysfs_emit(buf, "0 50\n");
-}
-
-static ssize_t right_joystick_outer_threshold_show(struct device *dev,
-						   struct device_attribute *attr,
-						   char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	return sysfs_emit(buf, "%u\n", cfg->right_outer_threshold);
-}
-
-static ssize_t right_joystick_outer_threshold_store(struct device *dev,
-						    struct device_attribute *attr,
-						    const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value < 70 || value > 100)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	ret = ally_set_joystick_thresholds(ally, hdev, cfg,
-					   cfg->left_deadzone,
-					   cfg->left_outer_threshold,
-					   cfg->right_deadzone,
-					   value);
-	if (ret)
-		return ret;
-
-	cfg->right_outer_threshold = value;
-
-	return count;
-}
-
-static ssize_t right_joystick_outer_threshold_range_show(struct device *dev,
-							 struct device_attribute *attr,
-							 char *buf)
-{
-	return sysfs_emit(buf, "70 100\n");
-}
-
-static struct device_attribute dev_attr_left_joystick_inner_threshold =
-	__ATTR(inner_threshold, 0644, left_joystick_inner_threshold_show,
-	       left_joystick_inner_threshold_store);
-
-static struct device_attribute dev_attr_left_joystick_inner_threshold_range =
-	__ATTR(inner_threshold_range, 0444, left_joystick_inner_threshold_range_show, NULL);
-
-static struct device_attribute dev_attr_left_joystick_outer_threshold =
-	__ATTR(outer_threshold, 0644, left_joystick_outer_threshold_show,
-	       left_joystick_outer_threshold_store);
-
-static struct device_attribute dev_attr_left_joystick_outer_threshold_range =
-	__ATTR(outer_threshold_range, 0444, left_joystick_outer_threshold_range_show, NULL);
-
-static struct device_attribute dev_attr_right_joystick_inner_threshold =
-	__ATTR(inner_threshold, 0644, right_joystick_inner_threshold_show,
-	       right_joystick_inner_threshold_store);
-
-static struct device_attribute dev_attr_right_joystick_inner_threshold_range =
-	__ATTR(inner_threshold_range, 0444, right_joystick_inner_threshold_range_show, NULL);
-
-static struct device_attribute dev_attr_right_joystick_outer_threshold =
-	__ATTR(outer_threshold, 0644, right_joystick_outer_threshold_show,
-	       right_joystick_outer_threshold_store);
-
-static struct device_attribute dev_attr_right_joystick_outer_threshold_range =
-	__ATTR(outer_threshold_range, 0444, right_joystick_outer_threshold_range_show, NULL);
-
-/**
- * ally_set_anti_deadzone() - Set anti-deadzone values for joysticks
- * @ally: ally handheld structure
- * @hdev: HID device
- * @cfg: ally config
- * @left_adz: left joystick anti-deadzone value (0-100)
- * @right_adz: right joystick anti-deadzone value (0-100)
- *
- * Return: 0 on success, negative errno on failure
- */
-static int ally_set_anti_deadzone(struct ally_handheld *ally,
-				  struct hid_device *hdev, struct ally_config *cfg,
-				  u8 left_adz, u8 right_adz)
-{
-	const u8 payload[] = { left_adz, right_adz };
-	int ret;
-
-	if (!cfg->anti_deadzone_support) {
-		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
-		return -EOPNOTSUPP;
-	}
-
-	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_ANTI_DEADZONE, payload, sizeof(payload));
-	if (!buf)
-		return -ENOMEM;
-
-	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-	if (ret < 0) {
-		hid_err(hdev, "Failed to set anti-deadzone values: %d\n", ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static ssize_t left_joystick_anti_deadzone_show(struct device *dev, struct device_attribute *attr,
-						char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->anti_deadzone_support) {
-		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
-		return -EOPNOTSUPP;
-	}
-
-	return sysfs_emit(buf, "%u\n", cfg->left_anti_deadzone);
-}
-
-static ssize_t left_joystick_anti_deadzone_store(struct device *dev, struct device_attribute *attr,
-						 const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value > 100)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->anti_deadzone_support) {
-		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
-		return -EOPNOTSUPP;
-	}
-
-	ret = ally_set_anti_deadzone(ally, hdev, cfg, value, cfg->right_anti_deadzone);
-	if (ret)
-		return ret;
-
-	cfg->left_anti_deadzone = value;
-
-	return count;
-}
-
-static ssize_t left_joystick_anti_deadzone_range_show(struct device *dev,
-						      struct device_attribute *attr,
-						      char *buf)
-{
-	return sysfs_emit(buf, "0 100\n");
-}
-
-static ssize_t right_joystick_anti_deadzone_show(struct device *dev, struct device_attribute *attr,
-						 char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->anti_deadzone_support) {
-		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
-		return -EOPNOTSUPP;
-	}
-
-	return sysfs_emit(buf, "%u\n", cfg->right_anti_deadzone);
-}
-
-static ssize_t right_joystick_anti_deadzone_store(struct device *dev, struct device_attribute *attr,
-						  const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value > 100)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->anti_deadzone_support) {
-		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
-		return -EOPNOTSUPP;
-	}
-
-	ret = ally_set_anti_deadzone(ally, hdev, cfg, cfg->left_anti_deadzone, value);
-	if (ret)
-		return ret;
-
-	cfg->right_anti_deadzone = value;
-
-	return count;
-}
-
-static ssize_t right_joystick_anti_deadzone_range_show(struct device *dev,
-						       struct device_attribute *attr,
-						       char *buf)
-{
-	return sysfs_emit(buf, "0 100\n");
-}
-
-static struct device_attribute dev_attr_left_joystick_anti_deadzone =
-	__ATTR(anti_deadzone, 0644, left_joystick_anti_deadzone_show,
-	       left_joystick_anti_deadzone_store);
-
-static struct device_attribute dev_attr_left_joystick_anti_deadzone_range =
-	__ATTR(anti_deadzone_range, 0444, left_joystick_anti_deadzone_range_show, NULL);
-
-static struct device_attribute dev_attr_right_joystick_anti_deadzone =
-	__ATTR(anti_deadzone, 0644, right_joystick_anti_deadzone_show,
-	       right_joystick_anti_deadzone_store);
-
-static struct device_attribute dev_attr_right_joystick_anti_deadzone_range =
-	__ATTR(anti_deadzone_range, 0444, right_joystick_anti_deadzone_range_show, NULL);
-
-/**
- * ally_set_trigger_ranges() - Generic function to set triggers ranges
- * @ally: ally handheld structure
- * @hdev: HID device
- * @cfg: ally config
- * @left_it: lower limit of the left trigger range (0-50)
- * @left_ot: upper limit of the left trigger range (70-100)
- * @right_it: lower limit of the right trigger range (0-50)
- * @right_ot: upper limit of the right trigger range (70-100)
- *
- * This function sends the command to set both inner and outer threshold
- * for the left and right triggers.
- *
- * Return: 0 on success, negative errno on failure
- */
-static int ally_set_trigger_ranges(struct ally_handheld *ally,
-				   struct hid_device *hdev, struct ally_config *cfg,
-				   u8 left_it, u8 left_ot, u8 right_it, u8 right_ot)
-{
-	const u8 payload[] = { left_it, left_ot, right_it, right_ot };
-	int ret;
-
-	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_TRIGGER_RANGE, payload, sizeof(payload));
-	if (!buf)
-		return -ENOMEM;
-
-	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-	if (ret < 0) {
-		hid_err(hdev, "Failed to set trigger ranges: %d\n", ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static ssize_t left_trigger_range_lower_limit_show(struct device *dev,
-						   struct device_attribute *attr, char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	return sysfs_emit(buf, "%u\n", cfg->left_trigger_min);
-}
-
-static ssize_t left_trigger_range_lower_limit_store(struct device *dev,
-						    struct device_attribute *attr,
-						    const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value > 50)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	ret = ally_set_trigger_ranges(ally, hdev, cfg,
-				      value,
-				      cfg->left_trigger_max,
-				      cfg->right_trigger_min,
-				      cfg->right_trigger_max);
-	if (ret)
-		return ret;
-
-	cfg->left_trigger_min = value;
-
-	return count;
-}
-
-static ssize_t left_trigger_range_lower_limit_range_show(struct device *dev,
-							 struct device_attribute *attr,
-							 char *buf)
-{
-	return sysfs_emit(buf, "0 50\n");
-}
-
-static ssize_t right_trigger_range_upper_limit_show(struct device *dev,
-						    struct device_attribute *attr, char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	return sysfs_emit(buf, "%u\n", cfg->right_trigger_max);
-}
-
-static ssize_t right_trigger_range_upper_limit_store(struct device *dev,
-						     struct device_attribute *attr,
-						     const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value < 70 || value > 100)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	ret = ally_set_trigger_ranges(ally, hdev, cfg,
-				      cfg->left_trigger_min,
-				      cfg->left_trigger_max,
-				      cfg->right_trigger_min,
-				      value);
-	if (ret)
-		return ret;
-
-	cfg->right_trigger_max = value;
-
-	return count;
-}
-
-static ssize_t right_trigger_range_upper_limit_range_show(struct device *dev,
-							  struct device_attribute *attr,
-							  char *buf)
-{
-	return sysfs_emit(buf, "70 100\n");
-}
-
-static ssize_t right_trigger_range_lower_limit_show(struct device *dev,
-						    struct device_attribute *attr, char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	return sysfs_emit(buf, "%u\n", cfg->right_trigger_min);
-}
-
-static ssize_t right_trigger_range_lower_limit_store(struct device *dev,
-						     struct device_attribute *attr,
-						     const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value > 50)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	ret = ally_set_trigger_ranges(ally, hdev, cfg,
-				      cfg->left_trigger_min,
-				      cfg->left_trigger_max,
-				      value,
-				      cfg->right_trigger_max);
-	if (ret)
-		return ret;
-
-	cfg->right_trigger_min = value;
-
-	return count;
-}
-
-static ssize_t right_trigger_range_lower_limit_range_show(struct device *dev,
-							  struct device_attribute *attr,
-							  char *buf)
-{
-	return sysfs_emit(buf, "0 50\n");
-}
-
-static ssize_t left_trigger_range_upper_limit_show(struct device *dev,
-						   struct device_attribute *attr,
-						   char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	return sysfs_emit(buf, "%u\n", cfg->left_trigger_max);
-}
-
-static ssize_t left_trigger_range_upper_limit_store(struct device *dev,
-						    struct device_attribute *attr,
-						    const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	u8 value;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret || value < 70 || value > 100)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->user_cal_support)
-		return -EOPNOTSUPP;
-
-	ret = ally_set_trigger_ranges(ally, hdev, cfg,
-				      cfg->left_trigger_min,
-				      value,
-				      cfg->right_trigger_min,
-				      cfg->right_trigger_max);
-	if (ret)
-		return ret;
-
-	cfg->left_trigger_max = value;
-
-	return count;
-}
-
-static ssize_t left_trigger_range_upper_limit_range_show(struct device *dev,
-							 struct device_attribute *attr,
-							 char *buf)
-{
-	return sysfs_emit(buf, "70 100\n");
-}
-
-static struct device_attribute dev_attr_left_trigger_range_lower_limit =
-	__ATTR(range_lower_limit, 0644, left_trigger_range_lower_limit_show,
-	       left_trigger_range_lower_limit_store);
-
-static struct device_attribute dev_attr_left_trigger_range_lower_limit_range =
-	__ATTR(range_lower_limit_range, 0444, left_trigger_range_lower_limit_range_show, NULL);
-
-static struct device_attribute dev_attr_left_trigger_range_upper_limit =
-	__ATTR(range_upper_limit, 0644, left_trigger_range_upper_limit_show,
-	       left_trigger_range_upper_limit_store);
-
-static struct device_attribute dev_attr_left_trigger_range_upper_limit_range =
-	__ATTR(range_upper_limit_range, 0444, left_trigger_range_upper_limit_range_show, NULL);
-
-static struct device_attribute dev_attr_right_trigger_range_lower_limit =
-	__ATTR(range_lower_limit, 0644, right_trigger_range_lower_limit_show,
-	       right_trigger_range_lower_limit_store);
-
-static struct device_attribute dev_attr_right_trigger_range_lower_limit_range =
-	__ATTR(range_lower_limit_range, 0444, right_trigger_range_lower_limit_range_show, NULL);
-
-static struct device_attribute dev_attr_right_trigger_range_upper_limit =
-	__ATTR(range_upper_limit, 0644, right_trigger_range_upper_limit_show,
-	       right_trigger_range_upper_limit_store);
-
-static struct device_attribute dev_attr_right_trigger_range_upper_limit_range =
-	__ATTR(range_upper_limit_range, 0444, right_trigger_range_upper_limit_range_show, NULL);
-
-enum ally_joystick_side {
-	JOYSTICK_LEFT = 0,
-	JOYSTICK_RIGHT,
-};
-
-/**
- * ally_set_joystick_resp_curve() - Set joystick response curve parameters
- * @ally: ally handheld structure
- * @hdev: HID device
- * @side: which joystick side (0=left, 1=right)
- * @curve: response curve parameter structure
- *
- * Return: 0 on success, negative errno on failure
- */
-static int ally_set_joystick_resp_curve(struct ally_handheld *ally,
-					struct hid_device *hdev, enum ally_joystick_side side,
-					struct ally_joystick_resp_curve *curve)
-{
-	const u8 payload[] = { side,
-		curve->entry_1.move, curve->entry_1.resp,
-		curve->entry_2.move, curve->entry_2.resp,
-		curve->entry_3.move, curve->entry_3.resp,
-		curve->entry_4.move, curve->entry_4.resp
-	};
-	int ret;
-
-	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_RESP_CURVE, payload, sizeof(payload));
-	if (!buf)
-		return -ENOMEM;
-
-	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-	if (ret < 0)
-		return ret;
-
-	return 0;
-}
-
-static int response_curve_apply(struct ally_handheld *ally,
-				struct hid_device *hdev,
-				struct ally_config *cfg, bool is_left)
-{
-	struct ally_joystick_resp_curve curve;
-	int ret;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->resp_curve_support)
-		return -EOPNOTSUPP;
-
-	curve = is_left ? cfg->left_curve : cfg->right_curve;
-
-	if (!(curve.entry_1.move < curve.entry_2.move &&
-	      curve.entry_2.move < curve.entry_3.move &&
-	      curve.entry_3.move < curve.entry_4.move))
-		return -EINVAL;
-
-	ret = ally_set_joystick_resp_curve(ally, hdev,
-					   is_left ? JOYSTICK_LEFT : JOYSTICK_RIGHT,
-					   &curve);
-	if (ret) {
-		hid_err(hdev, "Failed to set joystick response curve: %d\n", ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static ssize_t left_response_curve_apply_store(struct device *dev,
-					       struct device_attribute *attr,
-					       const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	bool apply;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtobool(buf, &apply);
-	if (ret)
-		return ret;
-
-	if (!apply)
-		return count;
-
-	ret = response_curve_apply(ally, hdev, cfg, true);
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-
-static ssize_t right_response_curve_apply_store(struct device *dev,
-						struct device_attribute *attr,
-						const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *const ally = drvdata->rog_ally;
-	struct ally_config *cfg;
-	bool apply;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = kstrtobool(buf, &apply);
-	if (ret)
-		return ret;
-
-	if (!apply)
-		return count;
-
-	ret = response_curve_apply(ally, hdev, cfg, false);
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-
-static ALLY_DEVICE_ATTR_WO(left_response_curve_apply, response_curve_apply);
-static ALLY_DEVICE_ATTR_WO(right_response_curve_apply, response_curve_apply);
-
-static ssize_t response_curve_pct_show(struct device *dev,
-				       char *buf,
-				       struct ally_config *cfg, bool is_left,
-				       unsigned int idx)
-{
-	struct ally_joystick_resp_curve *curve;
-	int ret = -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->resp_curve_support)
-		return -EOPNOTSUPP;
-
-	curve = is_left ? &cfg->left_curve : &cfg->right_curve;
-
-	switch (idx) {
-	case 1:
-		ret = sysfs_emit(buf, "%u\n", curve->entry_1.resp);
-		break;
-	case 2:
-		ret = sysfs_emit(buf, "%u\n", curve->entry_2.resp);
-		break;
-	case 3:
-		ret = sysfs_emit(buf, "%u\n", curve->entry_3.resp);
-		break;
-	case 4:
-		ret = sysfs_emit(buf, "%u\n", curve->entry_4.resp);
-		break;
-	}
-
-	return ret;
-}
-
-static ssize_t response_curve_move_show(struct device *dev,
-					char *buf,
-					struct ally_config *cfg, bool is_left,
-					unsigned int idx)
-{
-	struct ally_joystick_resp_curve *curve;
-	int ret = -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->resp_curve_support)
-		return -EOPNOTSUPP;
-
-	curve = is_left ? &cfg->left_curve : &cfg->right_curve;
-
-	switch (idx) {
-	case 1:
-		ret = sysfs_emit(buf, "%u\n", curve->entry_1.move);
-		break;
-	case 2:
-		ret = sysfs_emit(buf, "%u\n", curve->entry_2.move);
-		break;
-	case 3:
-		ret = sysfs_emit(buf, "%u\n", curve->entry_3.move);
-		break;
-	case 4:
-		ret = sysfs_emit(buf, "%u\n", curve->entry_4.move);
-		break;
-	}
-
-	return ret;
-}
-
-static ssize_t response_curve_pct_store(struct device *dev,
-					const char *buf, size_t count,
-					struct ally_config *cfg, bool is_left,
-					unsigned int idx)
-{
-	struct ally_joystick_resp_curve *curve;
-	u8 value;
-	int ret;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret)
-		return ret;
-
-	if (value > 100)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->resp_curve_support)
-		return -EOPNOTSUPP;
-
-	curve = is_left ? &cfg->left_curve : &cfg->right_curve;
-
-	switch (idx) {
-	case 1:
-		curve->entry_1.resp = value;
-		break;
-	case 2:
-		curve->entry_2.resp = value;
-		break;
-	case 3:
-		curve->entry_3.resp = value;
-		break;
-	case 4:
-		curve->entry_4.resp = value;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return count;
-}
-
-static ssize_t response_curve_move_store(struct device *dev,
-					 const char *buf, size_t count,
-					 struct ally_config *cfg, bool is_left,
-					 unsigned int idx)
-{
-	struct ally_joystick_resp_curve *curve;
-	u8 value;
-	int ret;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret)
-		return ret;
-
-	if (value > 100)
-		return -EINVAL;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	if (!cfg->resp_curve_support)
-		return -EOPNOTSUPP;
-
-	curve = is_left ? &cfg->left_curve : &cfg->right_curve;
-
-	switch (idx) {
-	case 1:
-		curve->entry_1.move = value;
-		break;
-	case 2:
-		curve->entry_2.move = value;
-		break;
-	case 3:
-		curve->entry_3.move = value;
-		break;
-	case 4:
-		curve->entry_4.move = value;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return count;
-}
-
-#define DEFINE_JS_CURVE_PCT_FOPS(region, side)				\
-	static ssize_t side##_response_curve_pct_##region##_show(	\
-		struct device *dev, struct device_attribute *attr,	\
-		char *buf)						\
-	{								\
-		struct hid_device *hdev = to_hid_device(dev);		\
-		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);	\
-		struct ally_handheld *ally = drvdata->rog_ally;		\
-		struct ally_config *cfg;				\
-									\
-		if (!ally)						\
-			return -ENODEV;				\
-									\
-		cfg = ally_get_config(ally);				\
-		if (!cfg)						\
-			return -ENODEV;				\
-									\
-		return response_curve_pct_show(dev, buf, cfg,		\
-					       side##_is_left, region);\
-	}								\
-									\
-	static ssize_t side##_response_curve_pct_##region##_store(	\
-		struct device *dev, struct device_attribute *attr,	\
-		const char *buf, size_t count)				\
-	{								\
-		struct hid_device *hdev = to_hid_device(dev);		\
-		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);	\
-		struct ally_handheld *ally = drvdata->rog_ally;		\
-		struct ally_config *cfg;				\
-									\
-		if (!ally)						\
-			return -ENODEV;				\
-									\
-		cfg = ally_get_config(ally);				\
-		if (!cfg)						\
-			return -ENODEV;				\
-									\
-		return response_curve_pct_store(dev, buf, count, cfg,	\
-						side##_is_left, region);\
-	}
-
-#define DEFINE_JS_CURVE_MOVE_FOPS(region, side)				\
-	static ssize_t side##_response_curve_move_##region##_show(	\
-		struct device *dev, struct device_attribute *attr,	\
-		char *buf)						\
-	{								\
-		struct hid_device *hdev = to_hid_device(dev);		\
-		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);	\
-		struct ally_handheld *ally = drvdata->rog_ally;		\
-		struct ally_config *cfg;				\
-									\
-		if (!ally)						\
-			return -ENODEV;				\
-									\
-		cfg = ally_get_config(ally);				\
-		if (!cfg)						\
-			return -ENODEV;				\
-									\
-		return response_curve_move_show(dev, buf, cfg,		\
-						side##_is_left, region);\
-	}								\
-									\
-	static ssize_t side##_response_curve_move_##region##_store(	\
-		struct device *dev, struct device_attribute *attr,	\
-		const char *buf, size_t count)				\
-	{								\
-		struct hid_device *hdev = to_hid_device(dev);		\
-		struct asus_drvdata *drvdata = hid_get_drvdata(hdev);	\
-		struct ally_handheld *ally = drvdata->rog_ally;		\
-		struct ally_config *cfg;				\
-									\
-		if (!ally)						\
-			return -ENODEV;				\
-									\
-		cfg = ally_get_config(ally);				\
-		if (!cfg)						\
-			return -ENODEV;				\
-									\
-		return response_curve_move_store(dev, buf, count, cfg,	\
-						 side##_is_left, region);\
-	}
-
-#define DEFINE_JS_CURVE_ATTRS(region, side)				\
-	DEFINE_JS_CURVE_PCT_FOPS(region, side)				\
-	DEFINE_JS_CURVE_MOVE_FOPS(region, side)				\
-	static ALLY_DEVICE_ATTR_RW(side##_response_curve_pct_##region,	\
-				   response_curve_pct_##region);	\
-	static ALLY_DEVICE_ATTR_RW(side##_response_curve_move_##region,	\
-				   response_curve_move_##region)
-
-/* Helper defines for "is_left" parameter in DEFINE_JS_CURVE_ATTRS macros */
-#define left_is_left true
-#define right_is_left false
-
-DEFINE_JS_CURVE_ATTRS(1, left);
-DEFINE_JS_CURVE_ATTRS(2, left);
-DEFINE_JS_CURVE_ATTRS(3, left);
-DEFINE_JS_CURVE_ATTRS(4, left);
-
-DEFINE_JS_CURVE_ATTRS(1, right);
-DEFINE_JS_CURVE_ATTRS(2, right);
-DEFINE_JS_CURVE_ATTRS(3, right);
-DEFINE_JS_CURVE_ATTRS(4, right);
-
-static struct attribute *ally_config_attrs[] = {
-	&dev_attr_xbox_controller.attr,
-	&dev_attr_gamepad_mode.attr,
-	&dev_attr_gamepad_mode_index.attr,
-	NULL
-};
-
-static struct attribute *ally_left_vibration_attrs[] = {
-	&dev_attr_left_vibration_intensity.attr,
-	&dev_attr_left_vibration_intensity_range.attr,
-	NULL
-};
-
-static struct attribute *ally_right_vibration_attrs[] = {
-	&dev_attr_right_vibration_intensity.attr,
-	&dev_attr_right_vibration_intensity_range.attr,
-	NULL
-};
-
-static struct attribute *left_joystick_axis_attrs[] = {
-	&dev_attr_left_joystick_inner_threshold.attr,
-	&dev_attr_left_joystick_outer_threshold.attr,
-	&dev_attr_left_joystick_inner_threshold_range.attr,
-	&dev_attr_left_joystick_outer_threshold_range.attr,
-	&dev_attr_left_joystick_anti_deadzone.attr,
-	&dev_attr_left_joystick_anti_deadzone_range.attr,
-	&dev_attr_left_response_curve_pct_1.attr,
-	&dev_attr_left_response_curve_pct_2.attr,
-	&dev_attr_left_response_curve_pct_3.attr,
-	&dev_attr_left_response_curve_pct_4.attr,
-	&dev_attr_left_response_curve_move_1.attr,
-	&dev_attr_left_response_curve_move_2.attr,
-	&dev_attr_left_response_curve_move_3.attr,
-	&dev_attr_left_response_curve_move_4.attr,
-	&dev_attr_left_response_curve_apply.attr,
-	NULL
-};
-
-static struct attribute *right_joystick_axis_attrs[] = {
-	&dev_attr_right_joystick_inner_threshold.attr,
-	&dev_attr_right_joystick_outer_threshold.attr,
-	&dev_attr_right_joystick_inner_threshold_range.attr,
-	&dev_attr_right_joystick_outer_threshold_range.attr,
-	&dev_attr_right_joystick_anti_deadzone.attr,
-	&dev_attr_right_joystick_anti_deadzone_range.attr,
-	&dev_attr_right_response_curve_pct_1.attr,
-	&dev_attr_right_response_curve_pct_2.attr,
-	&dev_attr_right_response_curve_pct_3.attr,
-	&dev_attr_right_response_curve_pct_4.attr,
-	&dev_attr_right_response_curve_move_1.attr,
-	&dev_attr_right_response_curve_move_2.attr,
-	&dev_attr_right_response_curve_move_3.attr,
-	&dev_attr_right_response_curve_move_4.attr,
-	&dev_attr_right_response_curve_apply.attr,
-	NULL
-};
-
-static struct attribute *left_trigger_attrs[] = {
-	&dev_attr_left_trigger_range_lower_limit.attr,
-	&dev_attr_left_trigger_range_upper_limit.attr,
-	&dev_attr_left_trigger_range_lower_limit_range.attr,
-	&dev_attr_left_trigger_range_upper_limit_range.attr,
-	NULL
-};
-
-static struct attribute *right_trigger_attrs[] = {
-	&dev_attr_right_trigger_range_lower_limit.attr,
-	&dev_attr_right_trigger_range_upper_limit.attr,
-	&dev_attr_right_trigger_range_lower_limit_range.attr,
-	&dev_attr_right_trigger_range_upper_limit_range.attr,
-	NULL
-};
-
-static const struct attribute_group ally_attr_groups[] = {
-	{
-		.attrs = ally_config_attrs,
-	},
-	{
-		.name = "left_vibration",
-		.attrs = ally_left_vibration_attrs,
-	},
-	{
-		.name = "right_vibration",
-		.attrs = ally_right_vibration_attrs,
-	},
-};
-
-/*
- * The joystick and trigger range calibration attributes are tied to the
- * user-calibration capability: their sysfs groups are registered only
- * when the device supports configuring those parameters, and the show
- * and store callbacks reject accesses with -EOPNOTSUPP regardless, in
- * case the groups are registered for another supported feature.
- */
-static const struct attribute_group ally_left_joystick_axis_group = {
-	.name = "left_joystick_axis",
-	.attrs = left_joystick_axis_attrs,
-};
-
-static const struct attribute_group ally_right_joystick_axis_group = {
-	.name = "right_joystick_axis",
-	.attrs = right_joystick_axis_attrs,
-};
-
-static const struct attribute_group ally_left_trigger_group = {
-	.name = "left_trigger",
-	.attrs = left_trigger_attrs,
-};
-
-static const struct attribute_group ally_right_trigger_group = {
-	.name = "right_trigger",
-	.attrs = right_trigger_attrs,
-};
-
-static const struct attribute_group *const ally_cal_attr_groups[] = {
-	&ally_left_joystick_axis_group,
-	&ally_right_joystick_axis_group,
-	&ally_left_trigger_group,
-	&ally_right_trigger_group,
-};
-
-/**
- * ally_set_turbo_params() - Set turbo parameters for all buttons
- * @ally: ally handheld structure
- * @hdev: HID device
- * @cfg: ally config structure
- *
- * The payload mirrors the whole per-button turbo configuration, so the
- * caller must hold cfg->config_mutex: building it locklessly could send a
- * mix of parameters from concurrent sysfs writes to the hardware.
- *
- * Return: 0 on success, negative errno on failure
- */
-static int ally_set_turbo_params(struct ally_handheld *ally,
-				 struct hid_device *hdev,
-				 struct ally_config *cfg)
-{
-	struct ally_turbo_config *turbo = &cfg->turbo;
-	const u8 payload[] = {
-		turbo->btn_du.turbo,
-		turbo->btn_du.toggle,
-		turbo->btn_dd.turbo,
-		turbo->btn_dd.toggle,
-		turbo->btn_dl.turbo,
-		turbo->btn_dl.toggle,
-		turbo->btn_dr.turbo,
-		turbo->btn_dr.toggle,
-		turbo->btn_j0b.turbo,
-		turbo->btn_j0b.toggle,
-		turbo->btn_j1b.turbo,
-		turbo->btn_j1b.toggle,
-		turbo->btn_lb.turbo,
-		turbo->btn_lb.toggle,
-		turbo->btn_rb.turbo,
-		turbo->btn_rb.toggle,
-		turbo->btn_a.turbo,
-		turbo->btn_a.toggle,
-		turbo->btn_b.turbo,
-		turbo->btn_b.toggle,
-		turbo->btn_x.turbo,
-		turbo->btn_x.toggle,
-		turbo->btn_y.turbo,
-		turbo->btn_y.toggle,
-		turbo->btn_view.turbo,
-		turbo->btn_view.toggle,
-		turbo->btn_menu.turbo,
-		turbo->btn_menu.toggle,
-		turbo->btn_m2.turbo,
-		turbo->btn_m2.toggle,
-		turbo->btn_m1.turbo,
-		turbo->btn_m1.toggle,
-	};
-	int ret;
-
-	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_TURBO_PARAMS, payload, sizeof(payload));
-	if (!buf)
-		return -ENOMEM;
-
-	ret = ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-	if (ret < 0) {
-		hid_err(hdev, "Failed to set turbo parameters: %d\n", ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static struct ally_btn_turbo_params *ally_btn_get_turbo_params(struct ally_config *cfg,
-							       enum ally_button_id btn)
-{
-	switch (btn) {
-	case ALLY_BTN_DU: return &cfg->turbo.btn_du;
-	case ALLY_BTN_DD: return &cfg->turbo.btn_dd;
-	case ALLY_BTN_DL: return &cfg->turbo.btn_dl;
-	case ALLY_BTN_DR: return &cfg->turbo.btn_dr;
-	case ALLY_BTN_J0B: return &cfg->turbo.btn_j0b;
-	case ALLY_BTN_J1B: return &cfg->turbo.btn_j1b;
-	case ALLY_BTN_LB: return &cfg->turbo.btn_lb;
-	case ALLY_BTN_RB: return &cfg->turbo.btn_rb;
-	case ALLY_BTN_A: return &cfg->turbo.btn_a;
-	case ALLY_BTN_B: return &cfg->turbo.btn_b;
-	case ALLY_BTN_X: return &cfg->turbo.btn_x;
-	case ALLY_BTN_Y: return &cfg->turbo.btn_y;
-	case ALLY_BTN_VIEW: return &cfg->turbo.btn_view;
-	case ALLY_BTN_MENU: return &cfg->turbo.btn_menu;
-	case ALLY_BTN_M2: return &cfg->turbo.btn_m2;
-	case ALLY_BTN_M1: return &cfg->turbo.btn_m1;
-	default: return NULL;
-	}
-}
-
-static ssize_t btn_turbo_period_show(struct device *dev,
-				     struct device_attribute *attr, char *buf)
-{
-	struct ally_btn_sysfs_entry *entry = container_of(attr, struct ally_btn_sysfs_entry,
-							  attr_turbo_period);
-	struct ally_btn_turbo_params *params;
-
-	if (!entry->cfg->turbo_support)
-		return -EOPNOTSUPP;
-
-	params = ally_btn_get_turbo_params(entry->cfg, entry->btn);
-	if (!params)
-		return -ENODEV;
-
-	guard(mutex)(&entry->cfg->config_mutex);
-
-	return sysfs_emit(buf, "%hhu\n", params->turbo);
-}
-
-static ssize_t btn_turbo_period_store(struct device *dev, struct device_attribute *attr,
-				      const char *buf, size_t count)
-{
-	struct ally_btn_sysfs_entry *entry = container_of(attr, struct ally_btn_sysfs_entry,
-							  attr_turbo_period);
-	struct ally_btn_turbo_params *params;
-	u8 old_value, value;
-	int ret;
-
-	if (!entry->cfg->turbo_support)
-		return -EOPNOTSUPP;
-
-	params = ally_btn_get_turbo_params(entry->cfg, entry->btn);
-	if (!params)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret)
-		return ret;
-
-	if (value < ALLY_TURBO_PERIOD_MIN || value > ALLY_TURBO_PERIOD_MAX)
-		return -EINVAL;
-
-	guard(mutex)(&entry->cfg->config_mutex);
-
-	old_value = params->turbo;
-	params->turbo = value;
-	ret = ally_set_turbo_params(entry->ally, entry->hdev, entry->cfg);
-	if (ret) {
-		/*
-		 * The hardware rejected the update: restore the old
-		 * value or a later write to another button would
-		 * flush this stale one to the device.
-		 */
-		params->turbo = old_value;
-		return ret;
-	}
-
-	return count;
-}
-
-static ssize_t btn_toggle_period_show(struct device *dev,
-				      struct device_attribute *attr, char *buf)
-{
-	struct ally_btn_sysfs_entry *entry = container_of(attr, struct ally_btn_sysfs_entry,
-							  attr_toggle_period);
-	struct ally_btn_turbo_params *params;
-
-	if (!entry->cfg->turbo_support)
-		return -EOPNOTSUPP;
-
-	params = ally_btn_get_turbo_params(entry->cfg, entry->btn);
-	if (!params)
-		return -ENODEV;
-
-	guard(mutex)(&entry->cfg->config_mutex);
-
-	return sysfs_emit(buf, "%hhu\n", params->toggle);
-}
-
-static ssize_t btn_toggle_period_store(struct device *dev, struct device_attribute *attr,
-				       const char *buf, size_t count)
-{
-	struct ally_btn_sysfs_entry *entry = container_of(attr, struct ally_btn_sysfs_entry,
-							  attr_toggle_period);
-	struct ally_btn_turbo_params *params;
-	u8 old_value, value;
-	int ret;
-
-	if (!entry->cfg->turbo_support)
-		return -EOPNOTSUPP;
-
-	params = ally_btn_get_turbo_params(entry->cfg, entry->btn);
-	if (!params)
-		return -ENODEV;
-
-	ret = kstrtou8(buf, 10, &value);
-	if (ret)
-		return ret;
-
-	if (value < ALLY_TOGGLE_PERIOD_MIN || value > ALLY_TOGGLE_PERIOD_MAX)
-		return -EINVAL;
-
-	guard(mutex)(&entry->cfg->config_mutex);
-
-	old_value = params->toggle;
-	params->toggle = value;
-	ret = ally_set_turbo_params(entry->ally, entry->hdev, entry->cfg);
-	if (ret) {
-		/*
-		 * The hardware rejected the update: restore the old
-		 * value or a later write to another button would
-		 * flush this stale one to the device.
-		 */
-		params->toggle = old_value;
-		return ret;
-	}
-
-	return count;
-}
-
-static ssize_t btn_turbo_period_range_show(struct device *dev,
-					   struct device_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "0 20\n");
-}
-
-static ssize_t btn_toggle_period_range_show(struct device *dev,
-					    struct device_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "0 255\n");
-}
-
-static struct device_attribute dev_attr_btn_turbo_period_range =
-	__ATTR(turbo_period_range, 0444, btn_turbo_period_range_show, NULL);
-
-static struct device_attribute dev_attr_btn_toggle_period_range =
-	__ATTR(toggle_period_range, 0444, btn_toggle_period_range_show, NULL);
-
-static void ally_btn_turbo_init_attrs(struct ally_btn_sysfs_entry *entry)
-{
-	sysfs_attr_init(&entry->attr_turbo_period.attr);
-	entry->attr_turbo_period.attr.name = "turbo_period";
-	entry->attr_turbo_period.attr.mode = 0644;
-	entry->attr_turbo_period.show = btn_turbo_period_show;
-	entry->attr_turbo_period.store = btn_turbo_period_store;
-
-	sysfs_attr_init(&entry->attr_toggle_period.attr);
-	entry->attr_toggle_period.attr.name = "toggle_period";
-	entry->attr_toggle_period.attr.mode = 0644;
-	entry->attr_toggle_period.show = btn_toggle_period_show;
-	entry->attr_toggle_period.store = btn_toggle_period_store;
-	entry->attrs[0] = &entry->attr_turbo_period.attr;
-	entry->attrs[1] = &entry->attr_toggle_period.attr;
-	entry->attrs[2] = &dev_attr_btn_turbo_period_range.attr;
-	entry->attrs[3] = &dev_attr_btn_toggle_period_range.attr;
-	entry->attrs[4] = NULL;
-}
-
-/**
- * find_button_by_name() - Find a button code map by its name
- * @name: name of the button code to look up
- *
- * Return: the matching button code map, or NULL if not found
- */
-static const struct btn_code_map *find_button_by_name(const char *name)
-{
-	int i;
-
-	for (i = 0; i < keymap_len; i++) {
-		if (strcmp(ally_btn_codes[i].name, name) == 0)
-			return &ally_btn_codes[i];
-	}
-
-	return NULL;
-}
-
-/**
- * ally_remap_code_valid() - Check if a remap target is valid for a button
- * @btn: button to remap
- * @gamepad_mode: gamepad mode to validate the remap against
- * @code: remap target to check
- * @is_macro: whether the target is assigned to the macro mapping
- *
- * M1 and M2 can be remapped to anything at any time.
- * All other buttons may only be remapped to gamepad buttons (BTN_TYPE_PAD)
- * when in gamepad mode, and to keyboard/mouse/media codes when in desktop
- * (keyboard) mode.  BTN_TYPE_NONE (unmapped) is always allowed.
- * Macro mappings are executed by the MCU as input sequences on the virtual
- * keyboard and are accepted regardless of the current gamepad mode.
- *
- * Return: true if the remap is valid, false otherwise
- */
-static bool ally_remap_code_valid(enum ally_button_id btn, u8 gamepad_mode,
-				  const struct btn_code_map *code, bool is_macro)
-{
-	if (!code)
-		return false;
-
-	/* M1 and M2 can be remapped to everything */
-	if (btn == ALLY_BTN_M1 || btn == ALLY_BTN_M2)
-		return true;
-
-	/* NONE is always valid */
-	if (code->type == BTN_TYPE_NONE)
-		return true;
-
-	/* Macros are not restricted by the controller emulation mode */
-	if (is_macro)
-		return true;
-
-	if (gamepad_mode == ALLY_GAMEPAD_MODE_GAMEPAD)
-		return code->type == BTN_TYPE_PAD;
-
-	/* Desktop / keyboard mode: allow keyboard, mouse and media */
-	return code->type == BTN_TYPE_KB ||
-	       code->type == BTN_TYPE_MOUSE ||
-	       code->type == BTN_TYPE_MEDIA;
-}
-
-/**
- * ally_set_button_mapping() - Set the button mapping for a button pair
- * @hdev: HID device
- * @ally: ally handheld structure
- * @mapping: button pair mapping to send to the device
- *
- * Return: count of data transferred, negative if error
- */
-static int ally_set_button_mapping(struct hid_device *hdev, struct ally_handheld *ally,
-				   struct button_pair_map *mapping)
-{
-	/* The MCU mapping block is four consecutive 11-byte entries starting at
-	 * buf[5]: first remap 5-15, first macro 16-26, second remap 27-37,
-	 * second macro 38-48 (see hid-asus-ally __btn_pair_to_pkt, BTN_CODE_LEN).
-	 */
-	u8 macro_bytes[11] = {0};
-	u8 btn_bytes[11] = {0};
-
-	if (!mapping)
-		return -EINVAL;
-
-	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_MAPPING, NULL, 0);
-	if (!buf)
-		return -ENOMEM;
-
-	/* This packet is slightly different from the other
-	 * as before the packet length there is an extra byte
-	 * which is the pair index.
-	 */
-	buf[3] = mapping->pair_index;
-	buf[4] = 0x2C; /* Length */
-
-	/* First button mapping */
-	buf[5] = mapping->first.remap->type;
-	/* Fill in bytes 6-14 with button code */
-	if (mapping->first.remap->type) {
-		memset(btn_bytes, 0, sizeof(btn_bytes));
-		btn_bytes[0] = mapping->first.remap->type;
-
-		/* Value byte position depends on type: pad=1, kb=2, media=3,
-		 * mouse=4 (see hid-asus-ally BTN_CODE definitions).
-		 */
-		switch (mapping->first.remap->type) {
-		case BTN_TYPE_NONE:
-			break;
-		case BTN_TYPE_PAD:
-			btn_bytes[1] = mapping->first.remap->value;
-			break;
-		case BTN_TYPE_KB:
-			btn_bytes[2] = mapping->first.remap->value;
-			break;
-		case BTN_TYPE_MEDIA:
-			btn_bytes[3] = mapping->first.remap->value;
-			break;
-		case BTN_TYPE_MOUSE:
-			btn_bytes[4] = mapping->first.remap->value;
-			break;
-		}
-		memcpy(&buf[5], btn_bytes, 11);
-	}
-
-	/* Macro mapping for first button if any */
-	buf[16] = mapping->first.macro->type;
-	if (mapping->first.macro->type) {
-		memset(macro_bytes, 0, sizeof(macro_bytes));
-		macro_bytes[0] = mapping->first.macro->type;
-
-		switch (mapping->first.macro->type) {
-		case BTN_TYPE_NONE:
-			break;
-		case BTN_TYPE_PAD:
-			macro_bytes[1] = mapping->first.macro->value;
-			break;
-		case BTN_TYPE_KB:
-			macro_bytes[2] = mapping->first.macro->value;
-			break;
-		case BTN_TYPE_MEDIA:
-			macro_bytes[3] = mapping->first.macro->value;
-			break;
-		case BTN_TYPE_MOUSE:
-			macro_bytes[4] = mapping->first.macro->value;
-			break;
-		}
-		memcpy(&buf[16], macro_bytes, 11);
-	}
-
-	/* Second button mapping */
-	buf[27] = mapping->second.remap->type;
-	/* Fill in bytes 28-36 with button code */
-	if (mapping->second.remap->type) {
-		memset(btn_bytes, 0, sizeof(btn_bytes));
-		btn_bytes[0] = mapping->second.remap->type;
-
-		switch (mapping->second.remap->type) {
-		case BTN_TYPE_NONE:
-			break;
-		case BTN_TYPE_PAD:
-			btn_bytes[1] = mapping->second.remap->value;
-			break;
-		case BTN_TYPE_KB:
-			btn_bytes[2] = mapping->second.remap->value;
-			break;
-		case BTN_TYPE_MEDIA:
-			btn_bytes[3] = mapping->second.remap->value;
-			break;
-		case BTN_TYPE_MOUSE:
-			btn_bytes[4] = mapping->second.remap->value;
-			break;
-		}
-		memcpy(&buf[27], btn_bytes, 11);
-	}
-
-	/* Macro mapping for second button if any */
-	buf[38] = mapping->second.macro->type;
-	if (mapping->second.macro->type) {
-		memset(macro_bytes, 0, sizeof(macro_bytes));
-		macro_bytes[0] = mapping->second.macro->type;
-
-		switch (mapping->second.macro->type) {
-		case BTN_TYPE_NONE:
-			break;
-		case BTN_TYPE_PAD:
-			macro_bytes[1] = mapping->second.macro->value;
-			break;
-		case BTN_TYPE_KB:
-			macro_bytes[2] = mapping->second.macro->value;
-			break;
-		case BTN_TYPE_MEDIA:
-			macro_bytes[3] = mapping->second.macro->value;
-			break;
-		case BTN_TYPE_MOUSE:
-			macro_bytes[4] = mapping->second.macro->value;
-			break;
-		}
-		memcpy(&buf[38], macro_bytes, 11);
-	}
-
-	return ally_gamepad_send_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-}
-
-/* Button remap attribute structure */
-struct button_remap_attr {
-	struct device_attribute dev_attr;
-	enum ally_button_id button_id;
-	bool is_macro;
-};
-
-#define to_button_remap_attr(x) container_of(x, struct button_remap_attr, dev_attr)
-
-/**
- * get_button_pair_info() - Get the pair index and position of a button
- * @button_id: button to look up
- * @pair_idx: output pointer for the pair index of the button
- * @is_first: output pointer for the position of the button within the pair
- *
- * Return: 0 on success, negative errno on failure
- */
-static int get_button_pair_info(enum ally_button_id button_id,
-				enum btn_pair_index *pair_idx,
-				bool *is_first)
-{
-	switch (button_id) {
-	case ALLY_BTN_DU:
-		*pair_idx = BTN_PAIR_DPAD_UPDOWN;
-		*is_first = true;
-		break;
-	case ALLY_BTN_DD:
-		*pair_idx = BTN_PAIR_DPAD_UPDOWN;
-		*is_first = false;
-		break;
-	case ALLY_BTN_DL:
-		*pair_idx = BTN_PAIR_DPAD_LEFTRIGHT;
-		*is_first = true;
-		break;
-	case ALLY_BTN_DR:
-		*pair_idx = BTN_PAIR_DPAD_LEFTRIGHT;
-		*is_first = false;
-		break;
-	case ALLY_BTN_J0B:
-		*pair_idx = BTN_PAIR_STICK_LR;
-		*is_first = true;
-		break;
-	case ALLY_BTN_J1B:
-		*pair_idx = BTN_PAIR_STICK_LR;
-		*is_first = false;
-		break;
-	case ALLY_BTN_LB:
-		*pair_idx = BTN_PAIR_BUMPER_LR;
-		*is_first = true;
-		break;
-	case ALLY_BTN_RB:
-		*pair_idx = BTN_PAIR_BUMPER_LR;
-		*is_first = false;
-		break;
-	case ALLY_BTN_A:
-		*pair_idx = BTN_PAIR_AB;
-		*is_first = true;
-		break;
-	case ALLY_BTN_B:
-		*pair_idx = BTN_PAIR_AB;
-		*is_first = false;
-		break;
-	case ALLY_BTN_X:
-		*pair_idx = BTN_PAIR_XY;
-		*is_first = true;
-		break;
-	case ALLY_BTN_Y:
-		*pair_idx = BTN_PAIR_XY;
-		*is_first = false;
-		break;
-	case ALLY_BTN_VIEW:
-		*pair_idx = BTN_PAIR_VIEW_MENU;
-		*is_first = true;
-		break;
-	case ALLY_BTN_MENU:
-		*pair_idx = BTN_PAIR_VIEW_MENU;
-		*is_first = false;
-		break;
-	case ALLY_BTN_M1:
-		*pair_idx = BTN_PAIR_M1M2;
-		*is_first = false;
-		break;
-	case ALLY_BTN_M2:
-		*pair_idx = BTN_PAIR_M1M2;
-		*is_first = true;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static ssize_t button_remap_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	struct button_remap_attr *btn_attr = to_button_remap_attr(attr);
-	const struct btn_code_map *code;
-	struct ally_config *cfg;
-	enum ally_button_id button_id = btn_attr->button_id;
-	enum btn_pair_index pair_idx;
-	struct button_pair_map *pair;
-	struct button_map *btn_map;
-	bool is_first;
-	int ret;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	ret = get_button_pair_info(button_id, &pair_idx, &is_first);
-	if (ret < 0)
-		return ret;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	/*
-	 * button_mappings is unpublished by the remove path while holding
-	 * this same lock, so the check cannot race with the teardown.
-	 */
-	if (!cfg->button_mappings)
-		return -ENODEV;
-
-	pair = &cfg->button_mappings[cfg->gamepad_mode]
-			.button_pairs[pair_idx - 1];
-	btn_map = is_first ? &pair->first : &pair->second;
-	code = btn_attr->is_macro ? btn_map->macro : btn_map->remap;
-
-	if (code->type == BTN_TYPE_NONE)
-		return sysfs_emit(buf, "NONE\n");
-
-	return sysfs_emit(buf, "%s\n", code->name);
-}
-
-static ssize_t button_remap_store(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	struct button_remap_attr *btn_attr = to_button_remap_attr(attr);
-	enum ally_button_id button_id = btn_attr->button_id;
-	struct ally_button_mapping *mode_map;
-	const struct btn_code_map *code;
-	const struct btn_code_map *old_code;
-	enum btn_pair_index pair_idx;
-	struct button_pair_map *pair;
-	struct button_map *btn_map;
-	struct ally_config *cfg;
-	char btn_name[32];
-	bool is_first;
-	bool undo_hw;
-	int ret, i;
-
-	if (!ally)
-		return -ENODEV;
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return -ENODEV;
-
-	if (sscanf(buf, "%31s", btn_name) != 1)
-		return -EINVAL;
-
-	/* Handle "NONE" specially */
-	if (strcmp(btn_name, "NONE") == 0) {
-		code = &ally_btn_codes[0]; /* NONE entry */
-	} else {
-		code = find_button_by_name(btn_name);
-		if (!code)
-			return -EINVAL;
-	}
-
-	ret = get_button_pair_info(button_id, &pair_idx, &is_first);
-	if (ret < 0)
-		return ret;
-
-	guard(mutex)(&cfg->config_mutex);
-
-	/*
-	 * button_mappings is unpublished by the remove path while
-	 * holding this same lock, so the check cannot race with the
-	 * teardown.
-	 */
-	if (!cfg->button_mappings)
-		return -ENODEV;
-
-	/*
-	 * Validate the remap target while holding the lock: the
-	 * gamepad mode can change concurrently, and the check must
-	 * be done against the very mode the mapping is written to.
-	 */
-	if (!ally_remap_code_valid(button_id, cfg->gamepad_mode, code,
-				   btn_attr->is_macro))
-		return -EINVAL;
-
-	/* Access the mapping for current gamepad mode */
-	pair = &cfg->button_mappings[cfg->gamepad_mode]
-			.button_pairs[pair_idx - 1];
-	btn_map = is_first ? &pair->first : &pair->second;
-
-	if (btn_attr->is_macro) {
-		old_code = btn_map->macro;
-		btn_map->macro = code;
-	} else {
-		old_code = btn_map->remap;
-		btn_map->remap = code;
-	}
-
-	/* Update pair index */
-	pair->pair_index = pair_idx;
-
-	/*
-	 * Send mapping to device with the caveat that first
-	 * generation devices require individual button pair updates.
-	 */
-	if (cfg->is_ally_x) {
-		ret = ally_set_button_mapping(hdev, ally, pair);
-		undo_hw = false;
-	} else {
-		mode_map = &cfg->button_mappings[cfg->gamepad_mode];
-		ret = 0;
-		for (i = 0; i < 9; i++) {
-			mode_map->button_pairs[i].pair_index = i + 1;
-			ret = ally_set_button_mapping(hdev, ally,
-				&mode_map->button_pairs[i]);
-			if (ret < 0)
-				break;
-		}
-
-		/*
-		 * Pairs are pushed one at a time: remember whether
-		 * the target pair reached the hardware before a
-		 * later pair failed, so the rollback below can undo
-		 * it on the device too.
-		 */
-		undo_hw = ret < 0 && i > pair_idx - 1;
-	}
-
-	/*
-	 * The hardware rejected the update: restore the previous
-	 * mapping so that the software cache keeps describing the
-	 * state the device is actually in.
-	 */
-	if (ret < 0) {
-		if (btn_attr->is_macro)
-			btn_map->macro = old_code;
-		else
-			btn_map->remap = old_code;
-
-		/*
-		 * The target pair was already committed before a
-		 * later pair failed: push the restored mapping once
-		 * more so the hardware matches the cache again. Best
-		 * effort only: the device is misbehaving already.
-		 */
-		if (undo_hw)
-			ally_set_button_mapping(hdev, ally, pair);
-
-		hid_err(hdev, "Failed to set button mapping: %d\n", ret);
-		return ret;
-	}
-
-	return count;
-}
-
-/**
- * button_remap_attr_create() - Create a button remap attribute
- * @button_id: button the attribute is for
- * @is_macro: whether the attribute controls the macro mapping
- *
- * Return: the newly created attribute, or NULL on allocation failure
- */
-static struct button_remap_attr *button_remap_attr_create(enum ally_button_id button_id,
-							  bool is_macro)
-{
-	struct button_remap_attr *attr __free(kfree) = kzalloc_obj(*attr, GFP_KERNEL);
-	if (!attr)
-		return NULL;
-
-	attr->button_id = button_id;
-	attr->is_macro = is_macro;
-	sysfs_attr_init(&attr->dev_attr.attr);
-	attr->dev_attr.attr.name = is_macro ? "macro" : "remap";
-	attr->dev_attr.attr.mode = 0644;
-	attr->dev_attr.show = button_remap_show;
-	attr->dev_attr.store = button_remap_store;
-
-	return no_free_ptr(attr);
-}
-
-/**
- * btn_remap_index_show() - Show the list of valid remap targets for a button
- * @dev: device the attribute belongs to
- * @attr: attribute being read
- * @buf: buffer to write the list into
- *
- * M1/M2 list everything; other buttons list only the codes valid for the
- * active mode (gamepad buttons in gamepad mode, keyboard / mouse / media
- * in desktop mode).
- *
- * Return: number of characters written
- */
-static ssize_t btn_remap_index_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct ally_btn_sysfs_entry *entry = container_of(attr,
-		struct ally_btn_sysfs_entry, attr_remap_index);
-	enum ally_button_id btn = entry->btn;
-	u8 mode;
-	ssize_t len = 0;
-	int i;
-
-	scoped_guard(mutex, &entry->cfg->config_mutex)
-		mode = entry->cfg->gamepad_mode;
-
-	for (i = 0; i < keymap_len; i++) {
-		if (!ally_remap_code_valid(btn, mode, &ally_btn_codes[i], false))
-			continue;
-		len += sysfs_emit_at(buf, len, "%s ", ally_btn_codes[i].name);
-	}
-
-	if (len > 0)
-		buf[len - 1] = '\n';
-
-	return len;
-}
-
-/**
- * ally_create_button_attributes() - Create turbo button attributes
- * @hdev: HID device
- * @ally: ally handheld structure
- * @cfg: ally config structure
- *
- * Return: 0 on success, negative errno on failure
- */
-static int ally_create_button_attributes(struct hid_device *hdev,
-					 struct ally_handheld *ally,
-					 struct ally_config *cfg)
-{
-	struct ally_btn_sysfs_entry *entries;
-	struct ally_button_mapping *mappings;
-	int i, ret;
-
-	entries = devm_kcalloc(&hdev->dev, ALLY_BTN_MAX, sizeof(*entries), GFP_KERNEL);
-	if (!entries)
-		return -ENOMEM;
-
-	/* Allocate mappings for each gamepad mode (1-based indexing) */
-	mappings = devm_kcalloc(&hdev->dev, ALLY_GAMEPAD_MODE_KEYBOARD + 1,
-				sizeof(*mappings), GFP_KERNEL);
-	if (!mappings)
-		return -ENOMEM;
-
-	cfg->button_entries = entries;
-	cfg->button_mappings = mappings;
-	ally_set_default_gamepad_mapping(mappings);
-	ally_set_default_keyboard_mapping(mappings);
-
-	for (i = 0; i < ALLY_BTN_MAX; i++) {
-		entries[i].ally = ally;
-		entries[i].cfg = cfg;
-		entries[i].hdev = hdev;
-		entries[i].btn = i;
-
-		if (cfg->turbo_support) {
-			if (!ally_btn_get_turbo_params(cfg, i)) {
-				hid_err(hdev, "Invalid button id %d for turbo attributes\n", i);
-				ret = -EINVAL;
-				goto err_cleanup;
-			}
-
-			ally_btn_turbo_init_attrs(&entries[i]);
-		}
-
-		entries[i].remap_attr = button_remap_attr_create(i, false);
-		if (!entries[i].remap_attr) {
-			ret = -ENOMEM;
-			goto err_cleanup;
-		}
-
-		entries[i].macro_attr = button_remap_attr_create(i, true);
-		if (!entries[i].macro_attr) {
-			ret = -ENOMEM;
-			goto err_cleanup;
-		}
-
-		/* Initialize the remap_index attribute */
-		sysfs_attr_init(&entries[i].attr_remap_index.attr);
-		entries[i].attr_remap_index.attr.name = "remap_index";
-		entries[i].attr_remap_index.attr.mode = 0444;
-		entries[i].attr_remap_index.show = btn_remap_index_show;
-		entries[i].attr_remap_index.store = NULL;
-
-		/* Set up attributes array based on what's supported */
-		if (cfg->turbo_support) {
-			entries[i].attrs[4] =
-				&entries[i].remap_attr->dev_attr.attr;
-			entries[i].attrs[5] =
-				&entries[i].macro_attr->dev_attr.attr;
-			entries[i].attrs[6] =
-				&entries[i].attr_remap_index.attr;
-			entries[i].attrs[7] = NULL;
-		} else {
-			entries[i].attrs[0] =
-				&entries[i].remap_attr->dev_attr.attr;
-			entries[i].attrs[1] =
-				&entries[i].macro_attr->dev_attr.attr;
-			entries[i].attrs[2] =
-				&entries[i].attr_remap_index.attr;
-			entries[i].attrs[3] = NULL;
-		}
-
-		entries[i].group.name = ally_button_names[i];
-		entries[i].group.attrs = entries[i].attrs;
-
-		ret = sysfs_create_group(&hdev->dev.kobj, &entries[i].group);
-		if (ret < 0) {
-			hid_err(hdev, "Failed to create sysfs group for %s: %d\n",
-				ally_button_names[i], ret);
-			goto err_cleanup;
-		}
-	}
-
-	return 0;
-
-err_cleanup:
-	/* Only groups [0, i) were registered; the failure happened at i. */
-	while (--i >= 0)
-		sysfs_remove_group(&hdev->dev.kobj, &entries[i].group);
-
-	for (i = 0; i < ALLY_BTN_MAX; i++) {
-		kfree(entries[i].remap_attr);
-		kfree(entries[i].macro_attr);
-	}
-
-	/*
-	 * The arrays are devm-managed on the same device as the sysfs
-	 * attributes, so they are released together with them: only
-	 * unpublish the pointers here, or a concurrent sysfs callback
-	 * would dereference freed memory.
-	 */
-	cfg->button_entries = NULL;
-	cfg->button_mappings = NULL;
-
-	return ret;
-}
-
-/**
- * ally_remove_button_attributes() - Remove turbo button attributes
- * @hdev: HID device
- * @cfg: ally config structure
- */
-static void ally_remove_button_attributes(struct hid_device *hdev, struct ally_config *cfg)
-{
-	struct ally_btn_sysfs_entry *entries;
-	int i;
-
-	if (!cfg || !cfg->button_entries)
-		return;
-
-	entries = cfg->button_entries;
-
-	for (i = 0; i < ALLY_BTN_MAX; i++) {
-		sysfs_remove_group(&hdev->dev.kobj, &entries[i].group);
-		kfree(entries[i].remap_attr);
-		kfree(entries[i].macro_attr);
-	}
-
-	/*
-	 * The arrays are devm-managed on the same device as the sysfs
-	 * attributes, so they are released together with them.  Only
-	 * unpublish the pointers here, under the lock, so that a sysfs
-	 * callback which is still holding config_mutex observes the
-	 * teardown instead of racing against a manual free.
-	 */
-	scoped_guard(mutex, &cfg->config_mutex) {
-		cfg->button_entries = NULL;
-		cfg->button_mappings = NULL;
-	}
-}
-
-/**
- * ally_config_create() - Initialize configuration and create sysfs entries
- * @hdev: HID device
- * @ally: non-NULL ally device data with uninitialized config pointer
- *
- * Return: valid pointer on success, error pointer on failure
- */
-static struct ally_config *ally_config_create(struct hid_device *hdev, struct ally_handheld *ally)
-{
-	struct ally_config *cfg;
-	int ret, sysfs_i;
-
-	cfg = devm_kzalloc(&hdev->dev, sizeof(*cfg), GFP_KERNEL);
-	if (!cfg)
-		return ERR_PTR(-ENOMEM);
-
-	mutex_init(&cfg->config_mutex);
-
-	ret = ally_detect_capabilities(hdev, ally, cfg);
-	if (ret < 0) {
-		hid_err(hdev, "Failed to detect Ally capabilities: %d\n", ret);
-		goto ally_config_create_err;
-	}
-
-	/*
-	 * Skip the calibration, anti-deadzone and response curve groups when
-	 * none of the features they expose is supported.
-	 */
-	if (cfg->user_cal_support || cfg->anti_deadzone_support ||
-	    cfg->resp_curve_support) {
-		for (sysfs_i = 0; sysfs_i < ARRAY_SIZE(ally_cal_attr_groups); sysfs_i++) {
-			ret = devm_device_add_group(&hdev->dev,
-						    ally_cal_attr_groups[sysfs_i]);
-			if (ret < 0) {
-				hid_err(hdev, "Failed to create sysfs group '%s': %d\n",
-					ally_cal_attr_groups[sysfs_i]->name, ret);
-				goto ally_config_create_sysfs_err;
-			}
-		}
-	}
-
-	if (cfg->turbo_support) {
-		ret = ally_create_button_attributes(hdev, ally, cfg);
-		if (ret < 0) {
-			hid_err(hdev, "Failed to create button attributes: %d\n", ret);
-			goto ally_config_create_sysfs_err;
-		}
-	}
-
-	cfg->gamepad_mode = ALLY_GAMEPAD_MODE_GAMEPAD;
-	cfg->left_deadzone = 10;
-	cfg->left_outer_threshold = 90;
-	cfg->right_deadzone = 10;
-	cfg->right_outer_threshold = 90;
-	cfg->left_trigger_min = 0;
-	cfg->left_trigger_max = 100;
-	cfg->right_trigger_min = 0;
-	cfg->right_trigger_max = 100;
-	cfg->vibration_intensity_left = 100;
-	cfg->vibration_intensity_right = 100;
-
-	/* Initialize default response curve values (linear) */
-	cfg->left_curve.entry_1.move = 0;
-	cfg->left_curve.entry_1.resp = 0;
-	cfg->left_curve.entry_2.move = 33;
-	cfg->left_curve.entry_2.resp = 33;
-	cfg->left_curve.entry_3.move = 66;
-	cfg->left_curve.entry_3.resp = 66;
-	cfg->left_curve.entry_4.move = 100;
-	cfg->left_curve.entry_4.resp = 100;
-
-	cfg->right_curve.entry_1.move = 0;
-	cfg->right_curve.entry_1.resp = 0;
-	cfg->right_curve.entry_2.move = 33;
-	cfg->right_curve.entry_2.resp = 33;
-	cfg->right_curve.entry_3.move = 66;
-	cfg->right_curve.entry_3.resp = 66;
-	cfg->right_curve.entry_4.move = 100;
-	cfg->right_curve.entry_4.resp = 100;
-
-	for (sysfs_i = 0; sysfs_i < ARRAY_SIZE(ally_attr_groups); sysfs_i++) {
-		ret = devm_device_add_group(&hdev->dev, &ally_attr_groups[sysfs_i]);
-		if (ret < 0) {
-			hid_err(hdev, "Failed to create sysfs group '%s': %d\n",
-				ally_attr_groups[sysfs_i].name ?: "", ret);
-			goto ally_config_create_sysfs_err;
-		}
-	}
-
-	/* So far the only hardware this is supported is the Ally 1 */
-	if (cfg->xbox_controller_support) {
-		ret = ally_set_xbox_controller(hdev, ally, cfg, true);
-		if (ret < 0)
-			hid_warn(hdev, "Failed to set default Xbox controller mode: %d\n",
-				ret);
-	}
-
-	/*
-	 * Set the default gamepad mode now that the MCU is confirmed ready:
-	 * failure is non-critical, the mode can still be changed from sysfs.
-	 */
-	ret = ally_apply_gamepad_mode(hdev, ally, cfg);
-	if (ret < 0)
-		hid_warn(hdev, "Failed to set default gamepad mode: %d\n", ret);
-
-	cfg->initialized = true;
-
-	return cfg;
-ally_config_create_sysfs_err:
-	if (cfg->button_entries)
-		ally_remove_button_attributes(hdev, cfg);
-ally_config_create_err:
-	devm_kfree(&hdev->dev, cfg);
-	return ERR_PTR(ret);
-}
-
-/**
- * ally_config_remove() - Clean up configuration resources
- * @hdev: HID device
- * @cfg: ally config to clean up, may be NULL
- */
-static void ally_config_remove(struct hid_device *hdev, struct ally_config *cfg)
-{
-	int i;
-
-	if (!cfg || !cfg->initialized)
-		return;
-
-	if (cfg->button_entries)
-		ally_remove_button_attributes(hdev, cfg);
-
-	for (i = 0; i < ARRAY_SIZE(ally_attr_groups); i++)
-		sysfs_remove_group(&hdev->dev.kobj, &ally_attr_groups[i]);
-}
-
-/**
- * ally_gamepad_check_ready() - Wait for the gamepad MCU to report ready
- * @ally: ally handheld structure
- * @hdev: HID device
- *
- * This should be called before any remapping attempts, and on driver
- * init/resume, after the asus handshake has been performed on the
- * configuration endpoint.
- *
- * Return: 0 on success, negative errno on failure
- */
-static int ally_gamepad_check_ready(struct ally_handheld *ally, struct hid_device *hdev)
-{
-	u8 payload[] = { 0x00 };
-	int ret;
-
-	for (int i = 0; i < HID_ALLY_READY_MAX_TRIES; i++) {
-		u8 *buf __free(kfree) = ally_alloc_cmd(CMD_CHECK_READY, payload, sizeof(payload));
-		if (!buf)
-			return -ENOMEM;
-
-		ret = ally_gamepad_send_receive_packet(ally, hdev, buf, ROG_ALLY_REPORT_SIZE);
-		if (ret < 0) {
-			hid_dbg(hdev, "ROG Ally check %d/%d failed: %d\n", i,
-				HID_ALLY_READY_MAX_TRIES, ret);
-			continue;
-		}
-
-		if (buf[2] == CMD_CHECK_READY)
-			return 0;
-
-		usleep_range(1000, 2000);
-	}
-
-	hid_err(hdev, "ROG Ally never responded with a ready\n");
-	return -ENODEV;
-}
-
-static int ally_get_endpoint_address(struct hid_device *hdev)
-{
-	struct usb_host_endpoint *ep;
-	struct usb_interface *intf;
-
-	if (!hid_is_usb(hdev))
-		return -ENODEV;
-
-	intf = to_usb_interface(hdev->dev.parent);
-	if (!intf || !intf->cur_altsetting)
-		return -ENODEV;
-
-	if (intf->cur_altsetting->desc.bNumEndpoints == 0)
-		return -ENODEV;
-
-	ep = intf->cur_altsetting->endpoint;
-	if (!ep)
-		return -ENODEV;
-
-	return ep->desc.bEndpointAddress;
-}
-
-struct ally_x_input_report {
-	__le16 x, y;
-	__le16 rx, ry;
-	__le16 z, rz;
-	u8 buttons[3];
-} __packed;
-
-/* The hatswitch outputs integers, we use them to index this X|Y pair */
-static const int hat_values[][2] = {
-	{ 0, 0 }, { 0, -1 }, { 1, -1 }, { 1, 0 },   { 1, 1 },
-	{ 0, 1 }, { -1, 1 }, { -1, 0 }, { -1, -1 },
-};
-
-/**
- * ally_x_raw_event() - Parse and report an Ally X gamepad input report
- * @input: input device to report the events on
- * @hdev: HID device
- * @report: HID report the raw data arrived in
- * @data: raw report buffer
- * @size: length of @data in bytes
- *
- * Return: true if the event was handled, otherwise false
- */
-static bool ally_x_raw_event(struct input_dev *input, struct hid_device *hdev,
-			     struct hid_report *report, u8 *data, int size)
-{
-	struct ally_x_input_report *in_report;
-	u16 x, y, rx, ry, z, rz;
-	u8 byte;
-
-	if (!input)
-		return false;
-
-	if (size < 1)
-		return false;
-
-	/*
-	 * The size check above only guarantees one valid byte: do not
-	 * read the code of a truncated report.
-	 */
-	if (data[0] == 0x5A) {
-		if (size < 2)
-			return false;
-
-		input_report_key(input, KEY_PROG1, data[1] == 0x38);
-		input_report_key(input, KEY_F16, data[1] == 0xA6);
-		input_report_key(input, KEY_F17, data[1] == 0xA7);
-		input_report_key(input, KEY_F18, data[1] == 0xA8);
-		input_sync(input);
-
-		return data[1] == 0xA6 || data[1] == 0xA7 || data[1] == 0xA8 || data[1] == 0x38;
-	}
-
-	if (data[0] != HID_ALLY_X_INPUT_REPORT)
-		return false;
-
-	/*
-	 * hid-core only guarantees size >= 1 and does not zero-pad short
-	 * reports before ->raw_event, so a truncated transfer would leave the
-	 * payload below pointing at stale DMA buffer contents.
-	 */
-	if (size < 1 + sizeof(*in_report))
-		return false;
-
-	in_report = (struct ally_x_input_report *)&data[1];
-
-	/* USB HID payloads are little-endian: convert them explicitly. */
-	x = get_unaligned_le16(&in_report->x);
-	y = get_unaligned_le16(&in_report->y);
-	rx = get_unaligned_le16(&in_report->rx);
-	ry = get_unaligned_le16(&in_report->ry);
-	z = get_unaligned_le16(&in_report->z);
-	rz = get_unaligned_le16(&in_report->rz);
-
-	input_report_abs(input, ABS_X, x - 32768);
-	input_report_abs(input, ABS_Y, y - 32768);
-	input_report_abs(input, ABS_RX, rx - 32768);
-	input_report_abs(input, ABS_RY, ry - 32768);
-	input_report_abs(input, ABS_Z, z);
-	input_report_abs(input, ABS_RZ, rz);
-
-	byte = in_report->buttons[0];
-	input_report_key(input, BTN_A, byte & BIT(0));
-	input_report_key(input, BTN_B, byte & BIT(1));
-	input_report_key(input, BTN_X, byte & BIT(2));
-	input_report_key(input, BTN_Y, byte & BIT(3));
-	input_report_key(input, BTN_TL, byte & BIT(4));
-	input_report_key(input, BTN_TR, byte & BIT(5));
-	input_report_key(input, BTN_SELECT, byte & BIT(6));
-	input_report_key(input, BTN_START, byte & BIT(7));
-
-	byte = in_report->buttons[1];
-	input_report_key(input, BTN_THUMBL, byte & BIT(0));
-	input_report_key(input, BTN_THUMBR, byte & BIT(1));
-	input_report_key(input, BTN_MODE, byte & BIT(2));
-
-	/* The hatswitch byte is device-controlled; treat anything the table
-	 * does not cover as centred rather than indexing out of bounds.
-	 */
-	byte = in_report->buttons[2];
-	if (byte >= ARRAY_SIZE(hat_values))
-		byte = 0;
-	input_report_abs(input, ABS_HAT0X, hat_values[byte][0]);
-	input_report_abs(input, ABS_HAT0Y, hat_values[byte][1]);
-
-	input_sync(input);
-
-	return true;
-}
-
-static int ally_x_input_open(struct input_dev *dev)
-{
-	struct hid_device *hdev = input_get_drvdata(dev);
-
-	return hid_hw_open(hdev);
-}
-
-static void ally_x_input_close(struct input_dev *dev)
-{
-	hid_hw_close(input_get_drvdata(dev));
-}
-
-/**
- * ally_x_send_ff_report() - Send a force-feedback report to the gamepad
- * @ally: ally handheld structure
- * @hdev: HID device
- * @buf: buffer containing the report to send
- * @len: length of the report
- *
- * The gamepad interface consumes force-feedback packets as output reports.
- * Because Interface 5 lacks an interrupt OUT endpoint, hid_hw_output_report()
- * returns -ENOSYS; fallback to a SET_REPORT control transfer on endpoint 0 per
- * the USB HID specification.
- *
- * Return: count of data transferred, negative if error
- */
-static int ally_x_send_ff_report(struct ally_handheld *ally,
-				 struct hid_device *hdev,
-				 const u8 *buf, size_t len)
-{
-	guard(mutex)(&ally->intf_mutex);
-
-	return ally_dev_output_report(hdev, buf, len);
-}
-
-static int ally_x_send_ff_off(struct ally_handheld *ally, struct hid_device *hdev)
-{
-	return ally_x_send_ff_report(ally, hdev, ALLY_FORCE_FEEDBACK_OFF,
-				     sizeof(ALLY_FORCE_FEEDBACK_OFF));
-}
-
-static void ally_x_ff_work_fn(struct work_struct *work)
-{
-	struct ally_handheld *ally =
-		container_of(work, struct ally_handheld, ff_work);
-	struct hid_device *hdev = NULL;
-	struct ff_report report;
-	unsigned long flags;
-	bool update = false;
-	int ret;
-
-	scoped_guard(spinlock_irqsave, &ally->ff_lock) {
-		if (ally->update_ff) {
-			report = ally->ff_packet;
-			ally->update_ff = false;
-			update = true;
-		}
-	}
-
-	if (!update)
-		return;
-
-	/*
-	 * The hdev pointer is published and cleared under ally_data_lock:
-	 * take a reference on it so the gamepad interface cannot be freed
-	 * under us while the report is being sent.
-	 */
-	spin_lock_irqsave(&ally_data_lock, flags);
-	hdev = ally->ally_x_hdev;
-	if (hdev)
-		get_device(&hdev->dev);
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	if (!hdev)
-		return;
-
-	ret = ally_x_send_ff_report(ally, hdev, (u8 *)&report, sizeof(report));
-	if (ret < 0)
-		hid_err(hdev, "Failed to send force-feedback: %d\n", ret);
-
-	put_device(&hdev->dev);
-}
-
-static int ally_x_play_effect(struct input_dev *idev, void *data,
-			      struct ff_effect *effect)
-{
-	struct ally_handheld *ally = &ally_drvdata;
-
-	if (effect->type != FF_RUMBLE)
-		return 0;
-
-	scoped_guard(spinlock_irqsave, &ally->ff_lock) {
-		ally->ff_packet.ff.magnitude_strong =
-			effect->u.rumble.strong_magnitude * ALLY_FF_MAX_INTENSITY / 65535;
-		ally->ff_packet.ff.magnitude_weak =
-			effect->u.rumble.weak_magnitude * ALLY_FF_MAX_INTENSITY / 65535;
-		ally->update_ff = true;
-
-		if (ally->ff_work_initialized)
-			schedule_work(&ally->ff_work);
-	}
-
-	return 0;
-}
-
-static struct input_dev *ally_x_alloc_input_dev(struct hid_device *hdev)
-{
-	struct input_dev *input_dev = input_allocate_device();
-
-	if (!input_dev)
-		return ERR_PTR(-ENOMEM);
-
-	input_dev->dev.parent = &hdev->dev;
-	input_dev->id.bustype = hdev->bus;
-	input_dev->id.vendor = hdev->vendor;
-	input_dev->id.product = hdev->product;
-	input_dev->id.version = hdev->version;
-	input_dev->uniq = hdev->uniq;
-	input_dev->name = "ASUS ROG Ally X Gamepad";
-
-	input_set_drvdata(input_dev, hdev);
-	/*
-	 * Let the input core hold the hardware open while the device node
-	 * is in use: without these the interface could be runtime-suspended
-	 * and drop events.
-	 */
-	input_dev->open = ally_x_input_open;
-	input_dev->close = ally_x_input_close;
-
-	return input_dev;
-}
-
-static int ally_x_setup_input(struct hid_device *hdev, struct ally_handheld *ally)
-{
-	struct input_dev *input = ally_x_alloc_input_dev(hdev);
-	unsigned long flags;
-	int ret;
-
-	if (IS_ERR(input))
-		return PTR_ERR(input);
-
-	input_set_abs_params(input, ABS_X, -32768, 32767, 0, 0);
-	input_set_abs_params(input, ABS_Y, -32768, 32767, 0, 0);
-	input_set_abs_params(input, ABS_RX, -32768, 32767, 0, 0);
-	input_set_abs_params(input, ABS_RY, -32768, 32767, 0, 0);
-	input_set_abs_params(input, ABS_Z, 0, 1023, 0, 0);
-	input_set_abs_params(input, ABS_RZ, 0, 1023, 0, 0);
-	input_set_abs_params(input, ABS_HAT0X, -1, 1, 0, 0);
-	input_set_abs_params(input, ABS_HAT0Y, -1, 1, 0, 0);
-	input_set_capability(input, EV_KEY, BTN_A);
-	input_set_capability(input, EV_KEY, BTN_B);
-	input_set_capability(input, EV_KEY, BTN_X);
-	input_set_capability(input, EV_KEY, BTN_Y);
-	input_set_capability(input, EV_KEY, BTN_TL);
-	input_set_capability(input, EV_KEY, BTN_TR);
-	input_set_capability(input, EV_KEY, BTN_SELECT);
-	input_set_capability(input, EV_KEY, BTN_START);
-	input_set_capability(input, EV_KEY, BTN_MODE);
-	input_set_capability(input, EV_KEY, BTN_THUMBL);
-	input_set_capability(input, EV_KEY, BTN_THUMBR);
-
-	input_set_capability(input, EV_KEY, KEY_PROG1);
-	input_set_capability(input, EV_KEY, KEY_F16);
-	input_set_capability(input, EV_KEY, KEY_F17);
-	input_set_capability(input, EV_KEY, KEY_F18);
-	input_set_capability(input, EV_KEY, BTN_TRIGGER_HAPPY);
-	input_set_capability(input, EV_KEY, BTN_TRIGGER_HAPPY1);
-
-	memcpy(&ally->ff_packet, ALLY_FORCE_FEEDBACK_OFF, sizeof(ally->ff_packet));
-	ally->ff_work_initialized = true;
-
-	input_set_capability(input, EV_FF, FF_RUMBLE);
-
-	/*
-	 * A registered device advertising FF_RUMBLE without the memless core
-	 * behind it would crash input_ff_upload(): fail the whole setup instead.
-	 */
-	ret = input_ff_create_memless(input, NULL, ally_x_play_effect);
-	if (ret) {
-		hid_err(hdev, "Failed to create force-feedback: %d\n", ret);
-		goto ally_x_setup_input_err;
-	}
-
-	/*
-	 * Publish the interface before the input device becomes visible to
-	 * userspace: an effect uploaded right after registration would
-	 * otherwise find a NULL hdev and get dropped.
-	 */
-	spin_lock_irqsave(&ally_data_lock, flags);
-	ally->ally_x_hdev = hdev;
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	ret = input_register_device(input);
-	if (ret) {
-		hid_err(hdev, "Failed to register Ally X gamepad device: %d\n", ret);
-		goto ally_x_setup_input_err;
-	}
-
-	/* Publish the input_dev only when it is fully set up. */
-	spin_lock_irqsave(&ally_data_lock, flags);
-	ally->ally_x_input = input;
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	return 0;
-ally_x_setup_input_err:
-	spin_lock_irqsave(&ally_data_lock, flags);
-	if (ally->ally_x_hdev == hdev)
-		ally->ally_x_hdev = NULL;
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	input_free_device(input);
-	return ret;
-}
-
-static int hid_asus_ally_init(struct hid_device *hdev, struct ally_handheld *ally)
-{
-	struct hid_device *x_hdev;
-	struct ally_config *cfg;
-	unsigned long flags;
-	int ret;
-
-	/*
-	 * The force-feedback "off" packet belongs to the gamepad interface,
-	 * which consumes it as an output report: the config interface probed
-	 * here would reject it. The gamepad probe path sends the packet itself,
-	 * so this only matters when the gamepad interface is already bound,
-	 * e.g. after a reset resume that re-initialized the MCU.
-	 */
-	spin_lock_irqsave(&ally_data_lock, flags);
-	x_hdev = ally->ally_x_hdev;
-	if (x_hdev)
-		get_device(&x_hdev->dev);
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	if (x_hdev) {
-		/* Failure at this point is non-critical */
-		ret = ally_x_send_ff_off(ally, x_hdev);
-
-		if (ret < 0)
-			hid_err(hdev, "Ally failed to init force-feedback off: %d\n",
-				ret);
-
-		put_device(&x_hdev->dev);
-	}
-
-	cfg = ally_get_config(ally);
-	if (!cfg)
-		return 0;
-
-	/* The MCU may have just been reset: restore the cached state. */
-	guard(mutex)(&cfg->config_mutex);
-
-	if (cfg->xbox_controller_enabled) {
-		ret = ally_set_xbox_controller(hdev, ally, cfg, true);
-		if (ret < 0)
-			hid_warn(hdev, "Failed to restore Xbox controller mode: %d\n",
-				 ret);
-	}
-
-	return 0;
-}
-
-/**
- * hid_asus_ally_raw_event() - Route raw reports from the Ally interfaces
- * @hdev: HID device
- * @ally: ally handheld structure
- * @report: HID report the raw data arrived in
- * @data: raw report buffer
- * @size: length of @data in bytes
- *
- * Called from the raw_event callback, which may run in atomic (URB
- * completion) context: only spinlock-protected accesses to the shared
- * state are allowed here.
- *
- * Return: true if the event was handled, otherwise false
- */
-static bool hid_asus_ally_raw_event(struct hid_device *hdev, struct ally_handheld *ally,
-			    struct hid_report *report, u8 *data, int size)
-{
-	struct input_dev *x_input;
-	struct hid_device *x_hdev;
-	unsigned long flags;
-	bool handled;
-
-	if (!ally)
-		return false;
-
-	switch (ally_get_endpoint_address(hdev)) {
-	case HID_ALLY_X_INTF_IN:
-		/*
-		 * Take a reference on the input_dev while using it: the
-		 * gamepad interface can be unbound concurrently, and its
-		 * input_dev is freed with it.
-		 */
-		spin_lock_irqsave(&ally_data_lock, flags);
-		x_input = input_get_device(ally->ally_x_input);
-		x_hdev = ally->ally_x_hdev;
-		spin_unlock_irqrestore(&ally_data_lock, flags);
-
-		handled = ally_x_raw_event(x_input, x_hdev, report, data, size);
-		input_put_device(x_input);
-		if (handled)
-			return true;
-		break;
-	case HID_ALLY_INTF_CFG_IN:
-		if (handle_ally_event(hdev, ally, data, size))
-			return true;
-		break;
-	case HID_ALLY_INTF_KEYBOARD_IN:
-		if (handle_ctrl_alt_del(hdev, ally, data, size))
-			return false;
-		break;
-	default:
-		break;
-	}
-
-	return false;
-}
-
-/**
- * hid_asus_ally_probe() - Initialize the ROG Ally HID extension
- * @hdev: HID device
- *
- * This module works alongside the main Asus HID driver to handle
- * Ally-specific features and quirks.
- *
- * Return: an ally_handheld struct pointer on success, an ERR_PTR on
- * failure. The caller is not expected to use the returned pointer, but it
- * should check for errors by using IS_ERR and PTR_ERR and pass NULL to
- * other functions if there was an error.
- */
-static struct ally_handheld *hid_asus_ally_probe(struct hid_device *hdev)
-{
-	unsigned long flags;
-	int ret, ep = ally_get_endpoint_address(hdev);
-	struct usb_device *udev;
-	struct ally_config *ally_cfg;
-	struct hid_input *hidinput;
-
-	if (ep < 0)
-		return ERR_PTR(ep);
-
-	if (!hid_is_usb(hdev))
-		return ERR_PTR(-ENODEV);
-
-	/*
-	 * The ROG Ally controller is integrated into a handheld PC, so at
-	 * most one device can exist and the shared global state relies on
-	 * that: reject a probe from a different USB device, or a spoofed
-	 * peripheral could overwrite the state of the real controller. The
-	 * recorded device is dropped when the last interface of the
-	 * controller is unbound, so the re-enumeration the embedded
-	 * controller performs after a suspend cycle (it cuts the controller
-	 * power when powersave is enabled) is still accepted.
-	 */
-	udev = interface_to_usbdev(to_usb_interface(hdev->dev.parent));
-
-	spin_lock_irqsave(&ally_data_lock, flags);
-	if (ally_drvdata.udev && ally_drvdata.udev != udev) {
-		spin_unlock_irqrestore(&ally_data_lock, flags);
-		hid_err(hdev, "A ROG Ally controller is already connected\n");
-		return ERR_PTR(-ENODEV);
-	}
-	if (!ally_drvdata.udev) {
-		usb_get_dev(udev);
-		ally_drvdata.udev = udev;
-	}
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	/*
-	 * The interface initialization sleeps (it performs USB transfers),
-	 * so it must run before taking the spinlock guarding the shared
-	 * state; pointers are published only once it succeeded.
-	 */
-	switch (ep) {
-	case HID_ALLY_INTF_CFG_IN:
-		/*
-		 * This function assumes the asus-specific initialization
-		 * to have been performed already at this point.
-		 */
-		ret = ally_gamepad_check_ready(&ally_drvdata, hdev);
-		if (ret < 0) {
-			hid_err(hdev, "ROG Ally device is not ready: %d\n", ret);
-			ally_put_udev_if_orphaned();
-			return ERR_PTR(ret);
-		}
-
-		ally_cfg = ally_config_create(hdev, &ally_drvdata);
-		if (IS_ERR(ally_cfg)) {
-			hid_err(hdev, "Failed to create Ally cfg: %ld\n",
-				PTR_ERR(ally_cfg));
-			ally_put_udev_if_orphaned();
-			return ERR_PTR(PTR_ERR(ally_cfg));
-		}
-
-		ret = hid_asus_ally_init(hdev, &ally_drvdata);
-		if (ret < 0) {
-			ally_put_udev_if_orphaned();
-			return ERR_PTR(ret);
-		}
-
-		spin_lock_irqsave(&ally_data_lock, flags);
-		ally_drvdata.config = ally_cfg;
-		ally_drvdata.cfg_hdev = hdev;
-		spin_unlock_irqrestore(&ally_data_lock, flags);
-		break;
-	case HID_ALLY_X_INTF_IN:
-		/* This will create and populate ally_x_input */
-		ret = ally_x_setup_input(hdev, &ally_drvdata);
-		if (ret) {
-			hid_err(hdev, "Failed to create Ally X gamepad device.\n");
-			ally_put_udev_if_orphaned();
-			return ERR_PTR(ret);
-		}
-
-		/*
-		 * Make sure rumble starts disabled: this is the interface that
-		 * owns the force-feedback output report. Failure is non-critical.
-		 */
-		ret = ally_x_send_ff_off(&ally_drvdata, hdev);
-		if (ret < 0)
-			hid_warn(hdev, "Failed to disable force-feedback: %d\n", ret);
-
-		break;
-	case HID_ALLY_INTF_KEYBOARD_IN:
-		spin_lock_irqsave(&ally_data_lock, flags);
-		ally_drvdata.keyboard_hdev = hdev;
-		if (!list_empty(&hdev->inputs)) {
-			hidinput = list_first_entry(&hdev->inputs, struct hid_input, list);
-			ally_drvdata.keyboard_input = hidinput->input;
-			/*
-			 * Vendor button events are reported on this device. Its
-			 * descriptor declares the keyboard page's F13-F24, which
-			 * covers the Ally's F16-F19 codes, but not KEY_PROG1.
-			 */
-			if (ally_is_xbox_ally())
-				input_set_capability(hidinput->input, EV_KEY, KEY_PROG1);
-		}
-		spin_unlock_irqrestore(&ally_data_lock, flags);
-		break;
-	default:
-		/* This is normally supposed to happen */
-		break;
-	}
-
-	return &ally_drvdata;
-}
-
-static void hid_asus_ally_remove(struct hid_device *hdev, struct ally_handheld *ally)
-{
-	struct input_dev *x_input = NULL;
-	struct ally_config *cfg = NULL;
-	unsigned long flags;
-	bool owns_xpad;
-	bool owns_cfg;
-
-	if (!ally)
-		return;
-
-	/*
-	 * Any of the three interfaces can own an input_dev the resume work
-	 * reports through, and they are torn down in an arbitrary order, so
-	 * drain it before clearing anything. Cancel outside ally_data_lock so
-	 * a handler that wants the lock cannot deadlock against us.
-	 */
-	cancel_delayed_work_sync(&ally->resume_work);
-
-	spin_lock_irqsave(&ally_data_lock, flags);
-	owns_xpad = ally->ally_x_hdev == hdev;
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	if (owns_xpad) {
-		/*
-		 * Stop queueing force-feedback work before the gamepad
-		 * pointers are cleared: play_effect() tests the flag under the
-		 * same lock, so no work can be queued past the cancel below.
-		 */
-		scoped_guard(spinlock_irqsave, &ally->ff_lock)
-			ally->ff_work_initialized = false;
-
-		/*
-		 * cancel_work_sync() may sleep: keep it out of ally_data_lock,
-		 * but run it before the pointers are cleared so in-flight work
-		 * cannot outlive the interface it sends through.
-		 */
-		cancel_work_sync(&ally->ff_work);
-
-		/*
-		 * The input core can no longer stop effects through the
-		 * disabled work: quiesce any rumble still playing ourselves,
-		 * or the device would keep vibrating after being unbound.
-		 */
-		if (ally_x_send_ff_off(ally, hdev) < 0)
-			hid_warn(hdev, "Failed to stop force-feedback\n");
-	}
-
-	spin_lock_irqsave(&ally_data_lock, flags);
-	if (owns_xpad) {
-		ally->ally_x_input = NULL;
-		ally->ally_x_hdev = NULL;
-	}
-
-	/*
-	 * The keyboard interface is torn down before the config one, and
-	 * its input_dev is freed with it. handle_ally_event() and
-	 * ally_resume_work_fn() both report keys through it from the
-	 * config endpoint, so drop the references here or they dangle.
-	 */
-	if (ally->keyboard_hdev == hdev) {
-		x_input = ally->ally_x_input;
-		ally->ally_x_input = NULL;
-		ally->keyboard_input = NULL;
-		ally->keyboard_hdev = NULL;
-	}
-
-	owns_cfg = ally->cfg_hdev == hdev;
-	if (owns_cfg) {
-		cfg = ally->config;
-		ally->cfg_hdev = NULL;
-		ally->config = NULL;
-	}
-
-	spin_unlock_irqrestore(&ally_data_lock, flags);
-
-	/*
-	 * The config teardown removes sysfs groups and takes sleeping locks:
-	 * it must not run under ally_data_lock. The config pointer has been
-	 * unpublished above, so no new sysfs callback can find it while the
-	 * groups are being removed.
-	 */
-	if (owns_cfg)
-		ally_config_remove(hdev, cfg);
-
-	if (x_input)
-		input_unregister_device(x_input);
-
-	/*
-	 * Drop the recorded USB device when the last interface of the
-	 * controller has been unbound: the driver is then ready to accept
-	 * the controller again when it reconnects.
-	 */
-	ally_put_udev_if_orphaned();
-}
-
-static int hid_asus_ally_reset_resume(struct hid_device *hdev, struct ally_handheld *ally)
-{
-	int ep, ret;
-
-	/*
-	 * The extensions failed to probe and the device is operating as a
-	 * generic HID device: do not fail the resume because of that.
-	 */
-	if (!ally)
-		return 0;
-
-	ep = ally_get_endpoint_address(hdev);
-	if (ep != HID_ALLY_INTF_CFG_IN)
-		return 0;
-
-	/*
-	 * This function assumes the asus-specific initialization
-	 * to have been performed already at this point.
-	 */
-	ret = ally_gamepad_check_ready(ally, hdev);
-	if (ret < 0) {
-		hid_err(hdev, "ROG Ally device is not ready: %d\n", ret);
-		return ret;
-	}
-
-	ret = hid_asus_ally_init(hdev, ally);
-	if (ret < 0)
-		return ret;
-
-	return 0;
-}
 
 /*
  * Send events to asus-wmi driver for handling special keys
@@ -5293,7 +642,7 @@ static int asus_kbd_fn_lock_set(struct asus_drvdata *drvdata, bool enabled)
 	struct asus_work_action *action;
 	unsigned long flags;
 
-	action = kzalloc(sizeof(struct asus_work_action), GFP_ATOMIC);
+	action = kzalloc_obj(struct asus_work_action, GFP_ATOMIC);
 	if (!action)
 		return -ENOMEM;
 
@@ -5320,7 +669,7 @@ static int asus_kbd_wmi_fan_send(struct asus_drvdata *drvdata, u8 *report_data,
 		return -EINVAL;
 	}
 
-	action = kzalloc(sizeof(struct asus_work_action), GFP_NOWAIT);
+	action = kzalloc_obj(struct asus_work_action, GFP_NOWAIT);
 	if (!action)
 		return -ENOMEM;
 
@@ -5391,17 +740,6 @@ static int asus_raw_event(struct hid_device *hdev,
 
 	if (drvdata->quirks & QUIRK_MEDION_E1239T)
 		return asus_e1239t_event(drvdata, data, size);
-
-	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD) {
-		/*
-		 * Return -1 to suppress further processing by the generic HID
-		 * input parser for reports we fully handle for the Gamepad (0x0B):
-		 * letting 0x0B reach the default parser creates a generic gamepad
-		 * causing Steam Input overlaps (i.e. L1 stuck on screenshot).
-		 */
-		if (hid_asus_ally_raw_event(hdev, drvdata->rog_ally, report, data, size))
-			return -1;
-	}
 
 	/*
 	 * Skip these report ID, the device emits a continuous stream associated
@@ -5475,15 +813,37 @@ static int asus_raw_event(struct hid_device *hdev,
 static int asus_kbd_set_report(struct hid_device *hdev, const u8 *buf, size_t buf_size)
 {
 	u8 *dmabuf __free(kfree) = kmemdup(buf, buf_size, GFP_KERNEL);
+	int ret;
+
 	if (!dmabuf)
 		return -ENOMEM;
+
+	/*
+	 * For Aura/Slash LED reports (0x5d/0x5e), match asus_aura_set_feature:
+	 * interrupt OUT, then raw OUTPUT, then raw FEATURE.
+	 */
+	if (buf[0] == FEATURE_KBD_LED_REPORT_ID1 ||
+	    buf[0] == FEATURE_KBD_LED_REPORT_ID2) {
+		ret = hid_hw_output_report(hdev, dmabuf, buf_size);
+		if (ret >= 0)
+			return 0;
+
+		ret = hid_hw_raw_request(hdev, buf[0], dmabuf, buf_size,
+					 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
+		if (ret >= 0)
+			return 0;
+	}
 
 	/*
 	 * The report ID should be set from the incoming buffer due to LED and key
 	 * interfaces having different pages
 	 */
-	return hid_hw_raw_request(hdev, buf[0], dmabuf, buf_size, HID_FEATURE_REPORT,
-				  HID_REQ_SET_REPORT);
+	ret = hid_hw_raw_request(hdev, buf[0], dmabuf, buf_size, HID_FEATURE_REPORT,
+				 HID_REQ_SET_REPORT);
+	if (ret < 0)
+		return ret;
+
+	return 0;
 }
 
 static int asus_kbd_init(struct hid_device *hdev, u8 report_id)
@@ -5635,1431 +995,6 @@ static void asus_kbd_wmi_fan(struct hid_device *hdev, struct hid_raw_event_data 
 	up(&hdev->driver_input_lock);
 }
 
-static const char *asus_usb_rgb_zone_name(enum asus_aura_zone zone)
-{
-	switch (zone) {
-	case ASUS_AURA_ZONE_KEY1:
-		return "key1";
-	case ASUS_AURA_ZONE_KEY2:
-		return "key2";
-	case ASUS_AURA_ZONE_KEY3:
-		return "key3";
-	case ASUS_AURA_ZONE_KEY4:
-		return "key4";
-	case ASUS_AURA_ZONE_LOGO:
-		return "logo";
-	case ASUS_AURA_ZONE_BAR_LEFT:
-		return "bar_left";
-	case ASUS_AURA_ZONE_BAR_RIGHT:
-		return "bar_right";
-	case ASUS_AURA_ZONE_JOYSTICK_RING:
-		return "joystick_rings";
-	default:
-		return "none";
-	}
-}
-
-/*
- * Zone identity names the LED device and keys its state, the wire byte selects
- * the hardware zone. Devices with a single zone address it with 0x00.
- */
-static u8 asus_usb_rgb_zone_wire(enum asus_aura_zone zone)
-{
-	switch (zone) {
-	case ASUS_AURA_ZONE_JOYSTICK_RING:
-		return 0x00;
-	default:
-		return (u8)zone;
-	}
-}
-
-/*
- * Effect enum values match the Aura wire protocol directly (matching
- * asusctl's AuraModeNum), so no translation is needed.
- */
-static u8 asus_usb_rgb_effect_wire(enum asus_usb_rgb_effect effect)
-{
-	return (u8)effect;
-}
-
-static u8 asus_usb_rgb_speed_to_hw(u8 speed)
-{
-	if (speed <= 33)
-		return ASUS_USB_RGB_SPEED_SLOW;
-	if (speed <= 66)
-		return ASUS_USB_RGB_SPEED_MED;
-	return ASUS_USB_RGB_SPEED_FAST;
-}
-
-static void asus_usb_rgb_zone_state_default(struct asus_usb_rgb_zone_state *state,
-					      enum asus_aura_zone zone)
-{
-	state->effect = ASUS_USB_RGB_EFFECT_STATIC;
-	state->speed = 50;
-	state->brightness = 100;
-	state->direction = ASUS_USB_RGB_DIRECTION_FORWARD;
-	state->enabled = true;
-
-	switch (zone) {
-	case ASUS_AURA_ZONE_KEY1:
-		state->red = 0xff;
-		state->green = 0x00;
-		state->blue = 0x00;
-		state->bg_red = 0x00;
-		state->bg_green = 0x00;
-		state->bg_blue = 0xff;
-		break;
-	case ASUS_AURA_ZONE_KEY2:
-		state->red = 0x9b;
-		state->green = 0x26;
-		state->blue = 0xb6;
-		state->bg_red = 0x00;
-		state->bg_green = 0xff;
-		state->bg_blue = 0x00;
-		break;
-	case ASUS_AURA_ZONE_KEY3:
-		state->red = 0x00;
-		state->green = 0x00;
-		state->blue = 0xff;
-		state->bg_red = 0xff;
-		state->bg_green = 0x00;
-		state->bg_blue = 0x00;
-		break;
-	case ASUS_AURA_ZONE_JOYSTICK_RING:
-		/*
-		 * Leave the rings dark until userspace asks for a color: the
-		 * state is pushed to the device once the zone is registered, so
-		 * a lit default lights them on every cold boot until the
-		 * desktop restores its own settings.
-		 */
-		state->red = 0x00;
-		state->green = 0x00;
-		state->blue = 0x00;
-		break;
-	default:
-		state->red = 0x00;
-		state->green = 0x7c;
-		state->blue = 0x80;
-		state->bg_red = state->red;
-		state->bg_green = state->green;
-		state->bg_blue = state->blue;
-		break;
-	}
-
-	state->initialized = true;
-}
-
-/*
- * The Ally X powers its USB device off during suspend when mcu_powersave is
- * enabled, destroying and re-probing the HID device. Keep the zone state out
- * of the per-device allocation so it survives that cycle.
- */
-static struct asus_usb_rgb_zone_state asus_usb_rgb_state_store[ASUS_AURA_ZONE_MAX];
-
-static struct asus_usb_rgb_zone_state *asus_usb_rgb_get_zone_state(struct asus_usb_rgb_dev *rgb,
-							   enum asus_aura_zone zone)
-{
-	struct asus_usb_rgb_zone_state *state;
-
-	if (!rgb || zone <= ASUS_AURA_ZONE_NONE || zone >= ASUS_AURA_ZONE_MAX)
-		return NULL;
-
-	state = &asus_usb_rgb_state_store[zone];
-	if (!state->initialized)
-		asus_usb_rgb_zone_state_default(state, zone);
-
-	return state;
-}
-
-static bool asus_usb_rgb_can_initialize(const struct asus_drvdata *drvdata,
-				    bool is_vendor)
-{
-	return is_vendor && drvdata &&
-		(drvdata->quirks & QUIRK_USE_KBD_BACKLIGHT) &&
-		drvdata->listener.brightness_set;
-}
-
-static const struct asus_usb_rgb_hw_desc *asus_usb_rgb_match_hw(struct hid_device *hdev)
-{
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(asus_usb_rgb_hw_matches); i++) {
-		if (asus_usb_rgb_hw_matches[i].product_id == hdev->product)
-			return asus_usb_rgb_hw_matches[i].desc;
-	}
-
-	/*
-	 * Keep quirk-driven assignment only as a fallback so product tables remain
-	 * the primary source of zone assignments for current and future platforms.
-	 */
-	if (drvdata && (drvdata->quirks & QUIRK_USE_KBD_BACKLIGHT))
-		return &asus_usb_rgb_hw_ally;
-
-	return NULL;
-}
-
-/*
- * Send a feature report SET_REPORT, then GET_REPORT to read the response.
- * Both use report ID 0x5d on the Aura endpoint. The buffers are padded to
- * the full feature report length so controllers that silently drop short
- * transfers still respond.
- */
-static int asus_aura_feature_xfer(struct hid_device *hdev, const u8 *req,
-				  size_t req_len, u8 *resp, size_t resp_len)
-{
-	u8 *set_buf __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
-	u8 *get_buf __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
-	int ret;
-
-	if (!set_buf || !get_buf)
-		return -ENOMEM;
-
-	memcpy(set_buf, req, min(req_len, (size_t)ROG_ALLY_REPORT_SIZE));
-
-	ret = hid_hw_raw_request(hdev, ASUS_AURA_CAP_REPORT_ID, set_buf,
-				 ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
-				 HID_REQ_SET_REPORT);
-	if (ret < 0)
-		return ret;
-
-	get_buf[0] = ASUS_AURA_CAP_REPORT_ID;
-	ret = hid_hw_raw_request(hdev, ASUS_AURA_CAP_REPORT_ID, get_buf,
-				 ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
-				 HID_REQ_GET_REPORT);
-	if (ret < 0)
-		return ret;
-
-	memcpy(resp, get_buf, min(resp_len, (size_t)ROG_ALLY_REPORT_SIZE));
-	return 0;
-}
-
-static int asus_aura_prime_status(struct hid_device *hdev)
-{
-	static const u8 signature[] = {
-		0x5d, 'A', 'S', 'U', 'S', ' ', 'T', 'e', 'c', 'h', '.',
-		'I', 'n', 'c', '.',
-	};
-	u8 *set_buf __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
-	u8 *get_buf __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
-	int ret;
-
-	if (!set_buf || !get_buf)
-		return -ENOMEM;
-
-	memcpy(set_buf, signature, min((size_t)ASUS_AURA_SIG_LEN,
-				       (size_t)ROG_ALLY_REPORT_SIZE));
-	ret = hid_hw_raw_request(hdev, ASUS_AURA_CAP_REPORT_ID, set_buf,
-				 ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
-				 HID_REQ_SET_REPORT);
-	if (ret < 0)
-		return ret;
-
-	get_buf[0] = ASUS_AURA_CAP_REPORT_ID;
-	hid_hw_raw_request(hdev, ASUS_AURA_CAP_REPORT_ID, get_buf,
-			   ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
-			   HID_REQ_GET_REPORT);
-	return 0;
-}
-
-static void asus_aura_decode_effect_mask(struct asus_aura_caps *caps)
-{
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(asus_aura_fw_mode_map); i++) {
-		const u8 low = asus_aura_fw_mode_map[i].mask_low_bit;
-		const u8 high = asus_aura_fw_mode_map[i].mask_high_bit;
-
-		if ((low && caps->mode_mask_low & low) ||
-		    (high && caps->mode_mask_high & high))
-			set_bit(asus_aura_fw_mode_map[i].effect, caps->effects);
-	}
-}
-
-static int asus_aura_query_caps(struct hid_device *hdev, struct asus_aura_caps *caps)
-{
-	static const u8 selectors[] = { ASUS_AURA_CAP_SEL_1, ASUS_AURA_CAP_SEL_2 };
-	u8 resp[ROG_ALLY_REPORT_SIZE];
-	unsigned int i;
-	int ret;
-
-	for (i = 0; i < ARRAY_SIZE(selectors); i++) {
-		u8 req[] = { ASUS_AURA_CAP_REPORT_ID, ASUS_AURA_CAP_CMD,
-			     ASUS_AURA_CAP_SUBCMD, selectors[i] };
-
-		ret = asus_aura_feature_xfer(hdev, req, sizeof(req), resp, sizeof(resp));
-		if (ret < 0)
-			continue;
-
-		if (resp[0] != ASUS_AURA_CAP_REPORT_ID ||
-		    resp[1] != ASUS_AURA_CAP_CMD ||
-		    resp[2] != ASUS_AURA_CAP_SUBCMD ||
-		    resp[3] != selectors[i] ||
-		    resp[4] != 1)
-			continue;
-
-		caps->mode_mask_low = resp[20];
-		caps->mode_mask_high = resp[21];
-		asus_aura_decode_effect_mask(caps);
-		/* MCU runmode capability byte 19 (0x13) non-0xFF indicates Reactive support */
-		if (resp[19] != 0xff)
-			set_bit(ASUS_USB_RGB_EFFECT_REACTIVE, caps->effects);
-
-		if (!test_bit(ASUS_USB_RGB_EFFECT_STATIC, caps->effects)) {
-			bitmap_zero(caps->effects, ASUS_USB_RGB_EFFECT_MAX);
-			continue;
-		}
-
-		caps->valid = true;
-		return 0;
-	}
-
-	return -ENODATA;
-}
-
-static int asus_aura_query_status(struct hid_device *hdev, struct asus_aura_caps *caps)
-{
-	u8 req[] = { ASUS_AURA_CAP_REPORT_ID, ASUS_AURA_STATUS_CMD,
-		     0x20, 0x31, 0x00, 0x20 };
-	u8 resp[ROG_ALLY_REPORT_SIZE];
-	int ret;
-
-	ret = asus_aura_prime_status(hdev);
-	if (ret < 0)
-		return ret;
-
-	ret = asus_aura_feature_xfer(hdev, req, sizeof(req), resp, sizeof(resp));
-	if (ret < 0)
-		return ret;
-
-	if (resp[0] != ASUS_AURA_CAP_REPORT_ID ||
-	    resp[1] != ASUS_AURA_STATUS_CMD ||
-	    resp[2] != 0x20 || resp[3] != 0x31 || resp[4] != 0x00)
-		return -ENODATA;
-
-	caps->keyboard_type = resp[9];
-	caps->region_bits = resp[13];
-	caps->feature_bits = resp[14];
-
-	return 0;
-}
-
-static bool asus_usb_rgb_effect_supported(struct asus_usb_rgb_dev *rgb,
-					  enum asus_usb_rgb_effect effect)
-{
-	if (!rgb->caps.valid)
-		return effect < ASUS_USB_RGB_EFFECT_MAX &&
-		       asus_usb_rgb_effect_strings[effect];
-
-	return test_bit(effect, rgb->caps.effects);
-}
-
-static struct asus_usb_rgb_zone *asus_usb_rgb_zone_from_dev(struct device *dev)
-{
-	struct led_classdev *led_cdev = dev_get_drvdata(dev);
-	struct led_classdev_mc *mc_cdev;
-
-	if (!led_cdev)
-		return NULL;
-
-	mc_cdev = lcdev_to_mccdev(led_cdev);
-	return container_of(mc_cdev, struct asus_usb_rgb_zone, mc_cdev);
-}
-
-static int asus_usb_rgb_send_zone_effect(struct asus_usb_rgb_zone *zone)
-{
-	struct asus_usb_rgb_dev *rgb = zone->parent;
-	struct asus_usb_rgb_zone_state *state;
-	struct asus_usb_rgb_report report;
-	u8 out[ROG_ALLY_REPORT_SIZE] = {};
-	u8 set_buf[ROG_ALLY_REPORT_SIZE] = {};
-	int ret;
-
-	if (!rgb || rgb->removed || !rgb->hdev)
-		return -ENODEV;
-
-	state = asus_usb_rgb_get_zone_state(rgb, zone->zone_id);
-	if (!state)
-		return -EINVAL;
-
-	set_buf[0] = rgb->desc->effect_report_id;
-	set_buf[1] = rgb->desc->set_cmd;
-
-	memset(&report, 0, sizeof(report));
-	report.report_id = rgb->desc->effect_report_id;
-	report.cmd = rgb->desc->config_cmd;
-	report.zone = asus_usb_rgb_zone_wire(zone->zone_id);
-	report.effect = asus_usb_rgb_effect_wire(state->effect);
-	report.red = state->enabled ? zone->mc_cdev.subled_info[0].brightness : 0;
-	report.green = state->enabled ? zone->mc_cdev.subled_info[1].brightness : 0;
-	report.blue = state->enabled ? zone->mc_cdev.subled_info[2].brightness : 0;
-	if (zone->mc_cdev.num_colors == 6) {
-		report.bg_red = state->enabled ? zone->mc_cdev.subled_info[3].brightness : 0;
-		report.bg_green = state->enabled ? zone->mc_cdev.subled_info[4].brightness : 0;
-		report.bg_blue = state->enabled ? zone->mc_cdev.subled_info[5].brightness : 0;
-	} else {
-		report.bg_red = state->enabled ? state->bg_red : 0;
-		report.bg_green = state->enabled ? state->bg_green : 0;
-		report.bg_blue = state->enabled ? state->bg_blue : 0;
-	}
-	if (state->effect == ASUS_USB_RGB_EFFECT_STROBE ||
-	    state->effect == ASUS_USB_RGB_EFFECT_STATIC)
-		report.speed = 0;
-	else
-		report.speed = asus_usb_rgb_speed_to_hw(state->speed);
-	report.direction = state->direction;
-	if (state->effect == ASUS_USB_RGB_EFFECT_BREATHING)
-		report.pad1 = 1;
-
-	memcpy(out, &report, sizeof(report));
-
-	scoped_guard(mutex, &rgb->io_mutex) {
-		ret = ally_dev_set_report(rgb->hdev, out, sizeof(out));
-		if (ret >= 0)
-			ret = ally_dev_set_report(rgb->hdev, set_buf, sizeof(set_buf));
-	}
-
-	return ret;
-}
-
-static int asus_usb_rgb_commit(struct asus_usb_rgb_dev *rgb)
-{
-	u8 apply_buf[ROG_ALLY_REPORT_SIZE] = {};
-	int ret = 0;
-
-	if (!rgb || rgb->removed || !rgb->hdev)
-		return -ENODEV;
-
-	apply_buf[0] = rgb->desc->effect_report_id;
-	apply_buf[1] = rgb->desc->apply_cmd;
-
-	/*
-	 * Serialise against the config/set pair in
-	 * asus_usb_rgb_send_zone_effect(); an apply landing between those two
-	 * commands would latch half-updated state.
-	 */
-	scoped_guard(mutex, &rgb->io_mutex)
-		ret = ally_dev_set_report(rgb->hdev, apply_buf, sizeof(apply_buf));
-
-	return ret;
-}
-
-static void asus_usb_rgb_zone_queue_update(struct asus_usb_rgb_zone *zone, bool effect_changed)
-{
-	scoped_guard(spinlock_irqsave, &zone->lock) {
-		if (zone->removed)
-			return;
-		zone->update_color = true;
-		if (effect_changed)
-			zone->update_effect = true;
-	}
-
-	schedule_delayed_work(&zone->work, msecs_to_jiffies(30));
-}
-
-/*
- * The MCU exposes a global brightness level (0-3) separate from the per-zone
- * color report. Animated effects ignore the RGB bytes and respond only to
- * this control. The value is potentially NV backed, so only send it when the
- * level changes.
- */
-static int asus_usb_rgb_apply_brightness(struct asus_usb_rgb_zone *zone)
-{
-	struct asus_usb_rgb_dev *rgb = zone->parent;
-	struct asus_usb_rgb_zone_state *state;
-	u8 feat_buf[ROG_ALLY_REPORT_SIZE] = {};
-	u8 out_buf[ROG_ALLY_REPORT_SIZE] = {};
-	int ret = 0;
-	u8 level;
-
-	if (!rgb || rgb->removed || !rgb->hdev)
-		return -ENODEV;
-
-	state = asus_usb_rgb_get_zone_state(rgb, zone->zone_id);
-	if (!state)
-		return -EINVAL;
-
-	if (state->effect == ASUS_USB_RGB_EFFECT_STATIC)
-		/* Static dimming is done in software, hold the hw level at max */
-		level = ASUS_USB_RGB_HW_LEVEL_MAX;
-	else if (!state->enabled || !state->brightness)
-		level = 0;
-	else if (state->brightness <= 33)
-		level = 1;
-	else if (state->brightness <= 66)
-		level = 2;
-	else
-		level = ASUS_USB_RGB_HW_LEVEL_MAX;
-
-	if (level == rgb->last_hw_level)
-		return 0;
-
-	out_buf[0] = FEATURE_KBD_LED_REPORT_ID1; /* 0x5d */
-	out_buf[1] = ASUS_USB_RGB_BRIGHTNESS_CMD1;
-	out_buf[2] = ASUS_USB_RGB_BRIGHTNESS_CMD2;
-	out_buf[3] = ASUS_USB_RGB_BRIGHTNESS_CMD3;
-	out_buf[4] = level;
-
-	feat_buf[0] = FEATURE_KBD_REPORT_ID; /* 0x5a */
-	feat_buf[1] = ASUS_USB_RGB_BRIGHTNESS_CMD1;
-	feat_buf[2] = ASUS_USB_RGB_BRIGHTNESS_CMD2;
-	feat_buf[3] = ASUS_USB_RGB_BRIGHTNESS_CMD3;
-	feat_buf[4] = level;
-
-	scoped_guard(mutex, &rgb->io_mutex) {
-		/*
-		 * Send the primary brightness feature reports (0x5a and 0x5d).
-		 * These use the USB control endpoint and succeed reliably without
-		 * requiring the interface to be held open by userspace.
-		 */
-		ret = ally_dev_set_report(rgb->hdev, feat_buf, sizeof(feat_buf));
-		if (ret >= 0)
-			ally_dev_set_report(rgb->hdev, out_buf, sizeof(out_buf));
-
-		/*
-		 * Also attempt interrupt OUT delivery on ep4 matching Armoury Crate.
-		 * Any error is non-fatal since the feature
-		 * reports already applied the hardware level.
-		 */
-		ally_dev_output_report(rgb->hdev, out_buf, sizeof(out_buf));
-	}
-
-	if (ret >= 0)
-		rgb->last_hw_level = level;
-
-	return ret;
-}
-
-static void asus_usb_rgb_zone_work_fn(struct work_struct *work)
-{
-	struct asus_usb_rgb_zone *zone = container_of(work, struct asus_usb_rgb_zone, work.work);
-	bool update;
-	int ret;
-
-	scoped_guard(spinlock_irqsave, &zone->lock) {
-		if (zone->removed)
-			return;
-		update = zone->update_color || zone->update_effect;
-		zone->update_color = false;
-		zone->update_effect = false;
-	}
-
-	if (!update)
-		return;
-
-	ret = asus_usb_rgb_send_zone_effect(zone);
-	if (ret < 0)
-		dev_err(&zone->parent->hdev->dev,
-			"Failed to set RGB effect for %s: %d\n",
-			asus_usb_rgb_zone_name(zone->zone_id), ret);
-
-	ret = asus_usb_rgb_apply_brightness(zone);
-	if (ret < 0)
-		dev_err(&zone->parent->hdev->dev,
-			"Failed to set RGB brightness for %s: %d\n",
-			asus_usb_rgb_zone_name(zone->zone_id), ret);
-}
-
-static void asus_usb_rgb_set(struct led_classdev *cdev, enum led_brightness brightness)
-{
-	struct led_classdev_mc *mc_cdev = lcdev_to_mccdev(cdev);
-	struct asus_usb_rgb_zone *zone = container_of(mc_cdev, struct asus_usb_rgb_zone, mc_cdev);
-	struct asus_usb_rgb_zone_state *state;
-	bool changed, removed;
-
-	/*
-	 * led_classdev_unregister() switches the LED off while tearing a device
-	 * down. That can complete after the replacement device is live, so
-	 * ignore it rather than clobbering the state already in use.
-	 */
-	scoped_guard(spinlock_irqsave, &zone->lock)
-		removed = zone->removed;
-
-	if (removed)
-		return;
-
-	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
-	if (!state)
-		return;
-
-	led_mc_calc_color_components(mc_cdev, brightness);
-
-	changed = state->red != mc_cdev->subled_info[0].intensity ||
-		state->green != mc_cdev->subled_info[1].intensity ||
-		state->blue != mc_cdev->subled_info[2].intensity;
-
-	state->red = mc_cdev->subled_info[0].intensity;
-	state->green = mc_cdev->subled_info[1].intensity;
-	state->blue = mc_cdev->subled_info[2].intensity;
-
-	if (mc_cdev->num_colors == 6) {
-		changed = changed ||
-			state->bg_red != mc_cdev->subled_info[3].intensity ||
-			state->bg_green != mc_cdev->subled_info[4].intensity ||
-			state->bg_blue != mc_cdev->subled_info[5].intensity;
-
-		state->bg_red = mc_cdev->subled_info[3].intensity;
-		state->bg_green = mc_cdev->subled_info[4].intensity;
-		state->bg_blue = mc_cdev->subled_info[5].intensity;
-	}
-	state->brightness = brightness;
-	state->initialized = true;
-
-	asus_usb_rgb_zone_queue_update(zone, changed);
-}
-
-static ssize_t asus_usb_rgb_zone_effect_show(struct device *dev,
-				      struct device_attribute *attr, char *buf)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-	struct asus_usb_rgb_zone_state *state;
-
-	if (!zone)
-		return -ENODEV;
-
-	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
-	if (!state || state->effect >= ASUS_USB_RGB_EFFECT_MAX ||
-	    !asus_usb_rgb_effect_strings[state->effect])
-		return -EINVAL;
-
-	return sysfs_emit(buf, "%s\n", asus_usb_rgb_effect_strings[state->effect]);
-}
-
-static ssize_t asus_usb_rgb_zone_effect_store(struct device *dev,
-				       struct device_attribute *attr,
-				       const char *buf, size_t count)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-	struct asus_usb_rgb_zone_state *state;
-	int mode = -EINVAL;
-	int i;
-
-	if (!zone)
-		return -ENODEV;
-
-	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
-	if (!state)
-		return -EINVAL;
-
-	for (i = 0; i < ASUS_USB_RGB_EFFECT_MAX; i++) {
-		if (!asus_usb_rgb_effect_strings[i])
-			continue;
-		if (sysfs_streq(buf, asus_usb_rgb_effect_strings[i])) {
-			mode = i;
-			break;
-		}
-	}
-
-	if (mode < 0) {
-		if (sysfs_streq(buf, "static") || sysfs_streq(buf, "monocolor"))
-			mode = ASUS_USB_RGB_EFFECT_STATIC;
-		else if (sysfs_streq(buf, "breathing"))
-			mode = ASUS_USB_RGB_EFFECT_BREATHING;
-		else if (sysfs_streq(buf, "color_cycle"))
-			mode = ASUS_USB_RGB_EFFECT_COLOR_CYCLE;
-	}
-
-	if (mode < 0)
-		return mode;
-
-	if (!asus_usb_rgb_effect_supported(zone->parent, mode))
-		return -EINVAL;
-
-	state->effect = mode;
-	asus_usb_rgb_zone_queue_update(zone, true);
-
-	return count;
-}
-
-static ssize_t asus_usb_rgb_zone_effect_index_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-	int i;
-	int len = 0;
-
-	if (!zone)
-		return -ENODEV;
-
-	for (i = 0; i < ASUS_USB_RGB_EFFECT_MAX; i++) {
-		if (!asus_usb_rgb_effect_strings[i])
-			continue;
-		if (!asus_usb_rgb_effect_supported(zone->parent, i))
-			continue;
-		len += sysfs_emit_at(buf, len, "%s%s",
-				    len ? " " : "", asus_usb_rgb_effect_strings[i]);
-	}
-
-	len += sysfs_emit_at(buf, len, "\n");
-	return len;
-}
-
-static ssize_t asus_usb_rgb_zone_speed_show(struct device *dev,
-				     struct device_attribute *attr, char *buf)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-	struct asus_usb_rgb_zone_state *state;
-
-	if (!zone)
-		return -ENODEV;
-
-	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
-	if (!state)
-		return -EINVAL;
-
-	return sysfs_emit(buf, "%u\n", state->speed);
-}
-
-static ssize_t asus_usb_rgb_zone_speed_store(struct device *dev,
-				      struct device_attribute *attr,
-				      const char *buf, size_t count)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-	struct asus_usb_rgb_zone_state *state;
-	u8 speed;
-	int ret;
-
-	if (!zone)
-		return -ENODEV;
-
-	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
-	if (!state)
-		return -EINVAL;
-
-	ret = kstrtou8(buf, 10, &speed);
-	if (ret)
-		return ret;
-
-	if (speed > 100)
-		return -EINVAL;
-
-	state->speed = speed;
-	asus_usb_rgb_zone_queue_update(zone, true);
-
-	return count;
-}
-
-static ssize_t asus_usb_rgb_zone_speed_range_show(struct device *dev,
-					   struct device_attribute *attr,
-					   char *buf)
-{
-	return sysfs_emit(buf, "0-100\n");
-}
-
-static ssize_t asus_usb_rgb_zone_enabled_show(struct device *dev,
-				       struct device_attribute *attr, char *buf)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-	struct asus_usb_rgb_zone_state *state;
-
-	if (!zone)
-		return -ENODEV;
-
-	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
-	if (!state)
-		return -EINVAL;
-
-	return sysfs_emit(buf, "%u\n", state->enabled);
-}
-
-static ssize_t asus_usb_rgb_zone_enabled_store(struct device *dev,
-					struct device_attribute *attr,
-					const char *buf, size_t count)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-	struct asus_usb_rgb_zone_state *state;
-	bool enabled;
-	int ret;
-
-	if (!zone)
-		return -ENODEV;
-
-	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
-	if (!state)
-		return -EINVAL;
-
-	ret = kstrtobool(buf, &enabled);
-	if (ret)
-		return ret;
-
-	state->enabled = enabled;
-	asus_usb_rgb_zone_queue_update(zone, true);
-
-	return count;
-}
-
-static ssize_t asus_usb_rgb_zone_enabled_index_show(struct device *dev,
-					     struct device_attribute *attr,
-					     char *buf)
-{
-	return sysfs_emit(buf, "0 1\n");
-}
-
-static const char *const asus_usb_rgb_direction_strings[] = {
-	[ASUS_USB_RGB_DIRECTION_FORWARD] = "forward",
-	[ASUS_USB_RGB_DIRECTION_REVERSE] = "reverse",
-};
-
-static ssize_t asus_usb_rgb_zone_direction_show(struct device *dev,
-					 struct device_attribute *attr, char *buf)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-	struct asus_usb_rgb_zone_state *state;
-
-	if (!zone)
-		return -ENODEV;
-
-	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
-	if (!state || state->direction >= ARRAY_SIZE(asus_usb_rgb_direction_strings))
-		return -EINVAL;
-
-	return sysfs_emit(buf, "%s\n", asus_usb_rgb_direction_strings[state->direction]);
-}
-
-static ssize_t asus_usb_rgb_zone_direction_store(struct device *dev,
-					  struct device_attribute *attr,
-					  const char *buf, size_t count)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-	struct asus_usb_rgb_zone_state *state;
-	int direction;
-
-	if (!zone)
-		return -ENODEV;
-
-	state = asus_usb_rgb_get_zone_state(zone->parent, zone->zone_id);
-	if (!state)
-		return -EINVAL;
-
-	direction = sysfs_match_string(asus_usb_rgb_direction_strings, buf);
-	if (direction < 0)
-		return direction;
-
-	state->direction = direction;
-	asus_usb_rgb_zone_queue_update(zone, true);
-
-	return count;
-}
-
-static ssize_t asus_usb_rgb_zone_direction_index_show(struct device *dev,
-					       struct device_attribute *attr, char *buf)
-{
-	int i;
-	int len = 0;
-
-	for (i = 0; i < ARRAY_SIZE(asus_usb_rgb_direction_strings); i++)
-		len += sysfs_emit_at(buf, len, "%s%s", len ? " " : "",
-				    asus_usb_rgb_direction_strings[i]);
-
-	len += sysfs_emit_at(buf, len, "\n");
-	return len;
-}
-
-static ssize_t asus_usb_rgb_zone_name_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-
-	if (!zone)
-		return -ENODEV;
-
-	return sysfs_emit(buf, "%s\n", asus_usb_rgb_zone_name(zone->zone_id));
-}
-
-static ssize_t asus_usb_rgb_zone_apply_store(struct device *dev,
-					struct device_attribute *attr,
-					const char *buf, size_t count)
-{
-	struct asus_usb_rgb_zone *zone = asus_usb_rgb_zone_from_dev(dev);
-	bool val;
-	int ret;
-
-	if (!zone)
-		return -ENODEV;
-
-	ret = kstrtobool(buf, &val);
-	if (ret)
-		return ret;
-	if (!val)
-		return count;
-
-	ret = asus_usb_rgb_commit(zone->parent);
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-
-static ssize_t asus_usb_rgb_zone_color_set_count_show(struct device *dev,
-					       struct device_attribute *attr,
-					       char *buf)
-{
-	return sysfs_emit(buf, "2\n");
-}
-
-static ssize_t asus_usb_rgb_zone_color_set_index_show(struct device *dev,
-					       struct device_attribute *attr,
-					       char *buf)
-{
-	return sysfs_emit(buf, "primary:0-2 secondary:3-5\n");
-}
-
-static struct device_attribute dev_attr_asus_usb_rgb_zone_effect =
-	__ATTR(effect, 0644, asus_usb_rgb_zone_effect_show, asus_usb_rgb_zone_effect_store);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_effect_index =
-	__ATTR(effect_index, 0444, asus_usb_rgb_zone_effect_index_show, NULL);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_speed =
-	__ATTR(speed, 0644, asus_usb_rgb_zone_speed_show, asus_usb_rgb_zone_speed_store);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_speed_range =
-	__ATTR(speed_range, 0444, asus_usb_rgb_zone_speed_range_show, NULL);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_enabled =
-	__ATTR(enabled, 0644, asus_usb_rgb_zone_enabled_show, asus_usb_rgb_zone_enabled_store);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_enabled_index =
-	__ATTR(enabled_index, 0444, asus_usb_rgb_zone_enabled_index_show, NULL);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_direction =
-	__ATTR(direction, 0644, asus_usb_rgb_zone_direction_show,
-	       asus_usb_rgb_zone_direction_store);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_direction_index =
-	__ATTR(direction_index, 0444, asus_usb_rgb_zone_direction_index_show, NULL);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_name =
-	__ATTR(zone, 0444, asus_usb_rgb_zone_name_show, NULL);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_apply =
-	__ATTR(apply, 0200, NULL, asus_usb_rgb_zone_apply_store);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_color_set_count =
-	__ATTR(color_set_count, 0444, asus_usb_rgb_zone_color_set_count_show, NULL);
-static struct device_attribute dev_attr_asus_usb_rgb_zone_color_set_index =
-	__ATTR(color_set_index, 0444, asus_usb_rgb_zone_color_set_index_show, NULL);
-
-static struct attribute *asus_usb_rgb_zone_attrs[] = {
-	&dev_attr_asus_usb_rgb_zone_effect.attr,
-	&dev_attr_asus_usb_rgb_zone_effect_index.attr,
-	&dev_attr_asus_usb_rgb_zone_speed.attr,
-	&dev_attr_asus_usb_rgb_zone_speed_range.attr,
-	&dev_attr_asus_usb_rgb_zone_enabled.attr,
-	&dev_attr_asus_usb_rgb_zone_enabled_index.attr,
-	&dev_attr_asus_usb_rgb_zone_direction.attr,
-	&dev_attr_asus_usb_rgb_zone_direction_index.attr,
-	&dev_attr_asus_usb_rgb_zone_name.attr,
-	&dev_attr_asus_usb_rgb_zone_apply.attr,
-	&dev_attr_asus_usb_rgb_zone_color_set_count.attr,
-	&dev_attr_asus_usb_rgb_zone_color_set_index.attr,
-	NULL,
-};
-
-static const struct attribute_group asus_usb_rgb_zone_attr_group = {
-	.attrs = asus_usb_rgb_zone_attrs,
-};
-
-static int asus_usb_rgb_register_zone(struct asus_usb_rgb_dev *rgb, int idx)
-{
-	static const u32 rgb_color_index[3] = {
-		LED_COLOR_ID_RED, LED_COLOR_ID_GREEN, LED_COLOR_ID_BLUE,
-	};
-	struct asus_usb_rgb_zone *zone = &rgb->zones[idx];
-	struct asus_usb_rgb_zone_state *state;
-	struct led_classdev *cdev;
-	u8 components;
-	int ret, i;
-
-	components = rgb->desc->color_components;
-	if (components != 3 && components != 6)
-		return -EINVAL;
-
-	zone->parent = rgb;
-	zone->zone_id = rgb->desc->zones[idx];
-
-	state = asus_usb_rgb_get_zone_state(rgb, zone->zone_id);
-	if (!state)
-		return -EINVAL;
-
-	for (i = 0; i < components; i++)
-		zone->subled_info[i].color_index = rgb_color_index[i % 3];
-
-	zone->mc_cdev.subled_info = zone->subled_info;
-	zone->mc_cdev.num_colors = components;
-
-	cdev = &zone->mc_cdev.led_cdev;
-	cdev->name = devm_kasprintf(&rgb->hdev->dev, GFP_KERNEL,
-				   /* NOT FOR UPSTREAM: spoof the Legion Go S LED name so SteamOS Game Mode exposes the joystick RGB menu. Upstream uses "asus:rgb:%s". */
-				  "go_s:rgb:%s", asus_usb_rgb_zone_name(zone->zone_id));
-	if (!cdev->name)
-		return -ENOMEM;
-
-	/*
-	 * Userspace fades the LEDs to zero before suspend, so the stored level
-	 * can be zero when the device is re-probed on resume. Restore the last
-	 * non-zero level rather than bringing the ring back dark.
-	 */
-	cdev->brightness = state->brightness;
-	cdev->max_brightness = 100;
-	cdev->brightness_set = asus_usb_rgb_set;
-	/*
-	 * The rings reproduce arbitrary colors, which LED_COLOR_ID_RGB
-	 * describes; LED_COLOR_ID_MULTI is the generic multicolor case and
-	 * leaves userspace unable to tell the two apart.
-	 */
-	cdev->color = LED_COLOR_ID_RGB;
-
-	zone->subled_info[0].intensity = state->red;
-	zone->subled_info[1].intensity = state->green;
-	zone->subled_info[2].intensity = state->blue;
-	if (components == 6) {
-		zone->subled_info[3].intensity = state->bg_red;
-		zone->subled_info[4].intensity = state->bg_green;
-		zone->subled_info[5].intensity = state->bg_blue;
-	}
-	led_mc_calc_color_components(&zone->mc_cdev, cdev->brightness);
-
-	spin_lock_init(&zone->lock);
-	INIT_DELAYED_WORK(&zone->work, asus_usb_rgb_zone_work_fn);
-
-	ret = devm_led_classdev_multicolor_register(&rgb->hdev->dev, &zone->mc_cdev);
-	if (ret)
-		return ret;
-
-	ret = devm_device_add_group(zone->mc_cdev.led_cdev.dev,
-				    &asus_usb_rgb_zone_attr_group);
-	if (ret && ret != -EEXIST)
-		return ret;
-
-	return 0;
-}
-
-static void asus_usb_rgb_resume_work_fn(struct work_struct *work)
-{
-	struct asus_usb_rgb_dev *rgb = container_of(work, struct asus_usb_rgb_dev,
-						resume_work.work);
-	int i;
-
-	if (!rgb)
-		return;
-
-	for (i = 0; i < rgb->desc->zone_count; i++)
-		asus_usb_rgb_zone_queue_update(&rgb->zones[i], true);
-}
-
-static bool ally_check_xbox_led_support(struct hid_device *hdev);
-
-static struct asus_usb_rgb_dev *asus_usb_rgb_create(struct hid_device *hdev)
-{
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct asus_usb_rgb_dev *rgb;
-	const struct asus_usb_rgb_hw_desc *desc;
-	int i;
-	int ret;
-
-	desc = asus_usb_rgb_match_hw(hdev);
-	if (!desc)
-		return ERR_PTR(-EOPNOTSUPP);
-
-	rgb = devm_kzalloc(&hdev->dev, sizeof(*rgb), GFP_KERNEL);
-	if (!rgb)
-		return ERR_PTR(-ENOMEM);
-
-	rgb->hdev = hdev;
-	rgb->desc = desc;
-	/* Level is unknown at probe, force the first send */
-	rgb->last_hw_level = ASUS_USB_RGB_HW_LEVEL_NONE;
-	mutex_init(&rgb->io_mutex);
-	spin_lock_init(&rgb->lock);
-	INIT_DELAYED_WORK(&rgb->resume_work, asus_usb_rgb_resume_work_fn);
-
-	/*
-	 * Probe the Aura firmware for runtime capabilities. The 0x9e feature
-	 * report returns the supported effect mask; the 0x05 status report
-	 * returns the physical keyboard type and region bits. When the firmware
-	 * does not implement either query, caps.valid stays false and the
-	 * static effect table is used as a fallback.
-	 */
-	if (hid_hw_open(hdev) >= 0) {
-		if (asus_aura_query_caps(hdev, &rgb->caps) == 0)
-			hid_dbg(hdev, "Aura firmware effects detected (mask %02x%02x)\n",
-				rgb->caps.mode_mask_high, rgb->caps.mode_mask_low);
-		else
-			hid_dbg(hdev, "Aura firmware capability query failed, using static fallback\n");
-
-		if (asus_aura_query_status(hdev, &rgb->caps) == 0)
-			hid_dbg(hdev, "Aura status: type=%02x regions=%02x features=%02x\n",
-				rgb->caps.keyboard_type, rgb->caps.region_bits,
-				rgb->caps.feature_bits);
-		hid_hw_close(hdev);
-	}
-
-	if (!rgb->caps.valid && desc->supported_effects) {
-		for (i = 0; i < ASUS_USB_RGB_EFFECT_MAX; i++) {
-			if (desc->supported_effects & BIT(i))
-				set_bit(i, rgb->caps.effects);
-		}
-		if (drvdata && drvdata->has_xbox_features)
-			set_bit(ASUS_USB_RGB_EFFECT_REACTIVE, rgb->caps.effects);
-		rgb->caps.valid = true;
-	}
-
-	for (i = 0; i < desc->zone_count; i++) {
-		ret = asus_usb_rgb_register_zone(rgb, i);
-		if (ret)
-			return ERR_PTR(ret);
-	}
-
-	for (i = 0; i < desc->zone_count; i++)
-		asus_usb_rgb_zone_queue_update(&rgb->zones[i], true);
-
-	return rgb;
-}
-
-static void asus_usb_rgb_remove(struct asus_usb_rgb_dev *rgb)
-{
-	int i;
-
-	if (!rgb || rgb->removed)
-		return;
-
-	scoped_guard(spinlock_irqsave, &rgb->lock)
-		rgb->removed = true;
-
-	cancel_delayed_work_sync(&rgb->resume_work);
-
-	for (i = 0; i < rgb->desc->zone_count; i++) {
-		struct asus_usb_rgb_zone *zone = &rgb->zones[i];
-
-		scoped_guard(spinlock_irqsave, &zone->lock)
-			zone->removed = true;
-
-		cancel_delayed_work_sync(&zone->work);
-		devm_led_classdev_multicolor_unregister(&rgb->hdev->dev, &zone->mc_cdev);
-	}
-}
-
-static void asus_usb_rgb_resume(struct asus_usb_rgb_dev *rgb)
-{
-	if (!rgb || rgb->removed)
-		return;
-
-	/* Same ordering constraint as asus_usb_rgb_zone_queue_update(). */
-	scoped_guard(spinlock_irqsave, &rgb->lock) {
-		if (rgb->removed)
-			return;
-		schedule_delayed_work(&rgb->resume_work, msecs_to_jiffies(1500));
-	}
-}
-
-/*
- * ROG Xbox Ally X (RC74XA) Guide Button LED control
- */
-struct ally_xbox_led {
-	struct hid_device *hdev;
-	struct led_classdev cdev;
-	struct mutex lock;
-	u8 brightness;
-	u8 effect;
-	u8 speed;
-};
-
-/*
- * CMD_SET_LED_POWER flags: the system states in which the MCU keeps its
- * LEDs lit. Bit assignment per asusctl (rog-aura) for the Ally family.
- */
-#define ALLY_LED_POWER_BOOT		BIT(0)
-#define ALLY_LED_POWER_AWAKE		BIT(1)
-#define ALLY_LED_POWER_SLEEP		BIT(2)
-#define ALLY_LED_POWER_SHUTDOWN		BIT(3)
-
-/*
- * ally_xbox_led_set_power() - Enable the Xbox logo LED in every power state
- *
- * The MCU gates the Xbox logo LED on its LED power-state flags, and the
- * RC74XA firmware default leaves that zone unlit in every state after the
- * power-on flash. Brightness and effect commands are accepted but have no
- * visible result until the flags are set. Armoury Crate sends this once at
- * service start, so no USB capture of its UI contains it.
- *
- * The four low bits follow the Ally documentation; the zone-to-bit mapping
- * of the Xbox logo on RC74XA has not been isolated, and 0xff is the value
- * verified to light it. Sent once per probe, not on resume: the flags are
- * kept by the MCU and are the kind of setting the vendor tool writes only
- * when it changes.
- */
-static int ally_xbox_led_set_power(struct hid_device *hdev)
-{
-	u8 buf[ROG_ALLY_REPORT_SIZE] = {
-		HID_ALLY_SET_REPORT_ID, HID_ALLY_FEATURE_CODE_PAGE,
-		CMD_SET_LED_POWER, 0x01, 0xff,
-	};
-	int ret;
-
-	ret = ally_dev_set_report(hdev, buf, sizeof(buf));
-	if (ret < 0)
-		hid_warn(hdev, "Failed to set Xbox LED power state: %d\n", ret);
-
-	return ret;
-}
-
-static int ally_xbox_led_set_effect(struct ally_xbox_led *led)
-{
-	u8 e_buf[ROG_ALLY_REPORT_SIZE] = {
-		HID_ALLY_SET_REPORT_ID, HID_ALLY_FEATURE_CODE_PAGE,
-		CMD_SET_XBOX_LED_EFFECT, 0x02,
-		led->effect, led->speed,
-	};
-	int ret;
-
-	guard(mutex)(&led->lock);
-
-	ret = ally_dev_set_report(led->hdev, e_buf, sizeof(e_buf));
-	if (ret < 0)
-		hid_warn(led->hdev, "Xbox LED effect SET_REPORT failed: %d\n", ret);
-
-	hid_dbg(led->hdev, "Applied Xbox LED effect: 0x%02x, speed: 0x%02x (ret=%d)\n",
-		led->effect, led->speed, ret);
-
-	return ret;
-}
-
-static int ally_xbox_led_set_brightness(struct ally_xbox_led *led)
-{
-	u8 b_buf_5d[ROG_ALLY_REPORT_SIZE] = {
-		FEATURE_KBD_LED_REPORT_ID1, /* 0x5D */
-		HID_ALLY_FEATURE_CODE_PAGE,
-		CMD_SET_XBOX_LED_BRIGHTNESS, 0x01,
-		led->brightness,
-	};
-	int ret;
-
-	guard(mutex)(&led->lock);
-
-	/* Send to interrupt OUT ep4 matching Armoury Crate captures */
-	ret = ally_dev_output_report(led->hdev, b_buf_5d, sizeof(b_buf_5d));
-	if (ret < 0)
-		hid_warn(led->hdev, "Xbox LED brightness output report failed: %d\n", ret);
-
-	hid_dbg(led->hdev, "Applied Xbox LED brightness: %u (ret=%d)\n",
-		led->brightness, ret);
-
-	return ret < 0 ? ret : 0;
-}
-
-static int ally_xbox_led_apply(struct ally_xbox_led *led)
-{
-	int ret;
-
-	ret = ally_xbox_led_set_effect(led);
-	if (ret < 0)
-		return ret;
-
-	return ally_xbox_led_set_brightness(led);
-}
-
-static int ally_xbox_led_set_blocking(struct led_classdev *cdev,
-				      enum led_brightness brightness)
-{
-	struct ally_xbox_led *led = container_of(cdev, struct ally_xbox_led, cdev);
-
-	if (brightness > 3)
-		brightness = 3;
-
-	led->brightness = (u8)brightness;
-	return ally_xbox_led_set_brightness(led);
-}
-
-static ssize_t effect_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct led_classdev *cdev = dev_get_drvdata(dev);
-	struct ally_xbox_led *led = container_of(cdev, struct ally_xbox_led, cdev);
-	const char *name;
-
-	switch (led->effect) {
-	case 0x00: name = "static"; break;
-	case 0x01: name = "breathing"; break;
-	case 0x0A: name = "strobing"; break;
-	default:   name = "unknown"; break;
-	}
-
-	return sysfs_emit(buf, "%s\n", name);
-}
-
-static ssize_t effect_store(struct device *dev, struct device_attribute *attr,
-			    const char *buf, size_t count)
-{
-	struct led_classdev *cdev = dev_get_drvdata(dev);
-	struct ally_xbox_led *led = container_of(cdev, struct ally_xbox_led, cdev);
-	u8 eff;
-	int ret;
-
-	if (sysfs_streq(buf, "static") || sysfs_streq(buf, "0"))
-		eff = 0x00;
-	else if (sysfs_streq(buf, "breathing") || sysfs_streq(buf, "breathe") || sysfs_streq(buf, "1"))
-		eff = 0x01;
-	else if (sysfs_streq(buf, "strobing") || sysfs_streq(buf, "strobe") || sysfs_streq(buf, "10"))
-		eff = 0x0A;
-	else
-		return -EINVAL;
-
-	led->effect = eff;
-	ret = ally_xbox_led_set_effect(led);
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-static DEVICE_ATTR_RW(effect);
-
-static ssize_t available_effects_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "static breathing strobing\n");
-}
-static DEVICE_ATTR_RO(available_effects);
-
-static ssize_t speed_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct led_classdev *cdev = dev_get_drvdata(dev);
-	struct ally_xbox_led *led = container_of(cdev, struct ally_xbox_led, cdev);
-	const char *name;
-
-	switch (led->speed) {
-	case 0x0D: name = "slow"; break;
-	case 0x08: name = "normal"; break;
-	case 0x04: name = "fast"; break;
-	default:   name = "normal"; break;
-	}
-
-	return sysfs_emit(buf, "%s\n", name);
-}
-
-static ssize_t speed_store(struct device *dev, struct device_attribute *attr,
-			   const char *buf, size_t count)
-{
-	struct led_classdev *cdev = dev_get_drvdata(dev);
-	struct ally_xbox_led *led = container_of(cdev, struct ally_xbox_led, cdev);
-	u8 spd;
-	int ret;
-
-	if (sysfs_streq(buf, "slow") || sysfs_streq(buf, "13"))
-		spd = 0x0D;
-	else if (sysfs_streq(buf, "normal") || sysfs_streq(buf, "8"))
-		spd = 0x08;
-	else if (sysfs_streq(buf, "fast") || sysfs_streq(buf, "4"))
-		spd = 0x04;
-	else
-		return -EINVAL;
-
-	led->speed = spd;
-	ret = ally_xbox_led_set_effect(led);
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-static DEVICE_ATTR_RW(speed);
-
-static ssize_t available_speeds_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "slow normal fast\n");
-}
-static DEVICE_ATTR_RO(available_speeds);
-
-static struct attribute *ally_xbox_led_attrs[] = {
-	&dev_attr_effect.attr,
-	&dev_attr_available_effects.attr,
-	&dev_attr_speed.attr,
-	&dev_attr_available_speeds.attr,
-	NULL,
-};
-ATTRIBUTE_GROUPS(ally_xbox_led);
-
-static bool ally_check_xbox_led_support(struct hid_device *hdev)
-{
-	u8 *set_buf __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
-	u8 *get_buf __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
-	int ret;
-
-	if (!set_buf || !get_buf)
-		return false;
-
-	set_buf[0] = HID_ALLY_SET_REPORT_ID;
-	set_buf[1] = HID_ALLY_FEATURE_CODE_PAGE;
-	set_buf[2] = CMD_CHECK_XBOX_LED_SUPPORT;
-	set_buf[3] = 0x03;
-
-	ret = hid_hw_raw_request(hdev, HID_ALLY_SET_REPORT_ID, set_buf,
-				 ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
-				 HID_REQ_SET_REPORT);
-	if (ret < 0) {
-		hid_warn(hdev, "Xbox LED support query SET_REPORT failed: %d\n", ret);
-		return false;
-	}
-
-	usleep_range(5000, 10000);
-
-	get_buf[0] = HID_ALLY_SET_REPORT_ID;
-	ret = hid_hw_raw_request(hdev, HID_ALLY_SET_REPORT_ID, get_buf,
-				 ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
-				 HID_REQ_GET_REPORT);
-	if (ret < 0) {
-		hid_warn(hdev, "Xbox LED support query GET_REPORT failed: %d\n", ret);
-		return false;
-	}
-
-	hid_dbg(hdev, "Xbox LED support query returned %d, resp: %*ph\n",
-		ret, 8, get_buf);
-
-	return (get_buf[1] == HID_ALLY_FEATURE_CODE_PAGE &&
-		get_buf[2] == CMD_CHECK_XBOX_LED_SUPPORT &&
-		(get_buf[5] & 0x08));
-}
-
-static struct ally_xbox_led *ally_xbox_led_create(struct hid_device *hdev)
-{
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_xbox_led *led;
-	int ret;
-
-	if (!drvdata || !drvdata->has_xbox_features)
-		return NULL;
-
-	led = devm_kzalloc(&hdev->dev, sizeof(*led), GFP_KERNEL);
-	if (!led)
-		return ERR_PTR(-ENOMEM);
-
-	led->hdev = hdev;
-	mutex_init(&led->lock);
-	led->brightness = 0; /* Default dark at probe */
-	led->effect = 0x00;  /* Default static */
-	led->speed = 0x08;   /* Default normal */
-
-	led->cdev.name = "ally:white:xbox_logo";
-	led->cdev.max_brightness = 3;
-	led->cdev.brightness = led->brightness;
-	led->cdev.brightness_set_blocking = ally_xbox_led_set_blocking;
-	led->cdev.groups = ally_xbox_led_groups;
-
-	ret = devm_led_classdev_register(&hdev->dev, &led->cdev);
-	if (ret) {
-		hid_err(hdev, "Failed to register Xbox logo LED: %d\n", ret);
-		return ERR_PTR(ret);
-	}
-
-	ally_xbox_led_set_power(hdev);
-	ally_xbox_led_apply(led);
-
-	return led;
-}
-
-static void ally_xbox_led_remove(struct ally_xbox_led *led)
-{
-	if (!led)
-		return;
-
-	led->brightness = 0;
-	ally_xbox_led_set_brightness(led);
-}
-
-static void ally_xbox_led_resume(struct ally_xbox_led *led)
-{
-	if (led)
-		ally_xbox_led_apply(led);
-}
-
-
 static void asus_kbd_backlight_set(struct asus_hid_listener *listener, int brightness)
 {
 	struct asus_drvdata *drvdata = container_of(listener, struct asus_drvdata, listener);
@@ -7069,7 +1004,7 @@ static void asus_kbd_backlight_set(struct asus_hid_listener *listener, int brigh
 
 	drvdata->kbd_backlight_brightness = brightness;
 
-	action = kzalloc(sizeof(struct asus_work_action), GFP_NOWAIT);
+	action = kzalloc_obj(struct asus_work_action, GFP_NOWAIT);
 	if (!action)
 		return;
 
@@ -7262,6 +1197,148 @@ static bool asus_has_report_id(struct hid_device *hdev, u16 report_id)
 	return false;
 }
 
+/*
+ * Sibling USB interface with HID Lighting (LampArray) only — no Aura 0x5d.
+ * Bound by this driver without hidraw so lighting stays in-kernel DL.
+ */
+static int asus_lamparray_detect_base(struct hid_device *hdev)
+{
+	u8 base;
+
+	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1) ||
+	    asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2))
+		return -ENODEV;
+
+	for (base = 0; base <= 0x40; base += 0x40) {
+		if (asus_has_report_id(hdev, base + ASUS_LAMPARRAY_RID_ATTR) &&
+		    asus_has_report_id(hdev, base + ASUS_LAMPARRAY_RID_MULTI) &&
+		    asus_has_report_id(hdev, base + ASUS_LAMPARRAY_RID_CONTROL))
+			return base;
+	}
+
+	return -ENODEV;
+}
+
+static bool asus_is_lamparray_interface(struct hid_device *hdev)
+{
+	return asus_lamparray_detect_base(hdev) >= 0;
+}
+
+static size_t asus_feature_report_len(struct hid_device *hdev, u8 id)
+{
+	struct hid_report *report;
+
+	report = hdev->report_enum[HID_FEATURE_REPORT].report_id_hash[id];
+	if (!report)
+		return 0;
+	return hid_report_len(report);
+}
+
+static bool asus_dmi_is_anime_board(void)
+{
+	const char *board = dmi_get_system_info(DMI_BOARD_NAME);
+
+	if (!board)
+		return false;
+
+	return strstr(board, "GA401I") || strstr(board, "GA401Q") ||
+	       strstr(board, "GA402R") || strstr(board, "GA402X") ||
+	       strstr(board, "GA402N") || strstr(board, "GU604V") ||
+	       strstr(board, "G635L") || strstr(board, "G835L");
+}
+
+/*
+ * Boards that ship a standalone Slash MCU on 0x193b and never AniMe.
+ * Keep this list conservative: unknown boards fall through to -ENODEV
+ * when report size alone cannot decide.
+ */
+static bool asus_dmi_is_slash_only_board(void)
+{
+	const char *board = dmi_get_system_info(DMI_BOARD_NAME);
+
+	if (!board)
+		return false;
+
+	return strstr(board, "G614") || strstr(board, "G614J") ||
+	       strstr(board, "G614JZ") || strstr(board, "G614JI") ||
+	       strstr(board, "G614JV") || strstr(board, "G614PR");
+}
+
+static enum asus_anime_type asus_anime_type_from_dmi(void)
+{
+	const char *board = dmi_get_system_info(DMI_BOARD_NAME);
+
+	if (!board)
+		return ASUS_ANIME_UNKNOWN;
+
+	if (strstr(board, "GA401I") || strstr(board, "GA401Q"))
+		return ASUS_ANIME_GA401;
+	if (strstr(board, "GA402R") || strstr(board, "GA402X") ||
+	    strstr(board, "GA402N"))
+		return ASUS_ANIME_GA402;
+	if (strstr(board, "GU604V"))
+		return ASUS_ANIME_GU604;
+	if (strstr(board, "G635L"))
+		return ASUS_ANIME_G635L;
+	if (strstr(board, "G835L"))
+		return ASUS_ANIME_G835L;
+
+	return ASUS_ANIME_UNKNOWN;
+}
+
+/*
+ * USB 0x193b is shared by Slash and AniMe Matrix. Discriminate in order:
+ * 1) feature report 0x5e size (AniMe ~640 B, Slash Aura-sized)
+ * 2) known DMI boards when size is ambiguous
+ * 3) otherwise refuse to guess (-ENODEV / NONE)
+ */
+static enum asus_pid_193b_kind asus_classify_pid_193b(struct hid_device *hdev)
+{
+	size_t len_5e;
+	bool anime_dmi = asus_dmi_is_anime_board();
+	bool slash_dmi = asus_dmi_is_slash_only_board();
+
+	if (hdev->product != USB_DEVICE_ID_ASUSTEK_ROG_SLASH)
+		return ASUS_PID_193B_NONE;
+
+	len_5e = asus_feature_report_len(hdev, FEATURE_KBD_LED_REPORT_ID2);
+
+	if (len_5e >= ASUS_ANIME_PACKET_SIZE)
+		return ASUS_PID_193B_ANIME;
+
+	if (len_5e > 0 && len_5e < ASUS_ANIME_PACKET_SIZE) {
+		if (anime_dmi)
+			return ASUS_PID_193B_NONE;
+		return ASUS_PID_193B_SLASH;
+	}
+
+	/* No usable 0x5e length: Slash may talk on 0x5d only. */
+	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1)) {
+		if (anime_dmi)
+			return ASUS_PID_193B_NONE;
+		return ASUS_PID_193B_SLASH;
+	}
+
+	if (anime_dmi)
+		return ASUS_PID_193B_ANIME;
+	if (slash_dmi)
+		return ASUS_PID_193B_SLASH;
+
+	return ASUS_PID_193B_NONE;
+}
+
+/*
+ * Slash on Aura keyboards exposes report 0x5e. Standalone Slash MCU reuses
+ * USB 0x193b and is accepted only when classify_pid_193b says SLASH.
+ */
+static bool asus_device_has_slash(struct hid_device *hdev)
+{
+	if (hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_SLASH)
+		return asus_classify_pid_193b(hdev) == ASUS_PID_193B_SLASH;
+
+	return asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2);
+}
+
 static int asus_kbd_register_leds(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
@@ -7301,6 +1378,2496 @@ static int asus_kbd_register_leds(struct hid_device *hdev)
 
 	return ret;
 }
+
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+
+/*
+ * Missing transfer type. A timeout or I/O error keeps the cached path.
+ * usbhid returns -ENOSYS when urbout is absent (no Interrupt OUT), which is
+ * the common case on Aura N-KEY interfaces that only expose Interrupt IN.
+ */
+static bool asus_aura_path_missing(int ret)
+{
+	return ret == -ENOSYS || ret == -EOPNOTSUPP || ret == -EINVAL ||
+	       ret == -EPIPE;
+}
+
+static u8 *asus_aura_write_slot(struct asus_drvdata *drvdata, u8 report_id)
+{
+	if (report_id == FEATURE_KBD_LED_REPORT_ID2)
+		return &drvdata->aura_write_5e;
+
+	return &drvdata->aura_write_5d;
+}
+
+static int asus_aura_try_path(struct asus_drvdata *drvdata, u8 path)
+{
+	switch (path) {
+	case 1:
+		if (!drvdata->hdev->ll_driver ||
+		    !drvdata->hdev->ll_driver->output_report)
+			return -EOPNOTSUPP;
+		return hid_hw_output_report(drvdata->hdev, drvdata->aura_buf,
+					    AURA_FEATURE_REPORT_SIZE);
+	case 2:
+		return hid_hw_raw_request(drvdata->hdev, drvdata->aura_buf[0],
+					  drvdata->aura_buf,
+					  AURA_FEATURE_REPORT_SIZE,
+					  HID_OUTPUT_REPORT,
+					  HID_REQ_SET_REPORT);
+	case 3:
+		return hid_hw_raw_request(drvdata->hdev, drvdata->aura_buf[0],
+					  drvdata->aura_buf,
+					  AURA_FEATURE_REPORT_SIZE,
+					  HID_FEATURE_REPORT,
+					  HID_REQ_SET_REPORT);
+	default:
+		return -EINVAL;
+	}
+}
+
+static int asus_aura_scan_paths(struct asus_drvdata *drvdata, u8 *slot)
+{
+	static const u8 order[] = { 1, 2, 3 };
+	unsigned int i;
+	int ret = -EIO;
+
+	for (i = 0; i < ARRAY_SIZE(order); i++) {
+		ret = asus_aura_try_path(drvdata, order[i]);
+		if (ret >= 0) {
+			*slot = order[i];
+			return 0;
+		}
+		if (!asus_aura_path_missing(ret))
+			return ret;
+	}
+
+	return ret;
+}
+
+static int asus_aura_set_feature_unlocked(struct asus_drvdata *drvdata,
+					  const u8 *buf, size_t buf_size)
+{
+	u8 *slot;
+	int ret;
+
+	if (buf_size > AURA_FEATURE_REPORT_SIZE)
+		return -EINVAL;
+
+	memcpy(drvdata->aura_buf, buf, buf_size);
+	if (buf_size < AURA_FEATURE_REPORT_SIZE)
+		memset(drvdata->aura_buf + buf_size, 0,
+		       AURA_FEATURE_REPORT_SIZE - buf_size);
+
+	/*
+	 * Match Armoury Crate: interrupt OUT, then raw OUTPUT, then FEATURE.
+	 * Remember the path that works for this report id. A later timeout
+	 * does not abandon it; only a missing transfer type does.
+	 */
+	slot = asus_aura_write_slot(drvdata, buf[0]);
+	if (*slot) {
+		ret = asus_aura_try_path(drvdata, *slot);
+		if (ret >= 0)
+			return 0;
+		if (!asus_aura_path_missing(ret))
+			return ret;
+		*slot = 0;
+	}
+
+	return asus_aura_scan_paths(drvdata, slot);
+}
+
+static int asus_aura_set_feature(struct asus_drvdata *drvdata,
+				 const u8 *buf, size_t buf_size)
+{
+	guard(mutex)(&drvdata->aura_lock);
+
+	return asus_aura_set_feature_unlocked(drvdata, buf, buf_size);
+}
+
+static int asus_aura_get_feature(struct asus_drvdata *drvdata,
+				 u8 *buf, size_t buf_size)
+{
+	int ret;
+
+	if (buf_size > AURA_FEATURE_REPORT_SIZE)
+		return -EINVAL;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	memset(drvdata->aura_buf, 0, AURA_FEATURE_REPORT_SIZE);
+	drvdata->aura_buf[0] = buf[0];
+
+	ret = hid_hw_raw_request(drvdata->hdev, buf[0], drvdata->aura_buf,
+				 AURA_FEATURE_REPORT_SIZE,
+				 HID_FEATURE_REPORT, HID_REQ_GET_REPORT);
+	if (ret < 0)
+		return ret;
+
+	memcpy(buf, drvdata->aura_buf, min_t(size_t, buf_size, ret));
+	return ret;
+}
+
+static int asus_aura_commit(struct asus_drvdata *drvdata)
+{
+	u8 buf_set[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_SET,
+	};
+	u8 buf_apply[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_COMMIT,
+	};
+	int ret;
+
+	/*
+	 * Apply staged 0xb3 effect programming:
+	 * First send 0xb5 (AURA_CMD_SET) to latch parameters,
+	 * then send 0xb4 (AURA_CMD_COMMIT) to apply them to hardware,
+	 * then send 0xb5 (AURA_CMD_SET) to settle as captured in firmware traces.
+	 */
+	ret = asus_aura_set_feature(drvdata, buf_set, sizeof(buf_set));
+	if (ret < 0)
+		return ret;
+
+	ret = asus_aura_set_feature(drvdata, buf_apply, sizeof(buf_apply));
+	if (ret < 0)
+		return ret;
+
+	return asus_aura_set_feature(drvdata, buf_set, sizeof(buf_set));
+}
+
+static int asus_aura_query_run_mode(struct asus_drvdata *drvdata, u8 selector,
+				    u8 *buf, size_t buf_size)
+{
+	u8 req[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_RUN_MODE,
+		0x01,
+		selector,
+	};
+	int ret;
+
+	ret = asus_aura_set_feature(drvdata, req, sizeof(req));
+	if (ret < 0)
+		return ret;
+
+	memset(buf, 0, buf_size);
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+
+	ret = asus_aura_get_feature(drvdata, buf, buf_size);
+	if (ret < 0)
+		return ret;
+
+	if (ret < 5 || buf[1] != AURA_CMD_RUN_MODE || buf[2] != 0x01 ||
+	    buf[3] != selector || buf[4] != 0x01)
+		return -ENODATA;
+
+	return ret;
+}
+
+static int asus_aura_get_effect_mask(struct asus_drvdata *drvdata, u8 effect_mask[2])
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE];
+	int ret;
+
+	ret = asus_aura_query_run_mode(drvdata, 0x20, buf, sizeof(buf));
+	if (ret >= 22)
+		goto found;
+
+	ret = asus_aura_query_run_mode(drvdata, 0x15, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+	if (ret < 22)
+		return -ENODATA;
+
+found:
+	effect_mask[0] = buf[20];
+	effect_mask[1] = buf[21];
+
+	return 0;
+}
+
+/*
+ * Notebook 0x9e capability bits (Armoury Crate). hw_mode is the 0xb3 opcode;
+ * cap_bit is the bit in bytes 20..21. They match for modes 0..8, then skip the
+ * unused byte21 bit2: Pulse is mode 0x0a but cap bit 9, not BIT(0x0a).
+ */
+static const struct {
+	const char *name;
+	u8 hw_mode;
+	u16 cap_bit;
+} asus_aura_effect_map[] = {
+	{ "static",		AURA_EFFECT_STATIC,		BIT(0) },
+	{ "breathe",		AURA_EFFECT_BREATHING,		BIT(1) },
+	{ "rainbow_cycle",	AURA_EFFECT_SPECTRUM_CYCLE,	BIT(2) },
+	{ "rainbow_wave",	AURA_EFFECT_RAINBOW,		BIT(3) },
+	{ "star",		AURA_EFFECT_STARS,		BIT(4) },
+	{ "rain",		AURA_EFFECT_RAIN,		BIT(5) },
+	{ "highlight",		AURA_EFFECT_REACTIVE,		BIT(6) },
+	{ "laser",		AURA_EFFECT_LASER,		BIT(7) },
+	{ "ripple",		AURA_EFFECT_RIPPLE,		BIT(8) },
+	{ "pulse",		AURA_EFFECT_PULSE,		BIT(9) },
+	{ "comet",		AURA_EFFECT_COMET,		BIT(11) },
+	{ "flash",		AURA_EFFECT_FLASH,		BIT(12) },
+};
+
+static unsigned int asus_aura_fill_effects(const char **dst,
+					   const u8 *effect_mask,
+					   bool direct_capable)
+{
+	unsigned int i, n = 0;
+	u16 mask = effect_mask ? (effect_mask[0] | ((u16)effect_mask[1] << 8))
+			       : (u16)~0;
+
+	for (i = 0; i < ARRAY_SIZE(asus_aura_effect_map); i++) {
+		if (mask & asus_aura_effect_map[i].cap_bit)
+			dst[n++] = asus_aura_effect_map[i].name;
+	}
+	if (direct_capable)
+		dst[n++] = "direct";
+
+	return n;
+}
+
+static int asus_aura_hw_mode_from_name(const char *name, u8 *aura_mode)
+{
+	unsigned int i;
+
+	if (!name)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(asus_aura_effect_map); i++) {
+		if (!strcmp(name, asus_aura_effect_map[i].name)) {
+			*aura_mode = asus_aura_effect_map[i].hw_mode;
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+static bool asus_aura_hw_mode_known(u8 mode)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_aura_effect_map); i++) {
+		if (asus_aura_effect_map[i].hw_mode == mode)
+			return true;
+	}
+
+	return false;
+}
+
+static bool asus_aura_speed_known(u8 speed)
+{
+	return speed == 0 || speed == AURA_SPEED_SLOW ||
+	       speed == AURA_SPEED_MED || speed == AURA_SPEED_FAST;
+}
+
+static const u8 asus_aura_hw_speed[] = {
+	[0] = AURA_SPEED_SLOW,
+	[1] = AURA_SPEED_MED,
+	[2] = AURA_SPEED_FAST,
+};
+
+static u8 asus_aura_speed_to_hw(unsigned int speed)
+{
+	if (speed < ARRAY_SIZE(asus_aura_hw_speed))
+		return asus_aura_hw_speed[speed];
+
+	return AURA_SPEED_MED;
+}
+
+static unsigned int asus_aura_speed_from_hw(u8 speed)
+{
+	if (speed == AURA_SPEED_SLOW)
+		return 0;
+	if (speed == AURA_SPEED_FAST)
+		return 2;
+
+	return 1;
+}
+
+/* Hardware direction byte for enum dl_direction. */
+static const u8 asus_aura_hw_direction[] = {
+	[DL_DIRECTION_LEFT]	= 1,
+	[DL_DIRECTION_RIGHT]	= 0,
+	[DL_DIRECTION_UP]	= 2,
+	[DL_DIRECTION_DOWN]	= 3,
+};
+
+static u8 asus_aura_direction_to_hw(enum dl_direction direction)
+{
+	if (direction < ARRAY_SIZE(asus_aura_hw_direction))
+		return asus_aura_hw_direction[direction];
+
+	return asus_aura_hw_direction[DL_DIRECTION_RIGHT];
+}
+
+static enum dl_direction asus_aura_direction_from_hw(u8 direction)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_aura_hw_direction); i++) {
+		if (asus_aura_hw_direction[i] == direction)
+			return i;
+	}
+
+	return DL_DIRECTION_RIGHT;
+}
+
+/*
+ * Aura 0xb3 is write-only. Read the feature report before any SET in probe:
+ * some firmware still holds the last committed Set Effect packet. Adopt that
+ * into the software node when the payload is a known Set Effect. Never write
+ * a color from probe: userspace owns the first commit.
+ */
+static void asus_aura_capture_boot_effect(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	u8 buf[AURA_FEATURE_REPORT_SIZE];
+	int ret;
+
+	memset(buf, 0, sizeof(buf));
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	ret = asus_aura_get_feature(drvdata, buf, sizeof(buf));
+	if (ret < 0)
+		return;
+
+	if (ret < 13 || buf[1] != AURA_CMD_SET_EFFECT ||
+	    buf[2] > AURA_ZONE_BAR_RIGHT ||
+	    !asus_aura_hw_mode_known(buf[3]) ||
+	    !asus_aura_speed_known(buf[7]))
+		return;
+
+	drvdata->boot_effect_valid = true;
+	drvdata->boot_zone = buf[2];
+	drvdata->boot_mode = buf[3];
+	drvdata->boot_r = buf[4];
+	drvdata->boot_g = buf[5];
+	drvdata->boot_b = buf[6];
+	drvdata->boot_speed = buf[7];
+	drvdata->boot_direction = buf[8];
+	drvdata->boot_r2 = buf[10];
+	drvdata->boot_g2 = buf[11];
+	drvdata->boot_b2 = buf[12];
+}
+
+static int asus_aura_activate_zone_unlocked(struct asus_drvdata *drvdata, u8 zone)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE] = { 0 };
+
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	buf[1] = AURA_CMD_ZONE_ENABLE;
+	buf[2] = zone;
+	buf[3] = 0x01;
+	buf[4] = 0x01;
+
+	return asus_aura_set_feature_unlocked(drvdata, buf, sizeof(buf));
+}
+
+static int asus_aura_activate_zone(struct asus_drvdata *drvdata, u8 zone)
+{
+	guard(mutex)(&drvdata->aura_lock);
+
+	return asus_aura_activate_zone_unlocked(drvdata, zone);
+}
+
+static int asus_aura_activate_zones(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	ret = asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_KEYBOARD);
+	if (ret < 0)
+		return ret;
+	if (drvdata->has_lightbar)
+		return asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_LIGHTBAR);
+	return 0;
+}
+
+static int asus_aura_wake_all_zones(struct asus_drvdata *drvdata)
+{
+	u8 buf_pwr[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_POWER,
+		AURA_POWER_CMD_ENABLE,
+		AURA_POWER_MASK_KBD_LOGO_ALL,
+		AURA_POWER_MASK_LIGHTBAR_ALL,
+		AURA_POWER_MASK_LID_ALL,
+		AURA_POWER_MASK_REAR_ALL,
+		0x00,
+	};
+	int ret;
+
+	/* Unmute power gating across keyboard, lightbar, logo, lid, and rear-glow */
+	ret = asus_aura_set_feature(drvdata, buf_pwr, sizeof(buf_pwr));
+	if (ret < 0)
+		return ret;
+
+	/* Activate keyboard zone */
+	ret = asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_KEYBOARD);
+	if (ret < 0)
+		return ret;
+
+	if (!drvdata->has_lightbar)
+		return 0;
+
+	return asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_LIGHTBAR);
+}
+
+static int asus_aura_apply_effect(struct led_classdev_dynamic *ldev);
+
+static void asus_aura_mark_effect_set(struct asus_drvdata *drvdata,
+				      struct led_classdev_dynamic *ldev)
+{
+	if (ldev == &drvdata->dldev_kbd)
+		drvdata->kbd_effect_set = true;
+	else if (ldev == &drvdata->dldev_lightbar)
+		drvdata->lightbar_effect_set = true;
+}
+
+static int asus_aura_write_zone_effect(struct asus_drvdata *drvdata, u8 zone,
+				       u8 aura_mode, u8 r, u8 g, u8 b,
+				       u8 speed, u8 direction,
+				       u8 r2, u8 g2, u8 b2,
+				       bool commit)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE] = { 0 };
+	int ret;
+
+	if (zone == AURA_ZONE_BAR_LEFT || zone == AURA_ZONE_BAR_RIGHT) {
+		ret = asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_LIGHTBAR);
+		if (ret < 0)
+			return ret;
+	}
+
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	buf[1] = AURA_CMD_SET_EFFECT;
+	buf[2] = zone;
+	buf[3] = aura_mode;
+	buf[4] = r;
+	buf[5] = g;
+	buf[6] = b;
+	buf[7] = speed;
+	buf[8] = direction;
+	buf[9] = 0x00;
+	buf[10] = r2;
+	buf[11] = g2;
+	buf[12] = b2;
+
+	ret = asus_aura_set_feature(drvdata, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+
+	if (commit)
+		return asus_aura_commit(drvdata);
+
+	return 0;
+}
+
+static size_t asus_lamparray_report_len(struct hid_device *hdev, u8 id)
+{
+	struct hid_report *report;
+
+	report = hdev->report_enum[HID_FEATURE_REPORT].report_id_hash[id];
+	if (!report)
+		return 0;
+	return hid_report_len(report);
+}
+
+static u8 asus_lamparray_rid(struct asus_drvdata *drvdata, u8 offset)
+{
+	return drvdata->lamparray_rid_base + offset;
+}
+
+static int asus_lamparray_raw(struct asus_drvdata *drvdata, u8 *buf, size_t len,
+			      bool get)
+{
+	int ret;
+
+	if (!drvdata->lamparray_hdev || !len)
+		return -ENODEV;
+
+	ret = hid_hw_raw_request(drvdata->lamparray_hdev, buf[0], buf, len,
+				 HID_FEATURE_REPORT,
+				 get ? HID_REQ_GET_REPORT : HID_REQ_SET_REPORT);
+	return ret < 0 ? ret : 0;
+}
+
+static void asus_lamparray_prepare(struct asus_drvdata *drvdata, u8 rid)
+{
+	memset(drvdata->lamparray_buf, 0, drvdata->lamparray_buf_len);
+	drvdata->lamparray_buf[0] = rid;
+}
+
+static struct hid_device *asus_find_lamparray_sibling(struct hid_device *hdev)
+{
+	struct usb_interface *intf;
+	struct usb_device *udev;
+	struct usb_host_config *config;
+	unsigned int i;
+
+	if (!hid_is_usb(hdev))
+		return NULL;
+
+	intf = to_usb_interface(hdev->dev.parent);
+	udev = interface_to_usbdev(intf);
+	if (!udev->actconfig)
+		return NULL;
+
+	config = udev->actconfig;
+	for (i = 0; i < config->desc.bNumInterfaces; i++) {
+		struct usb_interface *other = config->interface[i];
+		struct hid_device *other_hdev;
+
+		if (!other || other == intf)
+			continue;
+		if (!other->dev.driver || other->dev.driver != intf->dev.driver)
+			continue;
+
+		other_hdev = usb_get_intfdata(other);
+		if (!other_hdev)
+			continue;
+		if (other_hdev->vendor != hdev->vendor ||
+		    other_hdev->product != hdev->product)
+			continue;
+		if (asus_is_lamparray_interface(other_hdev))
+			return other_hdev;
+	}
+
+	return NULL;
+}
+
+static void asus_lamparray_unbind_from_owners(struct hid_device *la_hdev)
+{
+	struct usb_interface *intf;
+	struct usb_device *udev;
+	struct usb_host_config *config;
+	unsigned int i;
+
+	if (!hid_is_usb(la_hdev))
+		return;
+
+	intf = to_usb_interface(la_hdev->dev.parent);
+	udev = interface_to_usbdev(intf);
+	if (!udev->actconfig)
+		return;
+
+	config = udev->actconfig;
+	for (i = 0; i < config->desc.bNumInterfaces; i++) {
+		struct usb_interface *other = config->interface[i];
+		struct hid_device *other_hdev;
+		struct asus_drvdata *owner;
+
+		if (!other || other == intf)
+			continue;
+		if (!other->dev.driver || other->dev.driver != intf->dev.driver)
+			continue;
+
+		other_hdev = usb_get_intfdata(other);
+		if (!other_hdev || other_hdev->driver != la_hdev->driver)
+			continue;
+
+		owner = hid_get_drvdata(other_hdev);
+		if (!owner)
+			continue;
+
+		mutex_lock(&owner->aura_lock);
+		if (owner->lamparray_hdev == la_hdev) {
+			owner->lamparray_controlled = false;
+			owner->lamparray_count = 0;
+			owner->lamparray_lamps = NULL;
+			owner->lamparray_hdev = NULL;
+			owner->lamparray_unavailable = true;
+			mutex_unlock(&owner->aura_lock);
+			put_device(&la_hdev->dev);
+			return;
+		}
+		mutex_unlock(&owner->aura_lock);
+	}
+}
+
+static int asus_lamparray_cmp_x(const void *a, const void *b)
+{
+	const struct asus_lamparray_lamp *la = a;
+	const struct asus_lamparray_lamp *lb = b;
+
+	return cmp_int(la->x, lb->x);
+}
+
+static int asus_lamparray_init_from_hdev(struct asus_drvdata *drvdata,
+					 struct hid_device *la_hdev)
+{
+	u8 *buf;
+	size_t attr_len, req_len, resp_len, multi_len, ctrl_len, max_len;
+	unsigned int count, i;
+	int base, ret;
+
+	base = asus_lamparray_detect_base(la_hdev);
+	if (base < 0)
+		return base;
+
+	attr_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_ATTR);
+	req_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_REQUEST);
+	resp_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_RESPONSE);
+	multi_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_MULTI);
+	ctrl_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_CONTROL);
+	max_len = max3(max(attr_len, req_len), max(resp_len, multi_len), ctrl_len);
+	if (attr_len < 3 || req_len < 3 || resp_len < 23 || multi_len < 51 ||
+	    ctrl_len < 2 || !max_len)
+		return -EPROTO;
+
+	buf = devm_kzalloc(&drvdata->hdev->dev, max_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	drvdata->lamparray_hdev = la_hdev;
+	drvdata->lamparray_buf = buf;
+	drvdata->lamparray_buf_len = max_len;
+	drvdata->lamparray_rid_base = base;
+
+	asus_lamparray_prepare(drvdata, base + ASUS_LAMPARRAY_RID_ATTR);
+	ret = asus_lamparray_raw(drvdata, buf, attr_len, true);
+	if (ret < 0)
+		return ret;
+
+	count = get_unaligned_le16(buf + 1);
+	if (!count || count > ASUS_LAMPARRAY_MAX_LAMPS)
+		return -EPROTO;
+
+	drvdata->lamparray_lamps = devm_kcalloc(&drvdata->hdev->dev, count,
+						sizeof(*drvdata->lamparray_lamps),
+						GFP_KERNEL);
+	if (!drvdata->lamparray_lamps)
+		return -ENOMEM;
+
+	for (i = 0; i < count; i++) {
+		u32 purposes;
+
+		asus_lamparray_prepare(drvdata, base + ASUS_LAMPARRAY_RID_REQUEST);
+		put_unaligned_le16(i, buf + 1);
+		ret = asus_lamparray_raw(drvdata, buf, req_len, false);
+		if (ret < 0)
+			return ret;
+
+		asus_lamparray_prepare(drvdata, base + ASUS_LAMPARRAY_RID_RESPONSE);
+		ret = asus_lamparray_raw(drvdata, buf, resp_len, true);
+		if (ret < 0)
+			return ret;
+
+		/* LampId@1, PositionX@3, LampPurposes@19 (HID Lighting) */
+		drvdata->lamparray_lamps[i].id = get_unaligned_le16(buf + 1);
+		drvdata->lamparray_lamps[i].x = (s32)get_unaligned_le32(buf + 3);
+		purposes = get_unaligned_le32(buf + 19);
+		drvdata->lamparray_lamps[i].keyboard =
+			!!(purposes & ASUS_LAMPARRAY_PURPOSE_CONTROL);
+	}
+
+	drvdata->lamparray_count = count;
+	sort(drvdata->lamparray_lamps, count, sizeof(*drvdata->lamparray_lamps),
+	     asus_lamparray_cmp_x, NULL);
+	get_device(&la_hdev->dev);
+	hid_info(drvdata->hdev,
+		 "LampArray direct RGB backend (%u lamps, rid_base=0x%02x)\n",
+		 count, base);
+	return 0;
+}
+
+static void asus_lamparray_try_init_unlocked(struct asus_drvdata *drvdata)
+{
+	struct hid_device *sibling;
+	int ret;
+
+	if (drvdata->lamparray_count || drvdata->lamparray_unavailable)
+		return;
+
+	sibling = asus_find_lamparray_sibling(drvdata->hdev);
+	if (!sibling)
+		return;
+
+	ret = asus_lamparray_init_from_hdev(drvdata, sibling);
+	if (ret < 0) {
+		hid_warn(drvdata->hdev, "LampArray init failed: %d\n", ret);
+		drvdata->lamparray_hdev = NULL;
+		drvdata->lamparray_lamps = NULL;
+		drvdata->lamparray_count = 0;
+		drvdata->lamparray_unavailable = true;
+	}
+}
+
+static int asus_lamparray_set_control_unlocked(struct asus_drvdata *drvdata,
+					       bool autonomous)
+{
+	u8 rid = asus_lamparray_rid(drvdata, ASUS_LAMPARRAY_RID_CONTROL);
+	size_t len = asus_lamparray_report_len(drvdata->lamparray_hdev, rid);
+
+	if (len < 2)
+		return -EPROTO;
+
+	asus_lamparray_prepare(drvdata, rid);
+	drvdata->lamparray_buf[1] = autonomous ? 0x01 : 0x00;
+	return asus_lamparray_raw(drvdata, drvdata->lamparray_buf, len, false);
+}
+
+static int asus_lamparray_aura_handoff_unlocked(struct asus_drvdata *drvdata,
+						u8 zone, bool release)
+{
+	u8 aura[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_ZONE_ENABLE,
+		zone,
+		0x01,
+	};
+
+	if (release)
+		aura[4] = 0x01;
+
+	return asus_aura_set_feature_unlocked(drvdata, aura, sizeof(aura));
+}
+
+static int asus_lamparray_take_control_unlocked(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	if (drvdata->lamparray_controlled)
+		return 0;
+
+	ret = asus_lamparray_aura_handoff_unlocked(drvdata,
+						   AURA_ZONE_ACTIVATE_LAMPARRAY,
+						   false);
+	if (ret < 0)
+		return ret;
+
+	/* Match G-Helper: pulse then clear AutonomousMode for host control */
+	ret = asus_lamparray_set_control_unlocked(drvdata, true);
+	if (ret < 0)
+		return ret;
+	ret = asus_lamparray_set_control_unlocked(drvdata, false);
+	if (ret < 0)
+		return ret;
+
+	drvdata->lamparray_controlled = true;
+	return 0;
+}
+
+static void asus_lamparray_release_unlocked(struct asus_drvdata *drvdata)
+{
+	if (!drvdata->lamparray_count || !drvdata->lamparray_controlled)
+		return;
+
+	asus_lamparray_set_control_unlocked(drvdata, true);
+	asus_lamparray_aura_handoff_unlocked(drvdata,
+					     AURA_ZONE_RELEASE_LAMPARRAY,
+					     true);
+	drvdata->lamparray_controlled = false;
+}
+
+static void asus_lamparray_sample_rgb(const u8 *buf, unsigned int nleds,
+				      unsigned int idx, unsigned int n,
+				      u8 *r, u8 *g, u8 *b)
+{
+	unsigned int zi;
+
+	if (!buf || !nleds || !n) {
+		*r = *g = *b = 0;
+		return;
+	}
+
+	zi = (idx * nleds) / n;
+	if (zi >= nleds)
+		zi = nleds - 1;
+	*r = buf[zi * 3];
+	*g = buf[zi * 3 + 1];
+	*b = buf[zi * 3 + 2];
+}
+
+static void asus_lamparray_fill_solid(u8 *buf, unsigned int nleds,
+				      u8 r, u8 g, u8 b)
+{
+	unsigned int i;
+
+	for (i = 0; i < nleds; i++) {
+		buf[i * 3 + 0] = r;
+		buf[i * 3 + 1] = g;
+		buf[i * 3 + 2] = b;
+	}
+}
+
+static unsigned int asus_aura_lb_led_count(struct asus_drvdata *drvdata)
+{
+	return drvdata->is_strix_4zone ? ROG_STRIX_4ZONE_LIGHTBAR_LEDS :
+					 ROG_STRIX_LIGHTBAR_LEDS;
+}
+
+/*
+ * Update only the lamps for one zone. MultiUpdate lists those lamp ids, so
+ * the other zone keeps whatever the controller already shows. The direct
+ * buffers start empty; they are not prefilled red.
+ */
+static int asus_lamparray_apply_unlocked(struct asus_drvdata *drvdata,
+					 bool keyboard)
+{
+	unsigned int match[ASUS_LAMPARRAY_MAX_LAMPS];
+	unsigned int nmatch = 0, idx = 0, i;
+	unsigned int src_leds;
+	const u8 *src;
+	u8 *buf = drvdata->lamparray_buf;
+	u8 rid_multi = asus_lamparray_rid(drvdata, ASUS_LAMPARRAY_RID_MULTI);
+	size_t multi_len;
+	int ret;
+
+	for (i = 0; i < drvdata->lamparray_count; i++) {
+		if (drvdata->lamparray_lamps[i].keyboard == keyboard)
+			match[nmatch++] = i;
+	}
+	/*
+	 * No lamps for this zone: let callers fall back to Aura 0xBC.
+	 * Check before take_control so an empty match does not claim the
+	 * LampArray sibling and then report success.
+	 */
+	if (!nmatch)
+		return -ENODEV;
+
+	ret = asus_lamparray_take_control_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	src = keyboard ? drvdata->kbd_direct_buf : drvdata->lb_direct_buf;
+	src_leds = keyboard ? ROG_STRIX_4ZONE_KBD_LEDS :
+			      asus_aura_lb_led_count(drvdata);
+
+	multi_len = asus_lamparray_report_len(drvdata->lamparray_hdev, rid_multi);
+	if (multi_len < 51)
+		return -EPROTO;
+
+	for (i = 0; i < nmatch; i += ASUS_LAMPARRAY_MULTI_MAX) {
+		unsigned int n = min_t(unsigned int, ASUS_LAMPARRAY_MULTI_MAX,
+				       nmatch - i);
+		unsigned int j;
+		unsigned int id_off = 3;
+		unsigned int col_off = 3 + ASUS_LAMPARRAY_MULTI_MAX * 2;
+
+		asus_lamparray_prepare(drvdata, rid_multi);
+		buf[1] = n;
+		buf[2] = (i + n >= nmatch) ? ASUS_LAMPARRAY_FLAG_COMPLETE : 0;
+
+		for (j = 0; j < n; j++) {
+			unsigned int lamp = match[i + j];
+			u8 r, g, b;
+			u16 id = drvdata->lamparray_lamps[lamp].id;
+
+			asus_lamparray_sample_rgb(src, src_leds, idx++, nmatch,
+						  &r, &g, &b);
+			put_unaligned_le16(id, buf + id_off + j * 2);
+			buf[col_off + j * 4 + 0] = r;
+			buf[col_off + j * 4 + 1] = g;
+			buf[col_off + j * 4 + 2] = b;
+			buf[col_off + j * 4 + 3] = 0xff;
+		}
+
+		ret = asus_lamparray_raw(drvdata, buf, multi_len, false);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+/* Prefer LampArray; callers keep Aura 0xBC as fallback on -ENODEV. */
+static int asus_lamparray_try_apply_unlocked(struct asus_drvdata *drvdata,
+					     bool keyboard)
+{
+	asus_lamparray_try_init_unlocked(drvdata);
+	if (!drvdata->lamparray_count)
+		return -ENODEV;
+	return asus_lamparray_apply_unlocked(drvdata, keyboard);
+}
+
+static int asus_aura_write_4zone_direct_bc_unlocked(struct asus_drvdata *drvdata)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE];
+
+	memset(buf, 0, sizeof(buf));
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	buf[1] = AURA_CMD_DIRECT;
+	buf[2] = AURA_DIRECT_FRAME_ZONED;
+	buf[3] = AURA_DIRECT_ROUTING_DEFAULT;
+	buf[4] = AURA_ZONE_LIGHTBAR_CHANNEL;
+	if (drvdata->kbd_direct_valid)
+		memcpy(&buf[ROG_STRIX_4ZONE_DIRECT_KBD_OFFSET],
+		       drvdata->kbd_direct_buf,
+		       sizeof(drvdata->kbd_direct_buf));
+	if (drvdata->lb_direct_valid)
+		memcpy(&buf[ROG_STRIX_4ZONE_DIRECT_LB_OFFSET],
+		       drvdata->lb_direct_buf,
+		       ROG_STRIX_4ZONE_LIGHTBAR_BUF_SIZE);
+
+	return asus_aura_set_feature_unlocked(drvdata, buf, sizeof(buf));
+}
+
+/*
+ * Push a cached direct-RGB frame for one zone. LampArray MultiUpdate keeps the
+ * sibling zone untouched; the 4-zone 0xBC fallback rewrites both zone slots
+ * from the cached buffers.
+ */
+static int asus_aura_push_direct_unlocked(struct asus_drvdata *drvdata,
+					  bool keyboard)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE];
+	size_t payload_len;
+	int ret;
+
+	if (keyboard) {
+		if (!drvdata->kbd_direct_valid)
+			return 0;
+	} else if (!drvdata->lb_direct_valid) {
+		return 0;
+	}
+
+	ret = asus_lamparray_try_apply_unlocked(drvdata, keyboard);
+	if (ret != -ENODEV)
+		return ret;
+
+	if (drvdata->is_strix_4zone)
+		return asus_aura_write_4zone_direct_bc_unlocked(drvdata);
+
+	/* Per-key keyboard frames are not retained in kbd_direct_buf. */
+	if (keyboard)
+		return 0;
+
+	payload_len = asus_aura_lb_led_count(drvdata) * 3;
+	payload_len = min_t(size_t, payload_len, ROG_STRIX_LIGHTBAR_BUF_SIZE);
+
+	memset(buf, 0, sizeof(buf));
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	buf[1] = AURA_CMD_DIRECT;
+	buf[2] = AURA_DIRECT_FRAME_PERKEY;
+	buf[3] = AURA_DIRECT_ROUTING_DEFAULT;
+	buf[4] = AURA_ZONE_LIGHTBAR_CHANNEL;
+	buf[5] = AURA_DIRECT_CHUNK_FLAG;
+	buf[6] = 0x00;
+	buf[7] = (u8)(payload_len / 3);
+	memcpy(&buf[ROG_STRIX_PERKEY_DIRECT_PAYLOAD_OFFSET],
+	       drvdata->lb_direct_buf, payload_len);
+
+	return asus_aura_set_feature_unlocked(drvdata, buf, sizeof(buf));
+}
+
+static int asus_aura_strix_write_direct(struct asus_drvdata *drvdata,
+					const u8 *buffer, size_t size)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE];
+	unsigned int i;
+	int ret;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	if (drvdata->is_strix_4zone) {
+		unsigned int leds = min_t(size_t, size / 3,
+					  ROG_STRIX_4ZONE_KBD_LEDS);
+
+		if (buffer != drvdata->kbd_direct_buf)
+			memcpy(drvdata->kbd_direct_buf, buffer, leds * 3);
+		drvdata->kbd_direct_valid = true;
+
+		ret = asus_lamparray_try_apply_unlocked(drvdata, true);
+		if (ret != -ENODEV)
+			return ret;
+
+		return asus_aura_write_4zone_direct_bc_unlocked(drvdata);
+	}
+
+	/*
+	 * Stream ROG Strix per-key matrix in 16-LED chunks using
+	 * Aura HID Feature Reports with opcode 0xbc:
+	 * [0]    = Report ID (0x5d)
+	 * [1]    = Direct frame command (0xbc)
+	 * [2..5] = Routing header (0x00, 0x01, 0x01, 0x01)
+	 * [6]    = Start LED index (0, 16, 32, ..., 160)
+	 * [7]    = Number of LEDs in chunk (16 for chunks 0..9, 8 for chunk 10)
+	 * [8]    = Reserved / 0x00
+	 * [9..]  = RGB payload (3 bytes per LED)
+	 *
+	 * Total LEDs: 168 (11 packets). Strictly terminate at packet 10;
+	 * sending a 12th packet triggers a firmware defect that shuts off the
+	 * rear and front lightbars. No 0xb4 commit command is issued for raw
+	 * direct frames to avoid stepping hardware animation registers.
+	 */
+	for (i = 0; i < ROG_STRIX_DIRECT_LEDS; i += ROG_STRIX_LEDS_PER_PKT) {
+		unsigned int leds = min_t(unsigned int, ROG_STRIX_DIRECT_LEDS - i,
+					  ROG_STRIX_LEDS_PER_PKT);
+		size_t payload_len = leds * 3;
+
+		memset(buf, 0, sizeof(buf));
+		buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+		buf[1] = AURA_CMD_DIRECT;
+		buf[2] = AURA_DIRECT_FRAME_PERKEY;
+		buf[3] = AURA_DIRECT_ROUTING_DEFAULT;
+		buf[4] = AURA_ZONE_KEYBOARD_CHANNEL;
+		buf[5] = AURA_DIRECT_CHUNK_FLAG;
+		buf[6] = (u8)i;
+		buf[7] = (u8)leds;
+		buf[8] = 0x00;
+		memcpy(&buf[ROG_STRIX_PERKEY_DIRECT_PAYLOAD_OFFSET],
+		       buffer + (i * 3), payload_len);
+
+		ret = asus_aura_set_feature_unlocked(drvdata, buf, sizeof(buf));
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static bool asus_aura_is_lightbar(struct asus_drvdata *drvdata,
+				  struct led_classdev_dynamic *ldev)
+{
+	return ldev == &drvdata->dldev_lightbar;
+}
+
+static int asus_aura_write_zone_range(struct asus_drvdata *drvdata,
+				      u8 zone_first, u8 zone_last,
+				      u8 aura_effect, u8 r, u8 g, u8 b,
+				      u8 speed, u8 direction,
+				      u8 r2, u8 g2, u8 b2)
+{
+	u8 z;
+	int ret;
+
+	for (z = zone_first; z <= zone_last; z++) {
+		ret = asus_aura_write_zone_effect(drvdata, z, aura_effect,
+						  r, g, b, speed, direction,
+						  r2, g2, b2, false);
+		if (ret < 0)
+			return ret;
+	}
+
+	return asus_aura_commit(drvdata);
+}
+
+static int asus_aura_strix_set_direct(struct led_classdev_dynamic *ldev,
+				      const u8 *buffer, size_t size)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	int ret;
+
+	if (size != ldev->led_count * 3)
+		return -EINVAL;
+
+	if (!led_dynamic_effect_is(ldev, "direct")) {
+		ret = asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_KEYBOARD);
+		if (ret < 0)
+			return ret;
+	}
+
+	return asus_aura_strix_write_direct(drvdata, buffer, size);
+}
+
+static int asus_aura_lightbar_write_packet(struct asus_drvdata *drvdata,
+					   const u8 *buffer, size_t size)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE];
+	size_t payload_len;
+	int ret;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	if (drvdata->is_strix_4zone) {
+		unsigned int leds = min_t(size_t, size / 3,
+					  ROG_STRIX_4ZONE_LIGHTBAR_LEDS);
+
+		if (buffer != drvdata->lb_direct_buf)
+			memcpy(drvdata->lb_direct_buf, buffer, leds * 3);
+		drvdata->lb_direct_valid = true;
+
+		ret = asus_lamparray_try_apply_unlocked(drvdata, false);
+		if (ret != -ENODEV)
+			return ret;
+
+		return asus_aura_write_4zone_direct_bc_unlocked(drvdata);
+	}
+
+	payload_len = min_t(size_t, size, ROG_STRIX_LIGHTBAR_BUF_SIZE);
+
+	/*
+	 * Per-Key models use buf[2] = 0x00 (chunked packet), so the MCU
+	 * expects valid chunk headers in bytes 5-7. Without them it reads
+	 * "0 LEDs to update" and silently drops the packet.
+	 */
+	memset(buf, 0, sizeof(buf));
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	buf[1] = AURA_CMD_DIRECT;
+	buf[2] = AURA_DIRECT_FRAME_PERKEY;
+	buf[3] = AURA_DIRECT_ROUTING_DEFAULT;
+	buf[4] = AURA_ZONE_LIGHTBAR_CHANNEL;
+	buf[5] = AURA_DIRECT_CHUNK_FLAG;
+	buf[6] = 0x00;             /* start LED index */
+	buf[7] = (u8)(payload_len / 3); /* number of LEDs in this packet */
+
+	if (buffer != drvdata->lb_direct_buf)
+		memcpy(drvdata->lb_direct_buf, buffer, payload_len);
+	drvdata->lb_direct_valid = true;
+	memcpy(&buf[ROG_STRIX_PERKEY_DIRECT_PAYLOAD_OFFSET],
+	       drvdata->lb_direct_buf, payload_len);
+
+	return asus_aura_set_feature_unlocked(drvdata, buf, sizeof(buf));
+}
+
+static int asus_aura_lightbar_set_direct(struct led_classdev_dynamic *ldev,
+					 const u8 *buffer, size_t size)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	int ret;
+
+	if (size != ldev->led_count * 3)
+		return -EINVAL;
+
+	if (!led_dynamic_effect_is(ldev, "direct")) {
+		ret = asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_LIGHTBAR);
+		if (ret < 0)
+			return ret;
+	}
+
+	return asus_aura_lightbar_write_packet(drvdata, buffer, size);
+}
+
+/*
+ * Commit a firmware effect with the color stored in the palette. Brightness
+ * and enabled do not scale or clear this packet: 0xb3 is what the controller
+ * keeps across reboot, so it must stay the unscaled color.
+ */
+static bool asus_aura_zone_wants_direct(struct asus_drvdata *drvdata,
+					bool keyboard)
+{
+	struct led_classdev_dynamic *ldev = keyboard ? &drvdata->dldev_kbd :
+						      &drvdata->dldev_lightbar;
+	bool registered = keyboard ? drvdata->has_dldev_kbd :
+				     drvdata->has_dldev_lightbar;
+
+	return registered && ldev->enabled &&
+	       led_dynamic_effect_is(ldev, "direct");
+}
+
+static int asus_aura_commit_effect(struct led_classdev_dynamic *ldev,
+				   const char *name, unsigned int speed,
+				   enum dl_direction direction,
+				   const struct dl_rgb *palette,
+				   unsigned int num_entries)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	bool lightbar = asus_aura_is_lightbar(drvdata, ldev);
+	u8 aura_mode;
+	u8 r = 0, g = 0, b = 0;
+	u8 r2 = 0, g2 = 0, b2 = 0;
+	int ret;
+
+	if (name && !strcmp(name, "direct")) {
+		guard(mutex)(&drvdata->aura_lock);
+
+		return asus_aura_push_direct_unlocked(drvdata, !lightbar);
+	}
+
+	if (asus_aura_hw_mode_from_name(name, &aura_mode))
+		return -EINVAL;
+
+	if (palette && num_entries > 0) {
+		r = palette[0].r;
+		g = palette[0].g;
+		b = palette[0].b;
+		if (num_entries > 1) {
+			r2 = palette[1].r;
+			g2 = palette[1].g;
+			b2 = palette[1].b;
+		}
+	}
+
+	/*
+	 * Static and animations are firmware effects: commit them with 0xb3
+	 * so the controller keeps the color across reboot. LampArray stays
+	 * the direct-RGB backend and must be released first. Re-apply the
+	 * sibling zone afterwards if it is still in host direct mode.
+	 */
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		asus_lamparray_try_init_unlocked(drvdata);
+		if (drvdata->lamparray_count)
+			asus_lamparray_release_unlocked(drvdata);
+	}
+
+	if (lightbar)
+		ret = asus_aura_write_zone_range(drvdata, AURA_ZONE_BAR_LEFT,
+						 AURA_ZONE_BAR_RIGHT, aura_mode,
+						 r, g, b,
+						 asus_aura_speed_to_hw(speed),
+						 asus_aura_direction_to_hw(direction),
+						 r2, g2, b2);
+	else if (drvdata->is_strix_4zone)
+		ret = asus_aura_write_zone_range(drvdata, AURA_ZONE_KEY1,
+						 AURA_ZONE_KEY4, aura_mode,
+						 r, g, b,
+						 asus_aura_speed_to_hw(speed),
+						 asus_aura_direction_to_hw(direction),
+						 r2, g2, b2);
+	else
+		ret = asus_aura_write_zone_effect(drvdata, AURA_ZONE_ALL,
+						  aura_mode, r, g, b,
+						  asus_aura_speed_to_hw(speed),
+						  asus_aura_direction_to_hw(direction),
+						  r2, g2, b2, true);
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * Release above drops LampArray for every zone. If the sibling is
+	 * still in direct mode, push its cached frame again so host control
+	 * is not lost when this zone switches to a firmware effect.
+	 */
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		if (asus_aura_zone_wants_direct(drvdata, lightbar)) {
+			ret = asus_aura_push_direct_unlocked(drvdata, lightbar);
+			if (ret < 0)
+				return ret;
+		}
+	}
+
+	asus_aura_mark_effect_set(drvdata, ldev);
+	return 0;
+}
+
+static int asus_aura_apply_effect(struct led_classdev_dynamic *ldev)
+{
+	return asus_aura_commit_effect(ldev, led_dynamic_effect_name(ldev),
+				       ldev->speed, ldev->direction,
+				       ldev->palette, ldev->num_palette_entries);
+}
+
+static void asus_aura_restore(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	if (!drvdata->kbd_effect_set && !drvdata->lightbar_effect_set &&
+	    !drvdata->kbd_direct_valid && !drvdata->lb_direct_valid)
+		return;
+
+	ret = asus_aura_activate_zones(drvdata);
+	if (ret < 0)
+		hid_warn(drvdata->hdev, "Failed to activate Aura zones: %d\n", ret);
+
+	if (drvdata->has_dldev_kbd && drvdata->dldev_kbd.enabled &&
+	    ((led_dynamic_effect_is(&drvdata->dldev_kbd, "direct") &&
+	      drvdata->kbd_direct_valid) ||
+	     (!led_dynamic_effect_is(&drvdata->dldev_kbd, "direct") &&
+	      drvdata->kbd_effect_set))) {
+		ret = asus_aura_apply_effect(&drvdata->dldev_kbd);
+		if (ret < 0)
+			hid_warn(drvdata->hdev,
+				 "Failed to restore keyboard effect: %d\n", ret);
+	}
+	if (drvdata->has_dldev_lightbar && drvdata->dldev_lightbar.enabled &&
+	    ((led_dynamic_effect_is(&drvdata->dldev_lightbar, "direct") &&
+	      drvdata->lb_direct_valid) ||
+	     (!led_dynamic_effect_is(&drvdata->dldev_lightbar, "direct") &&
+	      drvdata->lightbar_effect_set))) {
+		ret = asus_aura_apply_effect(&drvdata->dldev_lightbar);
+		if (ret < 0)
+			hid_warn(drvdata->hdev,
+				 "Failed to restore lightbar effect: %d\n", ret);
+	}
+}
+
+static int asus_aura_set_effect(struct led_classdev_dynamic *ldev,
+				unsigned int index)
+{
+	if (!ldev->enabled)
+		return 0;
+
+	if (index >= ldev->num_effects)
+		return -EINVAL;
+
+	return asus_aura_commit_effect(ldev, ldev->effects[index],
+				       ldev->speed, ldev->direction,
+				       ldev->palette, ldev->num_palette_entries);
+}
+
+static int asus_aura_sync_power(struct asus_drvdata *drvdata,
+				struct led_classdev_dynamic *which,
+				bool enabled, u32 states);
+
+static int asus_aura_set_enabled(struct led_classdev_dynamic *ldev, bool enabled)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	bool lightbar = asus_aura_is_lightbar(drvdata, ldev);
+	int ret;
+
+	ret = asus_aura_sync_power(drvdata, ldev, enabled,
+				   ldev->active_power_states);
+	if (ret < 0)
+		return ret;
+
+	if (!enabled) {
+		/*
+		 * Core updates ldev->enabled only after this callback returns.
+		 * Blank the zone under LampArray/direct control, then release
+		 * host control when the sibling does not still need it.
+		 */
+		guard(mutex)(&drvdata->aura_lock);
+
+		if (drvdata->lamparray_controlled ||
+		    (lightbar ? drvdata->lb_direct_valid :
+				drvdata->kbd_direct_valid)) {
+			if (lightbar) {
+				memset(drvdata->lb_direct_buf, 0,
+				       sizeof(drvdata->lb_direct_buf));
+				drvdata->lb_direct_valid = true;
+			} else {
+				memset(drvdata->kbd_direct_buf, 0,
+				       sizeof(drvdata->kbd_direct_buf));
+				drvdata->kbd_direct_valid = true;
+			}
+
+			ret = asus_aura_push_direct_unlocked(drvdata, !lightbar);
+			if (ret < 0)
+				return ret;
+
+			if (lightbar)
+				drvdata->lb_direct_valid = false;
+			else
+				drvdata->kbd_direct_valid = false;
+
+			if (!asus_aura_zone_wants_direct(drvdata, lightbar))
+				asus_lamparray_release_unlocked(drvdata);
+		}
+		return 0;
+	}
+
+	return asus_aura_apply_effect(ldev);
+}
+
+static int asus_aura_set_speed(struct led_classdev_dynamic *ldev,
+			       unsigned int speed)
+{
+	if (!ldev->enabled)
+		return 0;
+
+	return asus_aura_commit_effect(ldev, led_dynamic_effect_name(ldev),
+				       speed, ldev->direction,
+				       ldev->palette, ldev->num_palette_entries);
+}
+
+static int asus_aura_set_direction(struct led_classdev_dynamic *ldev,
+				   enum dl_direction direction)
+{
+	if (!ldev->enabled)
+		return 0;
+
+	return asus_aura_commit_effect(ldev, led_dynamic_effect_name(ldev),
+				       ldev->speed, direction,
+				       ldev->palette, ldev->num_palette_entries);
+}
+
+static int asus_aura_set_palette(struct led_classdev_dynamic *ldev,
+				 const struct dl_rgb *palette,
+				 unsigned int num_entries)
+{
+	if (!palette || !num_entries || num_entries > ldev->max_palette_entries)
+		return -EINVAL;
+
+	if (!ldev->enabled)
+		return 0;
+
+	return asus_aura_commit_effect(ldev, led_dynamic_effect_name(ldev),
+				       ldev->speed, ldev->direction,
+				       palette, num_entries);
+}
+
+static int asus_aura_brightness_set_blocking(struct led_classdev *cdev,
+					     enum led_brightness brightness)
+{
+	struct led_classdev_dynamic *ldev = lcdev_to_dldev(cdev);
+	struct asus_drvdata *drvdata = ldev->driver_data;
+
+	guard(mutex)(&ldev->lock);
+
+	/*
+	 * Firmware backlight only. Zone power belongs to enabled. brightness
+	 * 0 must not gate the zone: led_trigger_remove() calls this with
+	 * LED_OFF, and the persisted 0xb3 color stays in place.
+	 */
+	if (ldev == &drvdata->dldev_kbd)
+		asus_kbd_set_brightness(drvdata->hdev, brightness);
+
+	return 0;
+}
+
+static void asus_aura_power_bits(u32 states, u8 *kbd, u8 *lightbar)
+{
+	*kbd = 0;
+	*lightbar = 0;
+
+	if (states & DL_POWER_STATE_BOOT) {
+		*kbd |= AURA_POWER_KBD_BOOT | AURA_POWER_LOGO_BOOT;
+		*lightbar |= AURA_POWER_LB_BOOT;
+	}
+	if (states & DL_POWER_STATE_AWAKE) {
+		*kbd |= AURA_POWER_KBD_AWAKE | AURA_POWER_LOGO_AWAKE;
+		*lightbar |= AURA_POWER_LB_AWAKE;
+	}
+	if (states & DL_POWER_STATE_SLEEP) {
+		*kbd |= AURA_POWER_KBD_SLEEP | AURA_POWER_LOGO_SLEEP;
+		*lightbar |= AURA_POWER_LB_SLEEP;
+	}
+	if (states & DL_POWER_STATE_SHUTDOWN) {
+		*kbd |= AURA_POWER_KBD_SHUTDOWN | AURA_POWER_LOGO_SHUTDOWN;
+		*lightbar |= AURA_POWER_LB_SHUTDOWN;
+	}
+}
+
+static int asus_aura_write_power_unlocked(struct asus_drvdata *drvdata,
+					  u8 kbd, u8 lightbar)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_POWER,
+		AURA_POWER_CMD_ENABLE,
+	};
+
+	/*
+	 * Logo bits are already in @kbd and track the keyboard states.
+	 * Lid and rear stay enabled so unmanaged zones are not gated off.
+	 */
+	buf[3] = kbd;
+	buf[4] = drvdata->has_lightbar ? lightbar : 0;
+	buf[5] = AURA_POWER_MASK_LID_ALL;
+	buf[6] = AURA_POWER_MASK_REAR_ALL;
+
+	return asus_aura_set_feature_unlocked(drvdata, buf, sizeof(buf));
+}
+
+static int asus_aura_sync_power(struct asus_drvdata *drvdata,
+				struct led_classdev_dynamic *which,
+				bool enabled, u32 states)
+{
+	u8 kbd = 0, lightbar = 0, unused;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	if (which == &drvdata->dldev_kbd) {
+		drvdata->kbd_power_on = enabled;
+		drvdata->kbd_power_states = states;
+	} else if (which == &drvdata->dldev_lightbar) {
+		drvdata->lb_power_on = enabled;
+		drvdata->lb_power_states = states;
+	}
+
+	if (drvdata->kbd_power_on)
+		asus_aura_power_bits(drvdata->kbd_power_states, &kbd, &unused);
+	if (drvdata->lb_power_on)
+		asus_aura_power_bits(drvdata->lb_power_states, &unused, &lightbar);
+
+	return asus_aura_write_power_unlocked(drvdata, kbd, lightbar);
+}
+
+static int asus_aura_set_power_states(struct led_classdev_dynamic *ldev,
+				      u32 active_states)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+
+	return asus_aura_sync_power(drvdata, ldev, ldev->enabled, active_states);
+}
+
+static const struct led_dynamic_ops asus_aura_ops = {
+	.set_effect	= asus_aura_set_effect,
+	.set_speed	= asus_aura_set_speed,
+	.set_direction	= asus_aura_set_direction,
+	.set_palette	= asus_aura_set_palette,
+	.set_enabled	= asus_aura_set_enabled,
+	.set_power_states = asus_aura_set_power_states,
+	.direct_write	= asus_aura_strix_set_direct,
+};
+
+static const struct led_dynamic_ops asus_aura_lightbar_ops = {
+	.set_effect	= asus_aura_set_effect,
+	.set_speed	= asus_aura_set_speed,
+	.set_direction	= asus_aura_set_direction,
+	.set_palette	= asus_aura_set_palette,
+	.set_enabled	= asus_aura_set_enabled,
+	.set_power_states = asus_aura_set_power_states,
+	.direct_write	= asus_aura_lightbar_set_direct,
+};
+
+static int asus_aura_discover(struct asus_drvdata *drvdata, bool *has_lightbar,
+			      bool *is_strix_4zone, bool *is_per_key)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_PROBE,
+		0x20,
+		0x31,
+		0x00,
+		0x20,
+	};
+	int ret;
+
+	*has_lightbar = false;
+	*is_strix_4zone = false;
+	*is_per_key = false;
+
+	/*
+	 * Query hardware configuration via Report 0x5D opcode 0x05.
+	 * Byte 9 describes the keyboard layout class (0x02 = 4-zone,
+	 * 0x03 = per-key) and byte 13 is the physical-region bitmap
+	 * (bit 1 = lightbar present).
+	 */
+	ret = asus_aura_set_feature(drvdata, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+
+	memset(buf, 0, sizeof(buf));
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	ret = asus_aura_get_feature(drvdata, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+
+	if (ret < 14)
+		return -EPROTO;
+
+	if (buf[1] != AURA_CMD_PROBE || buf[2] != 0x20 || buf[3] != 0x31)
+		return -ENODEV;
+
+	*is_strix_4zone = (buf[9] == 0x02);
+	*is_per_key = (buf[9] == 0x03);
+	*has_lightbar = !!(buf[13] & 0x02);
+
+	return 0;
+}
+
+static const struct asus_slash_mode {
+	const char *name;
+	u8 mode;
+} asus_slash_modes[] = {
+	{ "Static", 0x06 },
+	{ "Bounce", 0x10 },
+	{ "Slash", 0x12 },
+	{ "Loading", 0x13 },
+	{ "BitStream", 0x1d },
+	{ "Transmission", 0x1a },
+	{ "Flow", 0x19 },
+	{ "Flux", 0x25 },
+	{ "Phantom", 0x24 },
+	{ "Spectrum", 0x26 },
+	{ "Hazard", 0x32 },
+	{ "Interfacing", 0x33 },
+	{ "Ramp", 0x34 },
+	{ "GameOver", 0x42 },
+	{ "Start", 0x43 },
+	{ "Buzzer", 0x44 },
+};
+
+static inline u8 asus_slash_report_id(struct asus_drvdata *drvdata)
+{
+	if (asus_has_report_id(drvdata->hdev, FEATURE_KBD_LED_REPORT_ID2))
+		return FEATURE_KBD_LED_REPORT_ID2;
+	return FEATURE_KBD_LED_REPORT_ID1;
+}
+
+static int asus_slash_init_unlocked(struct asus_drvdata *drvdata)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt1[] = { rpt, 0xd7, 0x00, 0x00, 0x01, 0xac };
+	u8 pkt2[] = { rpt, 0xd2, 0x02, 0x01, 0x08, 0xab };
+	int ret;
+
+	ret = asus_aura_set_feature_unlocked(drvdata, pkt1, sizeof(pkt1));
+	if (ret < 0)
+		return ret;
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt2, sizeof(pkt2));
+}
+
+static int asus_slash_set_options_unlocked(struct asus_drvdata *drvdata, bool enabled,
+					   u8 brightness, u8 interval)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt[] = {
+		rpt, 0xd3, 0x03, 0x01, 0x08, 0xab, 0xff, 0x01,
+		enabled ? 1 : 0, 0x06, brightness, 0xff, interval
+	};
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt, sizeof(pkt));
+}
+
+static int asus_slash_set_mode_unlocked(struct asus_drvdata *drvdata, u8 mode)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt1[] = { rpt, 0xd2, 0x03, 0x00, 0x0c };
+	u8 pkt2[] = {
+		rpt, 0xd3, 0x04, 0x00, 0x0c, 0x01, mode, 0x02,
+		0x19, 0x03, 0x13, 0x04, 0x11, 0x05, 0x12, 0x06, 0x13
+	};
+	int ret;
+
+	ret = asus_aura_set_feature_unlocked(drvdata, pkt1, sizeof(pkt1));
+	if (ret < 0)
+		return ret;
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt2, sizeof(pkt2));
+}
+
+static int asus_slash_save_unlocked(struct asus_drvdata *drvdata)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt[] = { rpt, 0xd4, 0x00, 0x00, 0x01, 0xab };
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt, sizeof(pkt));
+}
+
+static int asus_slash_brightness_set_blocking(struct led_classdev *led_cdev,
+					      enum led_brightness brightness)
+{
+	struct asus_drvdata *drvdata = container_of(led_cdev, struct asus_drvdata, slash_led);
+	int ret;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	drvdata->slash_brightness = brightness;
+	ret = asus_slash_set_options_unlocked(drvdata, brightness > 0, (u8)brightness,
+					      drvdata->slash_interval);
+	if (ret < 0)
+		return ret;
+
+	return asus_slash_save_unlocked(drvdata);
+}
+
+static ssize_t slash_mode_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_slash_modes); i++) {
+		if (asus_slash_modes[i].mode == drvdata->slash_mode)
+			return sysfs_emit(buf, "%s\n", asus_slash_modes[i].name);
+	}
+
+	return sysfs_emit(buf, "0x%02x\n", drvdata->slash_mode);
+}
+
+static ssize_t slash_mode_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	char mode_str[32];
+	unsigned int i;
+	u8 mode_val = 0;
+	int ret;
+
+	if (sscanf(buf, "%31s", mode_str) != 1)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(asus_slash_modes); i++) {
+		if (sysfs_streq(mode_str, asus_slash_modes[i].name)) {
+			mode_val = asus_slash_modes[i].mode;
+			break;
+		}
+	}
+
+	if (!mode_val) {
+		if (kstrtou8(mode_str, 0, &mode_val))
+			return -EINVAL;
+	}
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	ret = asus_slash_set_mode_unlocked(drvdata, mode_val);
+	if (ret < 0)
+		return ret;
+
+	ret = asus_slash_save_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	drvdata->slash_mode = mode_val;
+	return count;
+}
+static DEVICE_ATTR_RW(slash_mode);
+
+static ssize_t slash_mode_index_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf,
+			  "Static Bounce Slash Loading BitStream Transmission Flow Flux Phantom Spectrum Hazard Interfacing Ramp GameOver Start Buzzer\n");
+}
+static DEVICE_ATTR_RO(slash_mode_index);
+
+static ssize_t slash_interval_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+
+	return sysfs_emit(buf, "%u\n", drvdata->slash_interval);
+}
+
+static ssize_t slash_interval_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	u8 interval;
+	int ret;
+
+	if (kstrtou8(buf, 0, &interval))
+		return -EINVAL;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	drvdata->slash_interval = interval;
+	ret = asus_slash_set_options_unlocked(drvdata, drvdata->slash_brightness > 0,
+					      drvdata->slash_brightness, interval);
+	if (ret < 0)
+		return ret;
+
+	ret = asus_slash_save_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(slash_interval);
+
+static struct attribute *asus_slash_attrs[] = {
+	&dev_attr_slash_mode.attr,
+	&dev_attr_slash_mode_index.attr,
+	&dev_attr_slash_interval.attr,
+	NULL,
+};
+
+static const struct attribute_group asus_slash_group = {
+	.attrs = asus_slash_attrs,
+};
+
+static const struct attribute_group *asus_slash_groups[] = {
+	&asus_slash_group,
+	NULL,
+};
+
+static int asus_init_slash(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	int ret;
+
+	if (!asus_device_has_slash(hdev))
+		return 0;
+
+	drvdata->slash_led.name = "asus::slash";
+	drvdata->slash_led.max_brightness = 255;
+	drvdata->slash_led.brightness = 255;
+	drvdata->slash_led.brightness_set_blocking = asus_slash_brightness_set_blocking;
+	drvdata->slash_led.groups = asus_slash_groups;
+
+	drvdata->slash_brightness = 255;
+	drvdata->slash_interval = 0;
+
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		ret = asus_slash_init_unlocked(drvdata);
+		if (ret < 0) {
+			hid_warn(hdev, "Failed to initialize Slash lighting: %d\n", ret);
+			return ret;
+		}
+	}
+
+	ret = devm_led_classdev_register(&hdev->dev, &drvdata->slash_led);
+	if (ret < 0) {
+		hid_warn(hdev, "Failed to register Slash LED classdev: %d\n", ret);
+		return ret;
+	}
+
+	drvdata->has_slash_led = true;
+	hid_info(hdev, "Registered Slash lighting LED: asus::slash\n");
+
+	return 0;
+}
+
+static void asus_aura_dldev_set_default_palette(struct led_classdev_dynamic *ldev,
+						struct dl_rgb *palette)
+{
+	ldev->palette = palette;
+	palette[0].r = 255;
+	palette[0].g = 0;
+	palette[0].b = 0;
+	ldev->num_palette_entries = 1;
+}
+
+static void asus_aura_dldev_common_init(struct led_classdev_dynamic *ldev,
+					struct asus_drvdata *drvdata,
+					const char *name,
+					const struct led_dynamic_ops *ops,
+					const char **effects,
+					unsigned int num_effects)
+{
+	unsigned int i;
+
+	ldev->cdev.name = name;
+	ldev->cdev.max_brightness = 255;
+	ldev->cdev.brightness = 255;
+	ldev->cdev.brightness_set_blocking = asus_aura_brightness_set_blocking;
+	ldev->ops = ops;
+	ldev->driver_data = drvdata;
+	ldev->speed = 1;
+	ldev->speed_min = 0;
+	ldev->speed_max = 2;
+	ldev->direction = DL_DIRECTION_RIGHT;
+	ldev->supported_directions = BIT(DL_DIRECTION_RIGHT) |
+				     BIT(DL_DIRECTION_LEFT);
+	ldev->max_palette_entries = 2;
+	ldev->enabled = true;
+	ldev->effects = (const char * const *)effects;
+	ldev->num_effects = num_effects;
+	ldev->current_effect = 0;
+	for (i = 0; i < num_effects; i++) {
+		if (!strcmp(effects[i], "static")) {
+			ldev->current_effect = i;
+			break;
+		}
+	}
+	ldev->supported_power_states = DL_POWER_STATE_ALL;
+	ldev->active_power_states = DL_POWER_STATE_ALL;
+}
+
+static int asus_aura_effect_index(struct led_classdev_dynamic *ldev, u8 hw_mode)
+{
+	const char *name = NULL;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_aura_effect_map); i++) {
+		if (asus_aura_effect_map[i].hw_mode == hw_mode) {
+			name = asus_aura_effect_map[i].name;
+			break;
+		}
+	}
+	if (!name)
+		return -1;
+
+	for (i = 0; i < ldev->num_effects; i++) {
+		if (!strcmp(ldev->effects[i], name))
+			return i;
+	}
+
+	return -1;
+}
+
+static void asus_aura_apply_boot_levels(struct led_classdev_dynamic *ldev,
+					struct asus_drvdata *drvdata)
+{
+	ldev->speed = asus_aura_speed_from_hw(drvdata->boot_speed);
+	ldev->direction = asus_aura_direction_from_hw(drvdata->boot_direction);
+
+	if (ldev->supported_directions &&
+	    !(ldev->supported_directions & BIT(ldev->direction)))
+		ldev->direction = DL_DIRECTION_RIGHT;
+}
+
+static bool asus_aura_adopt_node(struct asus_drvdata *drvdata,
+				 struct led_classdev_dynamic *ldev)
+{
+	int idx;
+
+	if (!ldev->palette)
+		return false;
+
+	idx = asus_aura_effect_index(ldev, drvdata->boot_mode);
+	if (idx < 0)
+		return false;
+
+	ldev->current_effect = idx;
+	ldev->palette[0].r = drvdata->boot_r;
+	ldev->palette[0].g = drvdata->boot_g;
+	ldev->palette[0].b = drvdata->boot_b;
+	ldev->num_palette_entries = 1;
+	if (drvdata->boot_r2 || drvdata->boot_g2 || drvdata->boot_b2) {
+		ldev->palette[1].r = drvdata->boot_r2;
+		ldev->palette[1].g = drvdata->boot_g2;
+		ldev->palette[1].b = drvdata->boot_b2;
+		ldev->num_palette_entries = 2;
+	}
+	asus_aura_apply_boot_levels(ldev, drvdata);
+	return true;
+}
+
+static bool asus_aura_adopt_boot_effect(struct asus_drvdata *drvdata)
+{
+	u8 zone = drvdata->boot_zone;
+	bool kbd = zone == AURA_ZONE_ALL ||
+		   (zone >= AURA_ZONE_KEY1 && zone <= AURA_ZONE_KEY4);
+	bool lightbar = zone == AURA_ZONE_ALL ||
+			zone == AURA_ZONE_BAR_LEFT ||
+			zone == AURA_ZONE_BAR_RIGHT;
+	bool any = false;
+
+	if (kbd && drvdata->dldev_kbd.palette &&
+	    asus_aura_adopt_node(drvdata, &drvdata->dldev_kbd)) {
+		drvdata->kbd_effect_set = true;
+		any = true;
+	}
+
+	if (lightbar && drvdata->dldev_lightbar.palette &&
+	    asus_aura_adopt_node(drvdata, &drvdata->dldev_lightbar)) {
+		drvdata->lightbar_effect_set = true;
+		any = true;
+	}
+
+	if (kbd && drvdata->kbd_effect_set) {
+		asus_lamparray_fill_solid(drvdata->kbd_direct_buf,
+					  ROG_STRIX_4ZONE_KBD_LEDS,
+					  drvdata->boot_r, drvdata->boot_g,
+					  drvdata->boot_b);
+		drvdata->kbd_direct_valid = true;
+	}
+	if (lightbar && drvdata->lightbar_effect_set) {
+		asus_lamparray_fill_solid(drvdata->lb_direct_buf,
+					  asus_aura_lb_led_count(drvdata),
+					  drvdata->boot_r, drvdata->boot_g,
+					  drvdata->boot_b);
+		drvdata->lb_direct_valid = true;
+	}
+
+	return any;
+}
+
+static int asus_init_dynamic_lighting(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	unsigned int kbd_n, lightbar_n;
+	u8 effect_mask[2];
+	const u8 *mask = NULL;
+	bool is_per_key = false;
+	bool has_lightbar = false;
+	bool kbd_direct;
+	bool lightbar_direct;
+	int ret;
+
+	ret = asus_aura_discover(drvdata, &has_lightbar, &drvdata->is_strix_4zone,
+				 &is_per_key);
+	if (ret == -ENODEV)
+		return 0;
+	if (ret < 0) {
+		hid_warn(hdev, "Aura device discovery failed: %d\n", ret);
+		return 0;
+	}
+
+	drvdata->has_lightbar = has_lightbar;
+
+	ret = asus_aura_wake_all_zones(drvdata);
+	if (ret < 0)
+		hid_warn(hdev, "Failed to wake Aura hardware zones: %d\n", ret);
+
+	scoped_guard(mutex, &drvdata->aura_lock)
+		asus_lamparray_try_init_unlocked(drvdata);
+
+	kbd_direct = is_per_key || drvdata->is_strix_4zone ||
+		     drvdata->lamparray_hdev;
+	lightbar_direct = has_lightbar;
+	ret = asus_aura_get_effect_mask(drvdata, effect_mask);
+	if (ret < 0) {
+		hid_warn(hdev,
+			 "Aura 0x9e capability probe failed: %d, using fallback effect list\n",
+			 ret);
+	} else {
+		mask = effect_mask;
+		hid_info(hdev, "Aura effect capability mask %02x %02x\n",
+			 effect_mask[0], effect_mask[1]);
+	}
+
+	kbd_n = asus_aura_fill_effects(drvdata->effects_kbd, mask, kbd_direct);
+	lightbar_n = asus_aura_fill_effects(drvdata->effects_lightbar, mask,
+					    lightbar_direct);
+
+	/* Keyboard Dynamic Lighting zone: always registered on Aura models. */
+	asus_aura_dldev_common_init(&drvdata->dldev_kbd, drvdata, "asus::keyboard",
+				    &asus_aura_ops,
+				    drvdata->effects_kbd, kbd_n);
+	asus_aura_dldev_set_default_palette(&drvdata->dldev_kbd,
+					    drvdata->kbd_palette);
+	drvdata->kbd_power_on = true;
+	drvdata->kbd_power_states = DL_POWER_STATE_ALL;
+	if (kbd_direct) {
+		drvdata->dldev_kbd.zone_type = drvdata->is_strix_4zone ?
+			"keyboard" : "keyboard_per_key";
+		drvdata->dldev_kbd.led_count = drvdata->is_strix_4zone ?
+			ROG_STRIX_4ZONE_KBD_LEDS : ROG_STRIX_DIRECT_LEDS;
+	} else {
+		drvdata->dldev_kbd.zone_type = "keyboard";
+		if (drvdata->is_strix_4zone)
+			drvdata->dldev_kbd.led_count = ROG_STRIX_4ZONE_KBD_LEDS;
+	}
+
+	if (has_lightbar) {
+		asus_aura_dldev_common_init(&drvdata->dldev_lightbar, drvdata,
+					    "asus::lightbar",
+					    &asus_aura_lightbar_ops,
+					    drvdata->effects_lightbar, lightbar_n);
+		drvdata->dldev_lightbar.zone_type = "lightbar";
+		drvdata->dldev_lightbar.led_count = asus_aura_lb_led_count(drvdata);
+		asus_aura_dldev_set_default_palette(&drvdata->dldev_lightbar,
+						    drvdata->lightbar_palette);
+		drvdata->lb_power_on = true;
+		drvdata->lb_power_states = DL_POWER_STATE_ALL;
+	}
+
+	/*
+	 * Adopt or keep the default palette before sysfs exists, so a
+	 * concurrent reader cannot observe a half-initialized node.
+	 */
+	if (drvdata->boot_effect_valid)
+		asus_aura_adopt_boot_effect(drvdata);
+
+	ret = devm_led_classdev_dynamic_register(&hdev->dev, &drvdata->dldev_kbd);
+	if (ret < 0) {
+		hid_warn(hdev, "Failed to register kbd dynamic lighting: %d\n", ret);
+		return ret;
+	}
+	drvdata->has_dldev_kbd = true;
+
+	if (has_lightbar) {
+		ret = devm_led_classdev_dynamic_register(&hdev->dev,
+							 &drvdata->dldev_lightbar);
+		if (ret < 0) {
+			hid_warn(hdev, "Failed to register lightbar dynamic lighting: %d\n",
+				 ret);
+		} else {
+			drvdata->has_dldev_lightbar = true;
+		}
+	}
+
+	hid_info(hdev, "Registered dynamic lighting zones: kbd=%d, lightbar=%d\n",
+		 drvdata->has_dldev_kbd, drvdata->has_dldev_lightbar);
+
+	if (drvdata->boot_effect_valid &&
+	    (drvdata->kbd_effect_set || drvdata->lightbar_effect_set))
+		hid_info(hdev, "Preserving programmed Aura effect\n");
+	else
+		hid_info(hdev, "Leaving Aura controller state unchanged\n");
+
+	return 0;
+}
+
+static unsigned int asus_anime_led_count(enum asus_anime_type type)
+{
+	switch (type) {
+	case ASUS_ANIME_GA401:
+		return ASUS_ANIME_PANE_LEN * 2;
+	case ASUS_ANIME_G635L:
+	case ASUS_ANIME_G835L:
+		return 810;
+	case ASUS_ANIME_GA402:
+	case ASUS_ANIME_GU604:
+	case ASUS_ANIME_UNKNOWN:
+	default:
+		/* Safe GA402-like 3-pane layout for unknown AniMe boards. */
+		return ASUS_ANIME_PANE_LEN * 3;
+	}
+}
+
+static unsigned int asus_anime_pane_count(enum asus_anime_type type)
+{
+	switch (type) {
+	case ASUS_ANIME_GA401:
+	case ASUS_ANIME_G635L:
+	case ASUS_ANIME_G835L:
+		return 2;
+	default:
+		return 3;
+	}
+}
+
+static void asus_anime_fill_prefix(enum asus_anime_type type, unsigned int pane,
+				   u8 *hdr)
+{
+	static const u8 ga_pfx[3][7] = {
+		{ 0x5e, 0xc0, 0x02, 0x01, 0x00, 0x73, 0x02 },
+		{ 0x5e, 0xc0, 0x02, 0x74, 0x02, 0x73, 0x02 },
+		{ 0x5e, 0xc0, 0x02, 0xe7, 0x04, 0x73, 0x02 },
+	};
+	static const u8 strix_pfx[2][7] = {
+		{ 0x5e, 0xc0, 0x02, 0x01, 0x00, 0xea, 0x01 },
+		{ 0x5e, 0xc0, 0x02, 0xeb, 0x01, 0x40, 0x01 },
+	};
+
+	if (type == ASUS_ANIME_G635L || type == ASUS_ANIME_G835L) {
+		memcpy(hdr, strix_pfx[min_t(unsigned int, pane, 1)], 7);
+		return;
+	}
+
+	memcpy(hdr, ga_pfx[min_t(unsigned int, pane, 2)], 7);
+}
+
+static int asus_anime_write(struct asus_drvdata *drvdata, u8 *buf, size_t len)
+{
+	int ret;
+
+	if (!buf || len < 1 || len > ASUS_ANIME_PACKET_SIZE)
+		return -EINVAL;
+
+	ret = hid_hw_raw_request(drvdata->hdev, buf[0], buf, len,
+				 HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+static int asus_anime_clear_pkt(struct asus_drvdata *drvdata)
+{
+	memset(drvdata->anime_buf, 0, ASUS_ANIME_PACKET_SIZE);
+	drvdata->anime_buf[0] = FEATURE_KBD_LED_REPORT_ID2;
+	return 0;
+}
+
+static int asus_anime_init_device(struct asus_drvdata *drvdata)
+{
+	static const char *asus_tech = "ASUS Tech.Inc.";
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	memcpy(drvdata->anime_buf + 1, asus_tech, strlen(asus_tech));
+	ret = asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+	if (ret < 0)
+		return ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc2;
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_flush(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc0;
+	drvdata->anime_buf[2] = 0x03;
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_set_brightness(struct asus_drvdata *drvdata, u8 brightness)
+{
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc0;
+	drvdata->anime_buf[2] = 0x04;
+	drvdata->anime_buf[3] = brightness;
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_set_display(struct asus_drvdata *drvdata, bool enabled)
+{
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc3;
+	drvdata->anime_buf[2] = 0x01;
+	drvdata->anime_buf[3] = enabled ? 0x00 : 0x80;
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_set_powersave_anim(struct asus_drvdata *drvdata, bool enabled)
+{
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc4;
+	drvdata->anime_buf[2] = 0x01;
+	drvdata->anime_buf[3] = enabled ? 0x00 : 0x80;
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_commit_builtins(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc5;
+	drvdata->anime_buf[2] = drvdata->anime_awake |
+				(drvdata->anime_sleep << 1) |
+				(drvdata->anime_shutdown << 2) |
+				(drvdata->anime_boot << 3);
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_write_frame(struct asus_drvdata *drvdata,
+				  const u8 *data, size_t len)
+{
+	unsigned int panes = asus_anime_pane_count(drvdata->anime_type);
+	unsigned int pane, offset = 0;
+	int ret;
+
+	if (len != asus_anime_led_count(drvdata->anime_type))
+		return -EINVAL;
+
+	for (pane = 0; pane < panes; pane++) {
+		unsigned int chunk;
+
+		ret = asus_anime_clear_pkt(drvdata);
+		if (ret)
+			return ret;
+
+		asus_anime_fill_prefix(drvdata->anime_type, pane,
+				       drvdata->anime_buf);
+
+		if (drvdata->anime_type == ASUS_ANIME_G635L ||
+		    drvdata->anime_type == ASUS_ANIME_G835L) {
+			chunk = pane ? (len - ASUS_ANIME_STRIX_PANE1_LEN) :
+				       ASUS_ANIME_STRIX_PANE1_LEN;
+		} else {
+			chunk = min_t(unsigned int, ASUS_ANIME_PANE_LEN, len - offset);
+		}
+
+		if (offset + chunk > len)
+			return -EINVAL;
+
+		memcpy(drvdata->anime_buf + ASUS_ANIME_BLOCK_START,
+		       data + offset, chunk);
+		offset += chunk;
+
+		ret = asus_anime_write(drvdata, drvdata->anime_buf,
+				       ASUS_ANIME_PACKET_SIZE);
+		if (ret < 0)
+			return ret;
+	}
+
+	return asus_anime_flush(drvdata);
+}
+
+static const char * const asus_anime_effect_names[] = {
+	"direct",
+	"glitch_construction",
+	"static_emergence",
+	"binary_banner_scroll",
+	"rog_logo_glitch",
+	"banner_swipe",
+	"starfield",
+	"glitch_out",
+	"see_ya",
+};
+
+static int asus_anime_apply_effect_unlocked(struct asus_drvdata *drvdata,
+					    unsigned int index)
+{
+	int ret;
+
+	if (index >= ARRAY_SIZE(asus_anime_effect_names))
+		return -EINVAL;
+
+	if (index == 0) {
+		drvdata->anime_builtin = false;
+		return asus_anime_set_powersave_anim(drvdata, false);
+	}
+
+	switch (index) {
+	case 1:
+		drvdata->anime_boot = 0;
+		break;
+	case 2:
+		drvdata->anime_boot = 1;
+		break;
+	case 3:
+		drvdata->anime_awake = 0;
+		break;
+	case 4:
+		drvdata->anime_awake = 1;
+		break;
+	case 5:
+		drvdata->anime_sleep = 0;
+		break;
+	case 6:
+		drvdata->anime_sleep = 1;
+		break;
+	case 7:
+		drvdata->anime_shutdown = 0;
+		break;
+	case 8:
+		drvdata->anime_shutdown = 1;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	drvdata->anime_builtin = true;
+	ret = asus_anime_commit_builtins(drvdata);
+	if (ret < 0)
+		return ret;
+
+	return asus_anime_set_powersave_anim(drvdata, true);
+}
+
+static int asus_anime_set_effect(struct led_classdev_dynamic *ldev,
+				 unsigned int index)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+
+	guard(mutex)(&drvdata->aura_lock);
+	return asus_anime_apply_effect_unlocked(drvdata, index);
+}
+
+static int asus_anime_set_enabled(struct led_classdev_dynamic *ldev, bool enabled)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+
+	guard(mutex)(&drvdata->aura_lock);
+	return asus_anime_set_display(drvdata, enabled);
+}
+
+static int asus_anime_direct_write(struct led_classdev_dynamic *ldev,
+				   const u8 *buffer, size_t size)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	int ret;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	ret = asus_anime_write_frame(drvdata, buffer, size);
+	if (ret < 0)
+		return ret;
+
+	drvdata->anime_builtin = false;
+	return asus_anime_set_powersave_anim(drvdata, false);
+}
+
+static int asus_anime_brightness_set(struct led_classdev *cdev,
+				     enum led_brightness brightness)
+{
+	struct led_classdev_dynamic *ldev = lcdev_to_dldev(cdev);
+	struct asus_drvdata *drvdata = ldev->driver_data;
+
+	guard(mutex)(&drvdata->aura_lock);
+	return asus_anime_set_brightness(drvdata, brightness);
+}
+
+static const struct led_dynamic_ops asus_anime_ops = {
+	.set_effect = asus_anime_set_effect,
+	.set_enabled = asus_anime_set_enabled,
+	.direct_write = asus_anime_direct_write,
+};
+
+static int asus_init_anime(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct led_classdev_dynamic *ldev = &drvdata->dldev_anime;
+	unsigned int i, led_count;
+	int ret;
+
+	if (asus_classify_pid_193b(hdev) != ASUS_PID_193B_ANIME)
+		return 0;
+
+	drvdata->anime_buf = devm_kzalloc(&hdev->dev, ASUS_ANIME_PACKET_SIZE,
+					  GFP_KERNEL);
+	if (!drvdata->anime_buf)
+		return -ENOMEM;
+
+	drvdata->anime_type = asus_anime_type_from_dmi();
+	if (drvdata->anime_type == ASUS_ANIME_UNKNOWN) {
+		drvdata->anime_type = ASUS_ANIME_GA402;
+		hid_info(hdev,
+			 "AniMe Matrix on unknown board; using GA402-like 3-pane layout\n");
+	}
+
+	led_count = asus_anime_led_count(drvdata->anime_type);
+
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		ret = asus_anime_init_device(drvdata);
+		if (ret < 0) {
+			hid_warn(hdev, "AniMe Matrix init failed: %d\n", ret);
+			return ret;
+		}
+
+		ret = asus_anime_set_display(drvdata, true);
+		if (ret < 0)
+			return ret;
+
+		ret = asus_anime_set_brightness(drvdata, 2);
+		if (ret < 0)
+			return ret;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(asus_anime_effect_names); i++)
+		drvdata->effects_anime[i] = asus_anime_effect_names[i];
+
+	ldev->cdev.name = "asus::anime";
+	ldev->cdev.max_brightness = 3;
+	ldev->cdev.brightness = 2;
+	ldev->cdev.brightness_set_blocking = asus_anime_brightness_set;
+	ldev->ops = &asus_anime_ops;
+	ldev->driver_data = drvdata;
+	ldev->zone_type = "matrix";
+	ldev->led_count = led_count;
+	ldev->direct_sample_size = 1;
+	ldev->effects = drvdata->effects_anime;
+	ldev->num_effects = ARRAY_SIZE(asus_anime_effect_names);
+	ldev->current_effect = 0;
+	ldev->enabled = true;
+
+	ret = devm_led_classdev_dynamic_register(&hdev->dev, ldev);
+	if (ret < 0) {
+		hid_warn(hdev, "Failed to register AniMe Dynamic Lighting: %d\n",
+			 ret);
+		return ret;
+	}
+
+	drvdata->has_dldev_anime = true;
+	hid_info(hdev,
+		 "Registered AniMe Matrix Dynamic Lighting (%u LEDs, type %u)\n",
+		 led_count, drvdata->anime_type);
+	return 0;
+}
+
+#else /* !IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC) */
+
+static inline int asus_init_dynamic_lighting(struct hid_device *hdev)
+{
+	return 0;
+}
+
+static inline int asus_init_slash(struct hid_device *hdev)
+{
+	return 0;
+}
+
+static inline int asus_init_anime(struct hid_device *hdev)
+{
+	return 0;
+}
+
+static inline void asus_aura_capture_boot_effect(struct hid_device *hdev)
+{
+}
+
+#endif /* IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC) */
 
 /*
  * [0]       REPORT_ID (same value defined in report descriptor)
@@ -7577,7 +4144,6 @@ static int asus_input_mapping(struct hid_device *hdev,
 		case 0x5f: asus_map_key_clear(KEY_PROG2);	break; /* S-shaped programmable key */
 		case 0x6b: asus_map_key_clear(KEY_F21);		break; /* ASUS touchpad toggle */
 		case 0x38: asus_map_key_clear(KEY_PROG1);	break; /* ROG key */
-		case 0x93: asus_map_key_clear(KEY_PROG1);	break; /* ROG Ally X AC button */
 		case 0xba: asus_map_key_clear(KEY_PROG2);	break; /* Fn+C ASUS Splendid */
 		case 0x5c: asus_map_key_clear(KEY_PROG3);	break; /* Fn+Space Power4Gear */
 		case 0x99: asus_map_key_clear(KEY_PROG4);	break; /* Fn+F5 "fan" symbol */
@@ -7591,8 +4157,7 @@ static int asus_input_mapping(struct hid_device *hdev,
 		case 0xa6: asus_map_key_clear(KEY_F16);		break; /* ROG Ally QAM button */
 		case 0xa7: asus_map_key_clear(KEY_F17);		break; /* ROG Ally ROG long-press */
 		case 0xa8: asus_map_key_clear(KEY_F18);		break; /* ROG Ally ROG long-press-release */
-		case 0xa0:
-		case 0xa4: asus_map_key_clear(KEY_RECORD);	break; /* ROG Xbox Ally X Share button (tap/hold) */
+		case 0x9c: asus_map_key_clear(KEY_F19);		break; /* Zephyrus Duo tent mode */
 
 		default:
 			/* ASUS lazily declares 256 usages, ignore the rest,
@@ -7686,33 +4251,14 @@ static int asus_start_multitouch(struct hid_device *hdev)
 	return 0;
 }
 
-/*
- * Initialize the reports of the device.
- *
- * Failures are intentionally not fatal: asus_kbd_init() tolerates a wrong
- * handshake until this is verified to work for all devices, so a failure
- * is only reported and the initialization of the remaining reports is
- * still attempted.
- */
-static void asus_initialize_reports(struct hid_device *hdev)
-{
-	int ret;
-
-	for (int r = 0; r < ARRAY_SIZE(asus_report_id_init); r++) {
-		if (asus_has_report_id(hdev, asus_report_id_init[r])) {
-			ret = asus_kbd_init(hdev, asus_report_id_init[r]);
-			if (ret < 0)
-				hid_warn(hdev, "Failed to initialize 0x%x: %d.\n",
-					 asus_report_id_init[r], ret);
-		}
-	}
-}
-
 static int __maybe_unused asus_resume(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	struct ally_handheld *ally = drvdata->rog_ally;
-	int ep;
+
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (drvdata->has_dldev_kbd || drvdata->has_dldev_lightbar)
+		asus_aura_restore(drvdata);
+#endif
 
 	/*
 	 * If we have a backlight listener registered, restore the previous state,
@@ -7722,39 +4268,20 @@ static int __maybe_unused asus_resume(struct hid_device *hdev)
 	if (drvdata->listener.brightness_set)
 		asus_kbd_backlight_set(&drvdata->listener, drvdata->kbd_backlight_brightness);
 
-	if (ally && (drvdata->quirks & QUIRK_ROG_ALLY_XPAD)) {
-		ep = ally_get_endpoint_address(hdev);
-		if (ep == HID_ALLY_INTF_CFG_IN)
-			schedule_delayed_work(&ally->resume_work, msecs_to_jiffies(500));
-	}
-
-	asus_usb_rgb_resume(drvdata->usb_rgb_dev);
-	ally_xbox_led_resume(drvdata->xbox_led);
-
 	return 0;
 }
 
 static int __maybe_unused asus_reset_resume(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-	int ret;
 
-	if (!drvdata->tp)
-		asus_initialize_reports(hdev);
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (drvdata->has_dldev_kbd || drvdata->has_dldev_lightbar)
+		asus_aura_restore(drvdata);
+#endif
 
 	if (drvdata->tp)
 		return asus_start_multitouch(hdev);
-
-	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD) {
-		ret = hid_asus_ally_reset_resume(hdev, drvdata->rog_ally);
-		if (ret) {
-			hid_err(hdev, "Failed to resume ROG Ally HID extensions: %d\n", ret);
-			return ret;
-		}
-	}
-
-	asus_usb_rgb_resume(drvdata->usb_rgb_dev);
-	ally_xbox_led_resume(drvdata->xbox_led);
 
 	return 0;
 }
@@ -7763,7 +4290,6 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	struct hid_report_enum *rep_enum;
 	struct asus_drvdata *drvdata;
-	struct ally_handheld *ally;
 	struct hid_report *rep;
 	bool is_vendor = false;
 	int ret;
@@ -7773,6 +4299,17 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return -ENOMEM;
 
 	hid_set_drvdata(hdev, drvdata);
+
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	ret = devm_mutex_init(&hdev->dev, &drvdata->aura_lock);
+	if (ret)
+		return ret;
+
+	drvdata->aura_buf = devm_kzalloc(&hdev->dev, AURA_FEATURE_REPORT_SIZE,
+					 GFP_KERNEL);
+	if (!drvdata->aura_buf)
+		return -ENOMEM;
+#endif
 
 	drvdata->quirks = id->driver_data;
 
@@ -7831,11 +4368,6 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	if (drvdata->quirks & QUIRK_NO_INIT_REPORTS)
 		hdev->quirks |= HID_QUIRK_NO_INIT_REPORTS;
 
-	if ((drvdata->quirks & QUIRK_ROG_ALLY_XPAD) && hid_is_usb(hdev)) {
-		if (ally_get_endpoint_address(hdev) == HID_ALLY_X_INTF_IN)
-			drvdata->quirks |= QUIRK_SKIP_INPUT_MAPPING;
-	}
-
 	drvdata->hdev = hdev;
 
 	if (drvdata->quirks & (QUIRK_T100CHI | QUIRK_T90CHI)) {
@@ -7853,12 +4385,52 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return ret;
 	}
 
+	/*
+	 * USB 0x193b is shared by Slash and AniMe Matrix. LampArray siblings
+	 * bind as usual; otherwise require a positive Slash/AniMe classification.
+	 */
+	if (hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_SLASH &&
+	    !asus_is_lamparray_interface(hdev)) {
+		enum asus_pid_193b_kind kind = asus_classify_pid_193b(hdev);
+
+		if (kind == ASUS_PID_193B_NONE) {
+			hid_dbg(hdev,
+				"Skipping ambiguous 0x193b (not Slash/AniMe)\n");
+			return -ENODEV;
+		}
+	}
+
 	/* Check for vendor for RGB init and handle generic devices properly. */
 	rep_enum = &hdev->report_enum[HID_INPUT_REPORT];
 	list_for_each_entry(rep, &rep_enum->report_list, list) {
 		if ((rep->application & HID_USAGE_PAGE) == HID_UP_ASUSVENDOR)
 			is_vendor = true;
 	}
+
+	/*
+	 * A vendor collection may be the only application collection on the
+	 * interface, which hidinput_connect() otherwise skips, leaving the
+	 * hotkey usages unmapped. Unpopulated inputs are dropped later.
+	 */
+	if (is_vendor && (drvdata->quirks & QUIRK_ROG_NKEY_KEYBOARD))
+		hdev->quirks |= HID_QUIRK_HIDINPUT_FORCE;
+
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	/*
+	 * LampArray is a Dynamic Lighting backend owned in-kernel: do not
+	 * export hidraw for that interface. Aura 0xBC remains the fallback
+	 * when LampArray is absent.
+	 */
+	if (asus_is_lamparray_interface(hdev)) {
+		ret = hid_hw_start(hdev, 0);
+		if (ret) {
+			hid_err(hdev, "Asus LampArray hw start failed: %d\n", ret);
+			return ret;
+		}
+		hid_info(hdev, "Bound ASUS LampArray interface (no hidraw)\n");
+		return 0;
+	}
+#endif
 
 	ret = asus_worker_create(hdev, drvdata);
 	if (ret) {
@@ -7873,47 +4445,50 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return ret;
 	}
 
-	if (!drvdata->tp)
-		asus_initialize_reports(hdev);
+	if (asus_classify_pid_193b(hdev) == ASUS_PID_193B_ANIME) {
+		ret = asus_init_anime(hdev);
+		if (ret < 0)
+			hid_warn(hdev, "Failed to initialize AniMe Matrix: %d\n",
+				 ret);
+	} else {
+		/*
+		 * Read any committed Aura effect before the keyboard handshake
+		 * overwrites the feature report. Skip on AniMe Matrix.
+		 */
+		if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1))
+			asus_aura_capture_boot_effect(hdev);
 
-	/* Laptops keyboard backlight is always at 0x5a */
-	if (is_vendor && (drvdata->quirks & QUIRK_USE_KBD_BACKLIGHT) &&
-	    (asus_has_report_id(hdev, FEATURE_KBD_REPORT_ID)) &&
-		(asus_kbd_register_leds(hdev)))
-		hid_warn(hdev, "Failed to initialize backlight.\n");
-
-	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD) {
-		ally = hid_asus_ally_probe(hdev);
-		if (IS_ERR(ally))
-			hid_err(hdev, "Failed to initialize ROG Ally HID extensions: %ld\n",
-				PTR_ERR(ally));
-		else
-			drvdata->rog_ally = ally;
-	}
-
-	if (is_vendor && (drvdata->quirks & QUIRK_ROG_ALLY_XPAD)) {
-		drvdata->has_xbox_features = ally_check_xbox_led_support(hdev);
-		if (drvdata->has_xbox_features) {
-			drvdata->xbox_led = ally_xbox_led_create(hdev);
-			if (IS_ERR(drvdata->xbox_led)) {
-				hid_warn(hdev, "Failed to create Xbox logo LED: %ld\n",
-					 PTR_ERR(drvdata->xbox_led));
-				drvdata->xbox_led = NULL;
-			} else {
-				hid_dbg(hdev, "Created Xbox logo LED control\n");
+		if (!drvdata->tp) {
+			for (int r = 0; r < ARRAY_SIZE(asus_report_id_init); r++) {
+				if (asus_has_report_id(hdev, asus_report_id_init[r])) {
+					ret = asus_kbd_init(hdev, asus_report_id_init[r]);
+					if (ret < 0)
+						hid_warn(hdev,
+							 "Failed to initialize 0x%x: %d.\n",
+							 asus_report_id_init[r], ret);
+				}
 			}
 		}
-	}
 
-	if (!drvdata->usb_rgb_dev && asus_usb_rgb_can_initialize(drvdata, is_vendor)) {
-		drvdata->usb_rgb_dev = asus_usb_rgb_create(hdev);
-		if (IS_ERR(drvdata->usb_rgb_dev)) {
-			if (PTR_ERR(drvdata->usb_rgb_dev) != -EOPNOTSUPP)
-				hid_warn(hdev, "Failed to create zone RGB controls: %ld\n",
-					 PTR_ERR(drvdata->usb_rgb_dev));
-			drvdata->usb_rgb_dev = NULL;
-		} else {
-			hid_info(hdev, "Created per-zone RGB controls\n");
+		/* Laptops keyboard backlight is always at 0x5a */
+		if (is_vendor && (drvdata->quirks & QUIRK_USE_KBD_BACKLIGHT) &&
+		    (asus_has_report_id(hdev, FEATURE_KBD_REPORT_ID)) &&
+		    (asus_kbd_register_leds(hdev)))
+			hid_warn(hdev, "Failed to initialize backlight.\n");
+
+		if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1) ||
+		    asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2)) {
+			ret = asus_init_dynamic_lighting(hdev);
+			if (ret < 0)
+				hid_warn(hdev,
+					 "Failed to initialize dynamic lighting: %d\n",
+					 ret);
+
+			ret = asus_init_slash(hdev);
+			if (ret < 0)
+				hid_warn(hdev,
+					 "Failed to initialize Slash lighting: %d\n",
+					 ret);
 		}
 	}
 
@@ -7948,19 +4523,6 @@ err_stop_hw:
 	if (drvdata->listener.brightness_set)
 		asus_hid_unregister_listener(&drvdata->listener);
 
-	if (drvdata->usb_rgb_dev) {
-		asus_usb_rgb_remove(drvdata->usb_rgb_dev);
-		drvdata->usb_rgb_dev = NULL;
-	}
-
-	if (drvdata->xbox_led) {
-		ally_xbox_led_remove(drvdata->xbox_led);
-		drvdata->xbox_led = NULL;
-	}
-
-	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD)
-		hid_asus_ally_remove(hdev, drvdata->rog_ally);
-
 	asus_worker_stop(drvdata->worker);
 	hid_hw_stop(hdev);
 	return ret;
@@ -7970,21 +4532,28 @@ static void asus_remove(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 
-	if (drvdata->xbox_led) {
-		ally_xbox_led_remove(drvdata->xbox_led);
-		drvdata->xbox_led = NULL;
-	}
-
-	if (drvdata->usb_rgb_dev) {
-		asus_usb_rgb_remove(drvdata->usb_rgb_dev);
-		drvdata->usb_rgb_dev = NULL;
-	}
-
 	if (drvdata->listener.brightness_set)
 		asus_hid_unregister_listener(&drvdata->listener);
 
-	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD)
-		hid_asus_ally_remove(hdev, drvdata->rog_ally);
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (asus_is_lamparray_interface(hdev)) {
+		asus_lamparray_unbind_from_owners(hdev);
+		hid_hw_stop(hdev);
+		return;
+	}
+	if (drvdata->lamparray_hdev) {
+		struct hid_device *la = NULL;
+
+		scoped_guard(mutex, &drvdata->aura_lock) {
+			asus_lamparray_release_unlocked(drvdata);
+			la = drvdata->lamparray_hdev;
+			drvdata->lamparray_hdev = NULL;
+			drvdata->lamparray_count = 0;
+		}
+		if (la)
+			put_device(&la->dev);
+	}
+#endif
 
 	asus_worker_stop(drvdata->worker);
 	hid_hw_stop(hdev);
@@ -8123,11 +4692,17 @@ static const struct hid_device_id asus_devices[] = {
 	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
+	    USB_DEVICE_ID_ASUSTEK_ROG_SLASH),
+	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_HID_FN_LOCK },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
 	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD2),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_HID_FN_LOCK },
 	{ HID_I2C_DEVICE(USB_VENDOR_ID_ASUSTEK,
 	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD2),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_HID_FN_LOCK },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
+	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD3),
+	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
 	    USB_DEVICE_ID_ASUSTEK_ROG_Z13_LIGHTBAR),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
@@ -8165,6 +4740,9 @@ static const struct hid_device_id asus_devices[] = {
 	 */
 	{ HID_DEVICE(BUS_USB, HID_GROUP_GENERIC,
 		USB_VENDOR_ID_ASUSTEK, USB_DEVICE_ID_ASUSTEK_ROG_Z13_FOLIO),
+	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
+	{ HID_DEVICE(BUS_BLUETOOTH, HID_GROUP_GENERIC,
+		USB_VENDOR_ID_ASUSTEK, USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD3_BT),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
 	{ HID_DEVICE(BUS_USB, HID_GROUP_GENERIC,
 		USB_VENDOR_ID_ASUSTEK, USB_DEVICE_ID_ASUSTEK_T101HA_KEYBOARD) },

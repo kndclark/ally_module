@@ -1,57 +1,34 @@
+# Out-of-tree build of OGC linux-unstable PR #17 (Dynamic Lighting LED class
+# + hid-asus Aura/LampArray) for the SteamOS 7.2.x kernel on the ROG Ally.
+#
+# hid-asus.c, hid-ids.h and led-class-dynamic.c are the PR files; only
+# led-class-dynamic.c and the header carry a marked shim for the
+# led_classdev back-pointer, which an out-of-tree build cannot add to the
+# kernel's struct. See dynlight_compat.h for the two missing defines.
+
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
+obj-m += led-class-dynamic.o
 obj-m += hid-asus.o
 
+# CONFIG_LEDS_CLASS_DYNAMIC is not in the kernel .config; tell the PR code
+# the class is reachable as a module.
+ccflags-y += -I$(src)/include
+ccflags-y += -include $(src)/dynlight_compat.h
+ccflags-y += -DCONFIG_LEDS_CLASS_DYNAMIC_MODULE=1
+
 # asus-wmi-stub exists only for kernels whose asus-wmi does not export the
-# hid-asus listener API. Building it against one that DOES (SteamOS 7.2's
-# asus-wmi exports all three symbols) makes the stub a duplicate GPL export,
-# and modprobe then refuses to insert it - which takes hid-asus down with it,
-# since modules.dep lists the stub as a dependency. Decide per kernel.
+# hid-asus listener API (SteamOS 7.2 does). Decide per kernel.
 STUB_NEEDED := $(shell grep -qE '[[:space:]]asus_hid_register_listener[[:space:]]' \
 	$(KDIR)/Module.symvers 2>/dev/null && echo no || echo yes)
-
 ifeq ($(STUB_NEEDED),yes)
 obj-m += asus-wmi-stub.o
 endif
 
-.PHONY: all audio audio-clean clean configure sync-upstream diff-upstream test
+.PHONY: all clean
 
 all:
-	make -C $(KDIR) M=$(PWD) modules CONFIG_DEBUG_INFO_BTF_MODULES=
-
-audio:
-	$(MAKE) -C audio all KDIR=$(KDIR)
-
-audio-clean:
-	$(MAKE) -C audio clean KDIR=$(KDIR)
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules CONFIG_DEBUG_INFO_BTF_MODULES=
 
 clean:
-	@if [ -d "$(KDIR)" ]; then \
-		make -C $(KDIR) M=$(PWD) clean; \
-	else \
-		echo "Warning: KDIR ($(KDIR)) not found, cleaning local files manually."; \
-		rm -f *.o *.ko *.mod* *.mod *.a .*.cmd *.symvers *.order *.ko.zst; \
-		rm -rf .tmp_versions; \
-	fi
-
-configure:
-	@if ! git remote get-url nero >/dev/null 2>&1; then \
-		echo "Adding remote 'nero'..."; \
-		git remote add nero https://github.com/NeroReflex/linux.git; \
-	fi
-
-sync-upstream: configure
-	@chmod +x ./sync_upstream.sh
-	@./sync_upstream.sh
-
-diff-upstream: configure
-	@git fetch nero
-	@git diff nero/for-next:drivers/hid/hid-asus.c hid-asus.c
-
-	make -C $(KDIR) M=$(PWD) clean
-
-test:
-	@echo " Running Ally X LED Tests...\
- @echo \Note: Tests require root privileges and access to /dev/hidraw2\
- @echo \Please run individual tests manually e.g.:\
- @echo " sudo python3 tests/test_flicker.py /dev/hidraw2\
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
