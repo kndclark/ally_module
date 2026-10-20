@@ -9,3 +9,4 @@
 Module.symvers
 .tmp_versions/
 dynlight-smoke-*.log*
+__pycache__/
