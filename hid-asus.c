@@ -1434,8 +1434,6 @@ static int asus_aura_scan_paths(struct asus_drvdata *drvdata, u8 *slot)
 
 	for (i = 0; i < ARRAY_SIZE(order); i++) {
 		ret = asus_aura_try_path(drvdata, order[i]);
-		hid_info(drvdata->hdev, "DEBUG scan_paths: id=%02x path=%u ret=%d\n",
-			 drvdata->aura_buf[0], order[i], ret);
 		if (ret >= 0) {
 			*slot = order[i];
 			return 0;
@@ -2921,8 +2919,6 @@ static int asus_aura_discover(struct asus_drvdata *drvdata, bool *has_lightbar,
 	 * (bit 1 = lightbar present).
 	 */
 	ret = asus_aura_set_feature(drvdata, buf, sizeof(buf));
-	hid_info(drvdata->hdev, "DEBUG discover: set ret=%d path5d=%u\n",
-		 ret, drvdata->aura_write_5d);
 	if (ret < 0)
 		return ret;
 
@@ -2931,9 +2927,6 @@ static int asus_aura_discover(struct asus_drvdata *drvdata, bool *has_lightbar,
 	ret = asus_aura_get_feature(drvdata, buf, sizeof(buf));
 	if (ret < 0)
 		return ret;
-
-	hid_info(drvdata->hdev, "DEBUG discover: get ret=%d reply=%*ph\n",
-		 ret, 16, buf);
 
 	if (ret < 14)
 		return -EPROTO;
