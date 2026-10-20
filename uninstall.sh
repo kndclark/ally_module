@@ -18,5 +18,6 @@ else
 fi
 sudo rm -f "${DEST}/leds/led-class-dynamic.ko.zst" /etc/modprobe.d/ally-dynlight.conf
 sudo depmod -a "$KVER"
+sync
 sudo modprobe hid_asus
 echo "[dynlight] LED nodes now:"; ls -1 /sys/class/leds/

@@ -42,6 +42,7 @@ if [ -f /usr/bin/steamos-readonly ]; then
     sudo steamos-readonly disable
 fi
 sudo mkdir -p "${DEST}/hid" "${DEST}/leds"
+PREV_SRCVERSION=$(modinfo -F srcversion "$HID_DST" 2>/dev/null || true)
 if [ -f "$HID_DST" ] && [ ! -f "$BACKUP" ]; then
     log "Keeping the current hid-asus.ko.zst as $(basename "$BACKUP")"
     sudo cp -a "$HID_DST" "$BACKUP"
@@ -53,6 +54,21 @@ sudo depmod -a "$KVER"
 # Same arrangement as linux-unstable: hid-asus alone handles the Ally.
 if ! grep -rqsE '^[[:space:]]*blacklist[[:space:]]+hid[-_]asus[-_]ally' /etc/modprobe.d/; then
     echo "blacklist hid_asus_ally" | sudo tee /etc/modprobe.d/ally-dynlight.conf >/dev/null
+fi
+
+# Everything above must be on disk before any module is touched: a crash
+# during the reload (2026-10-19) rolled back the unsynced files and left a
+# modules.dep that named a module which no longer existed.
+sync
+
+# Unloading the ally_module build of hid-asus has crashed the kernel on this
+# machine; only hot-swap when the loaded driver is already one of ours.
+if [ -r /sys/module/hid_asus/srcversion ] && \
+   [ "$(cat /sys/module/hid_asus/srcversion)" != "$(modinfo -F srcversion hid-asus.ko)" ] && \
+   [ "$(cat /sys/module/hid_asus/srcversion)" != "${PREV_SRCVERSION:-}" ]; then
+    log "A different hid-asus build is loaded. Installed and synced; reboot to switch drivers."
+    log "(No hot reload: unloading the ally_module driver has crashed this kernel before.)"
+    exit 0
 fi
 
 log "Reloading hid-asus"
