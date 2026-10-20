@@ -25,14 +25,13 @@ make KDIR="$KDIR"
 # Pre-flight: every undefined symbol must exist in the running kernel or be
 # exported by the sibling module. A missing symbol would fail modprobe at
 # boot and leave the controller without a driver.
-log "Pre-flight symbol check"
-sudo true
+log "Pre-flight symbol check against ${KDIR}/Module.symvers"
 exports=$(nm --defined-only led-class-dynamic.ko hid-asus.ko | awk '$2 ~ /[TD]/ {print $3}')
 for ko in led-class-dynamic.ko hid-asus.ko; do
     for sym in $(nm -u "$ko" | awk '{print $2}'); do
         grep -qw "$sym" <<<"$exports" && continue
-        sudo grep -qE " [TtDdRrBb] ${sym}$| [TtDdRrBb] ${sym}\.[a-z]" /proc/kallsyms && continue
-        [[ "$sym" == __fentry__ || "$sym" == __stack_chk_fail || "$sym" == __x86_* || "$sym" == _printk ]] && continue
+        grep -qE "[[:space:]]${sym}[[:space:]]" "${KDIR}/Module.symvers" && continue
+        [[ "$sym" == __fentry__ || "$sym" == __stack_chk_fail || "$sym" == __x86_* ]] && continue
         error "$ko needs '$sym', which this kernel does not export. Not installing."
     done
 done
