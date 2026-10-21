@@ -98,6 +98,14 @@ rm -f /usr/share/alsa/ucm2/sof-soundwire/tas2783.conf
 rm -f /usr/share/alsa/ucm2/codecs/tas2783/init.conf
 rmdir /usr/share/alsa/ucm2/codecs/tas2783 2>/dev/null || true
 
+# Remove the RC74XA steamos-manager device file (QAM TDP and GPU controls)
+log "Removing steamos-manager RC74XA device file..."
+rm -f /usr/share/steamos-manager/devices/zz-ally-module-rc74xa.toml
+
+# Remove the RC74XA InputPlumber profile (Armoury Crate button's QAM)
+log "Removing InputPlumber RC74XA profile..."
+rm -f /usr/share/inputplumber/devices/zz-ally-module-rc74xa.yaml
+
 # Remove emergency recovery guard service
 log "Removing emergency recovery guard service..."
 rm -f /etc/systemd/system/emergency.target.wants/ally-emergency-recovery.service \

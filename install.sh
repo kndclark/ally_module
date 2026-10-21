@@ -46,7 +46,8 @@ BOARD_NAME=$(cat /sys/devices/virtual/dmi/id/board_name 2>/dev/null || cat /sys/
 PRODUCT_NAME=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
 
 # The stock asus-armoury has power limits for RC73XA only; RC74XA gets
-# -ENODEV on every ppt_* attribute, so TDP control needs our build.
+# -ENODEV on every ppt_* attribute, so TDP control needs our build. Gate B
+# (stock_armoury_match) turns this off once the stock module catches up.
 INSTALL_ARMOURY=false
 if [ -d "platform/asus-armoury" ] && { [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; }; then
     INSTALL_ARMOURY=true
@@ -140,6 +141,157 @@ check_blacklist() {
     return 1
 }
 
+# The Armoury Crate button opens the Quick Access Menu only through an
+# InputPlumber profile matching the board's DMI. The menu shows TDP and GPU
+# controls only when steamos-manager has a device file matching the board's
+# DMI, and its TDP method needs asus-armoury power limits for the board.
+# Stock SteamOS has none of the three for RC74XA, so we ship all three. The
+# gates below detect the stock side catching up, which is when each
+# workaround is removed.
+SM_DEVICES_DIR=/usr/share/steamos-manager/devices
+SM_DEVICE_FILE=zz-ally-module-rc74xa.toml
+IP_DEVICES_DIR=/usr/share/inputplumber/devices
+IP_DEVICE_FILE=zz-ally-module-rc74xa.yaml
+
+# Gate A. Prints the stock steamos-manager device file with a [[device]]
+# entry whose every dmi.* key equals this machine's DMI value; returns 0 if
+# one does, 1 if none does, anything else if the check itself failed.
+stock_steamos_manager_match() {
+    python3 -I - "$SM_DEVICES_DIR" "$SM_DEVICE_FILE" "${DMI_DIR:-/sys/class/dmi/id}" <<'EOF'
+import pathlib, sys, tomllib
+
+devices, ours, dmi_dir = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+
+def dmi(key):
+    try:
+        return (dmi_dir / key).read_text().strip()
+    except OSError:
+        return None
+
+for path in sorted(devices.glob("*.toml")):
+    if path.name == ours:
+        continue
+    try:
+        entries = tomllib.loads(path.read_text()).get("device", [])
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        continue
+    for entry in entries:
+        match = entry.get("dmi", {})
+        if match and all(dmi(key) == value for key, value in match.items()):
+            print(path.name)
+            sys.exit(0)
+sys.exit(1)
+EOF
+}
+
+# Gate B. Prints the RC7x board string in the stock asus-armoury for kernel
+# $1 that DMI_MATCH (a substring match) would accept for this board; returns
+# 0 if there is one, 1 if not. Its only DMI table is the power limits one.
+stock_armoury_match() {
+    local mod name
+    mod=$(find "/lib/modules/$1/kernel" -name 'asus-armoury.ko*' 2>/dev/null | head -n 1)
+    [ -n "$mod" ] || return 1
+    while read -r name; do
+        if [[ "$BOARD_NAME" == *"$name"* ]]; then
+            echo "$name"
+            return 0
+        fi
+    done < <(case "$mod" in
+                 *.zst) zstd -dcq "$mod" ;;
+                 *.xz) xz -dcq "$mod" ;;
+                 *) cat "$mod" ;;
+             esac 2>/dev/null | grep -aoE 'RC7[0-9][A-Z0-9]*' | sort -u)
+    return 1
+}
+
+# Gate C. Prints the stock InputPlumber device file with a dmi_data match
+# InputPlumber would accept for this machine: every key a glob matching the
+# DMI value, as InputPlumber compares them. Returns 0 if one does, 1 if none
+# does, anything else if the check itself failed. A key with no file in the
+# DMI directory, such as cpu_vendor, counts as no match.
+stock_inputplumber_match() {
+    python3 -I - "$IP_DEVICES_DIR" "$IP_DEVICE_FILE" "${DMI_DIR:-/sys/class/dmi/id}" <<'EOF'
+import fnmatch, pathlib, sys
+
+try:
+    import yaml
+except ImportError:
+    sys.exit(2)
+
+devices, ours, dmi_dir = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+
+def accepts(key, pattern):
+    try:
+        value = (dmi_dir / key).read_text().strip()
+    except OSError:
+        return False
+    return fnmatch.fnmatchcase(value, str(pattern))
+
+for path in sorted(devices.glob("*.yaml")):
+    if path.name == ours:
+        continue
+    try:
+        config = yaml.safe_load(path.read_text())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        continue
+    if not isinstance(config, dict):
+        continue
+    for entry in config.get("matches") or []:
+        match = entry.get("dmi_data") if isinstance(entry, dict) else None
+        if isinstance(match, dict) and match and \
+           all(accepts(key, pattern) for key, pattern in match.items()):
+            print(path.name)
+            sys.exit(0)
+sys.exit(1)
+EOF
+}
+
+# Report where the workarounds stand. Informational: never fails --check.
+check_qam_support() {
+    local kver ours match attr
+    [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]] || return 0
+    kver=$(uname -r)
+
+    log "Checking the Quick Access Menu button and its TDP and GPU controls..."
+    ours="$IP_DEVICES_DIR/$IP_DEVICE_FILE"
+    if match=$(stock_inputplumber_match); then
+        log "  InputPlumber: stock $match matches this board; our profile is no longer needed."
+        [ ! -e "$ours" ] || warn "  ...but $ours is still installed. Re-run 'sudo ./install.sh' to remove it."
+    elif [ -e "$ours" ]; then
+        log "  InputPlumber: no stock profile matches this board; ours is installed."
+    else
+        warn "  InputPlumber: no profile matches this board, so the Armoury Crate button does not open the QAM. Re-run 'sudo ./install.sh'."
+    fi
+    systemctl is-active --quiet inputplumber || warn "  InputPlumber is not running, so no profile applies."
+
+    ours="$SM_DEVICES_DIR/$SM_DEVICE_FILE"
+    if match=$(stock_steamos_manager_match); then
+        log "  steamos-manager: stock $match matches this board; our device file is no longer needed."
+        [ ! -e "$ours" ] || warn "  ...but $ours is still installed. Re-run 'sudo ./install.sh' to remove it."
+    elif [ -e "$ours" ]; then
+        log "  steamos-manager: no stock device file matches this board; ours is installed."
+    else
+        warn "  steamos-manager: no device file matches this board, so the QAM has no TDP or GPU controls. Re-run 'sudo ./install.sh'."
+    fi
+
+    ours="/lib/modules/${kver}/updates/ally/drivers/platform/x86/asus-armoury.ko.zst"
+    if match=$(stock_armoury_match "$kver"); then
+        log "  asus-armoury: stock module has power limits for $match; the patched build is no longer needed."
+        [ ! -e "$ours" ] || warn "  ...but $ours is still installed. Re-run 'sudo ./install.sh' to remove it."
+    elif [ -e "$ours" ]; then
+        log "  asus-armoury: stock module has no power limits for this board; the patched build is installed."
+    else
+        warn "  asus-armoury: stock module has no power limits for this board and the patched build is not installed. Re-run 'sudo ./install.sh'."
+    fi
+
+    attr=/sys/class/firmware-attributes/asus-armoury/attributes/ppt_pl1_spl/current_value
+    if cat "$attr" >/dev/null 2>&1; then
+        log "  TDP limit (ppt_pl1_spl) readable: $(cat "$attr") W."
+    else
+        warn "  TDP limit (ppt_pl1_spl) not readable: the loaded asus-armoury has no limits for this board. Reboot after installing."
+    fi
+}
+
 # --- 1. Environment Checks ---
 
 log "Checking environment..."
@@ -158,6 +310,7 @@ if [ "$CHECK_ONLY" = true ]; then
     log "Checking driver binding (no build, no install)..."
     blacklisted=false
     check_blacklist || blacklisted=true
+    check_qam_support
     if verify_binding; then
         log "All ROG Ally interfaces are bound to our driver."
         exit 0
@@ -259,6 +412,12 @@ fi
 KDIR="/lib/modules/${KVER}/build"
 UPDATES_BASE="/lib/modules/${KVER}/updates/ally"
 INSTALL_PATH="${UPDATES_BASE}/drivers/hid"
+
+# Gate B: the install step below removes our copy when this skips it.
+if [ "$INSTALL_ARMOURY" = true ] && ARMOURY_MATCH=$(stock_armoury_match "$KVER"); then
+    INSTALL_ARMOURY=false
+    log "Stock asus-armoury for ${KVER} has power limits for ${ARMOURY_MATCH}: the patched build is no longer needed, skipping it."
+fi
 
 # Compiling needs no privileges, and building as root leaves root-owned
 # objects behind that make the next unprivileged build fail in MODPOST with
@@ -420,6 +579,44 @@ if [ "$INSTALL_AUDIO" = true ]; then
             mkdir -p "$ucm_base/codecs/tas2783"
             cp -f "ucm2/codecs/tas2783/init.conf" "$ucm_base/codecs/tas2783/init.conf"
         fi
+    fi
+fi
+
+# Gate A: steamos-manager device file for the QAM's TDP and GPU controls.
+if [ -d "$SM_DEVICES_DIR" ] && [ -f "steamos-manager/$SM_DEVICE_FILE" ] && \
+   { [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; }; then
+    SM_RC=0
+    SM_MATCH=$(stock_steamos_manager_match) || SM_RC=$?
+    if [ "$SM_RC" -eq 0 ]; then
+        log "Stock steamos-manager file $SM_MATCH matches this board: our device file is no longer needed."
+        if [ -e "$SM_DEVICES_DIR/$SM_DEVICE_FILE" ]; then
+            log "Removing $SM_DEVICES_DIR/$SM_DEVICE_FILE..."
+            rm -f "$SM_DEVICES_DIR/$SM_DEVICE_FILE"
+        fi
+    else
+        [ "$SM_RC" -eq 1 ] || warn "Could not read the stock steamos-manager device files (exit $SM_RC); installing ours anyway."
+        log "Installing steamos-manager device file for the QAM's TDP and GPU controls..."
+        cp -f "steamos-manager/$SM_DEVICE_FILE" "$SM_DEVICES_DIR/$SM_DEVICE_FILE"
+        chmod 644 "$SM_DEVICES_DIR/$SM_DEVICE_FILE"
+    fi
+fi
+
+# Gate C: InputPlumber profile that makes the Armoury Crate button open the QAM.
+if [ -d "$IP_DEVICES_DIR" ] && [ -f "inputplumber/$IP_DEVICE_FILE" ] && \
+   { [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; }; then
+    IP_RC=0
+    IP_MATCH=$(stock_inputplumber_match) || IP_RC=$?
+    if [ "$IP_RC" -eq 0 ]; then
+        log "Stock InputPlumber file $IP_MATCH matches this board: our profile is no longer needed."
+        if [ -e "$IP_DEVICES_DIR/$IP_DEVICE_FILE" ]; then
+            log "Removing $IP_DEVICES_DIR/$IP_DEVICE_FILE..."
+            rm -f "$IP_DEVICES_DIR/$IP_DEVICE_FILE"
+        fi
+    else
+        [ "$IP_RC" -eq 1 ] || warn "Could not read the stock InputPlumber device files (exit $IP_RC); installing ours anyway."
+        log "Installing InputPlumber profile for the Armoury Crate button..."
+        cp -f "inputplumber/$IP_DEVICE_FILE" "$IP_DEVICES_DIR/$IP_DEVICE_FILE"
+        chmod 644 "$IP_DEVICES_DIR/$IP_DEVICE_FILE"
     fi
 fi
 
@@ -599,6 +796,12 @@ if [ "$INSTALL_AUDIO" = true ]; then
     else
         warn "SoundWire audio requires a system reboot to initialize ACP 7.0 hardware: 'sudo reboot'"
     fi
+fi
+
+if [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; then
+    log "Reboot for the Armoury Crate button's Quick Access Menu and its TDP and"
+    log "GPU controls: this script does not reload asus-armoury or restart"
+    log "steamos-manager or InputPlumber."
 fi
 
 log "Note: SteamOS updates wipe /etc/modprobe.d, which un-blocks the stock"

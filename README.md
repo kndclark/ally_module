@@ -55,6 +55,29 @@ strings, neither of which is documented. Two consequences shape this driver:
 This vocabulary matches the upstream Lenovo Legion Go / Go S drivers, which is
 the convention Valve's client is written against.
 
+On the ROG Xbox Ally X (RC74XA) the Quick Access Menu needs three things
+stock SteamOS lacks for that board, and `install.sh` supplies all three:
+
+- **An InputPlumber profile.** The Armoury Crate button sends `KEY_PROG1`,
+  which InputPlumber turns into the Quick Access Menu for a device it
+  matches by DMI. Its stock `50-rog_xbox_ally.yaml` stops at RC73XA.
+  `inputplumber/zz-ally-module-rc74xa.yaml` is that file matching RC74XA
+  instead, with the `go_s:rgb:` LED name, and is installed to
+  `/usr/share/inputplumber/devices/`.
+- **A steamos-manager device file.** steamos-manager offers the menu's TDP
+  and GPU controls only for a device it matches by DMI, and its stock files
+  stop at RC73XA. `steamos-manager/zz-ally-module-rc74xa.toml` adapts the
+  RC73XA entry and is installed to `/usr/share/steamos-manager/devices/`.
+- **asus-armoury power limits.** The stock module has none for RC74XA, so
+  every `ppt_*` attribute fails with `ENODEV`. `platform/asus-armoury` adds
+  them.
+
+Each comes with a gate that notices when SteamOS catches up. The profile and
+the device file are removed once a stock file matches the board's DMI, and
+the patched asus-armoury is skipped once the stock module names the board.
+`sudo ./install.sh --check` reports where all three stand. Reboot after
+installing for the button and the controls to work.
+
 ### Suspend and resume
 
 - **Non-blocking init.** MCU setup runs from a `delayed_work` queue rather than

@@ -1,0 +1,46 @@
+# ROG Xbox Ally X (RC74XA) for steamos-manager, installed by ally_module's
+# install.sh to /usr/share/steamos-manager/devices/.
+#
+# steamos-manager only offers TDP and GPU controls to the Quick Access Menu
+# for a device it matches by DMI, and its stock files list RC73XA and RC73YA
+# but not RC74XA. This adapts the RC73XA entry from rog-ally-series.toml:
+# same TDP method (asus-armoury firmware attributes, which ally_module's
+# patched asus-armoury provides for RC74XA), same GPU and profile drivers.
+#
+# install.sh removes this file once a stock device file matches the board.
+
+# What an X20 reports in /sys/class/dmi/id/sys_vendor.
+[[device]]
+dmi.sys_vendor = "ASUS"
+dmi.board_name = "RC74XA"
+device = "rog_xbox_ally_x"
+variant = "RC74XA"
+friendly_name = "ROG Xbox Ally X"
+
+# The vendor string the stock ROG entries use, should a unit report it.
+[[device]]
+dmi.sys_vendor = "ASUSTeK COMPUTER INC."
+dmi.board_name = "RC74XA"
+device = "rog_xbox_ally_x"
+variant = "RC74XA"
+friendly_name = "ROG Xbox Ally X"
+
+[gpu_performance]
+driver = "amdgpu"
+
+[gpu_power_profile]
+driver = "amdgpu"
+
+[performance_profile]
+platform_profile_name = "asus-wmi"
+suggested_default = "performance"
+
+[tdp_limit]
+method = "firmware_attribute"
+
+[tdp_limit.firmware_attribute]
+attribute = "asus-armoury"
+performance_profile = "performance"
+
+[battery_charge_limit]
+method = "acpi_sb"
