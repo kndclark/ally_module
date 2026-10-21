@@ -36,15 +36,20 @@ On both devices:
    and flash do nothing *and* the firmware latches: the running animation
    (rainbow, pulse) freezes until a supported mode is written.
 3. **`enabled=false` does not turn the rings off.** The power packet it
-   sends (`5d bd 01 ...`) changed nothing visible on either device. Only
-   brightness 0 or a zeroed colour turns the rings off.
+   sends (`5d bd 01 ...`) changed nothing visible on either device. Both
+   MCUs do obey feature `5a d1 09 01 00` (rings off) and `5a d1 09 01 ff`
+   (back on), which would make a working `enabled`; on the Xbox Ally X the
+   same flags also gate the Xbox-button LED and survive a power cycle.
 
 On the Xbox Ally X only:
 
 4. **The PR's colours reach the left ring only.** With discovery byte 9 =
    0x02 the PR writes `b3` to zones 1-4. On this MCU those are the left
    ring; zones 5-8 are the right ring, and zone 0 sets both. The right ring
-   follows the PR's effect but keeps the colours it last had.
+   follows the PR's effect but keeps the colours it last had. Zone 0 sets
+   both rings on the Ally X too, where zones 1-4 are the four half-rings
+   and 5-8 change nothing, so writing zone 0 (or zones 1-8) is safe on
+   both models.
 5. **Brightness 0 turns the Xbox-button LED off, and the PR never turns it
    back on.** That LED has its own level packet, which the PR doesn't send.
 6. **Direct mode is half resolution.** LampArray reports 8 lamps; the node
@@ -52,13 +57,13 @@ On the Xbox Ally X only:
 
 On the Ally X only:
 
-7. **Direct mode: one wrong frame, not isolated.** Twice, the first
-   `direct_buffer` frame written after `effect=direct` showed the previous
-   Aura colour instead; every later frame was right, and a clean
-   static -> direct switch applied its first frame correctly. Both misses
-   followed an unsupported-effect freeze (item 2) earlier in the same
-   session, so this may be the latched firmware rather than the LampArray
-   path. It did not happen in four direct sessions on the Xbox Ally X.
+7. **Direct mode: a wrong first frame, not reproduced.** Twice in the
+   first session, the first `direct_buffer` frame written after
+   `effect=direct` showed the previous Aura colour instead; every later
+   frame was right. Both misses followed an unsupported-effect freeze
+   (item 2), but three deliberate freeze -> direct trials on a fresh boot
+   applied the first frame correctly every time, as did four direct
+   sessions on the Xbox Ally X. Probably nothing to fix.
 
 Both devices also register a bogus `asus::slash` (see the last section).
 
@@ -130,6 +135,32 @@ all later frames were correct. In the third, with a clean `static` (#0000ff)
 immediately before, the first red frame applied at once. Leaving `direct`
 (`effect=static`) hands the rings back to the Aura colour, visible as a
 flash before brightness 0.
+
+Re-check on a fresh boot: three times, `rainbow_wave` -> `star` (freezes)
+-> `direct` -> an all-red, all-green, then all-blue frame. The first frame
+was right every time, and so was the second.
+
+### Zones and palettes
+
+Raw writes are feature `5a b3 <zone> 00 <rgb>` then `5a b5`, with no `b4`
+(not saved), each on top of the last.
+
+| write | result |
+|---|---|
+| raw zone 0, blue | both rings blue |
+| raw zone 1, red | left stick, bottom half red |
+| raw zone 2, red | left stick, top half red |
+| raw zone 3, red | right stick, bottom half red |
+| raw zone 4, red | right stick, top half red |
+| raw zones 5, 6, 7, 8, white | no visible change |
+| PR static, palette #ff0000 #0000ff | both rings red |
+| PR breathe, same palette | both rings: red primary, blue secondary |
+| PR breathe, palette #ff0000 | both rings breathe red, no dark phase |
+
+Zone *k* is lamp *k*-1 of the LampArray order above, so the PR's zones 1-4
+are the right set on this MCU. With a one-entry palette the PR sends black
+as the second colour; the Xbox Ally X shows that as a long dark phase, this
+MCU shows none.
 
 ## ROG Xbox Ally X (RC74XA)
 
@@ -268,3 +299,10 @@ brightness 0) went dark both times, so I can't reproduce it.
   successful Slash-specific probe would avoid it.
 - Hot-unloading `hid-asus` crashed the Ally X's kernel once during the test;
   not attributed to the PR, pstore not yet read.
+- A suspend that looked like a hang on the Ally X was not the PR: the
+  suspend's filesystem sync waited 790 s, then 3196 s, on a microSD card
+  behind a Steam download, and both suspends resumed normally.
+- Once, right after those two long suspends, the Ally X's rings stayed dark
+  for every write, the PR's and raw `b3` alike, with no driver warnings.
+  That session ended before `d1 09 01 ff` was tried, and after a reboot
+  everything worked. Not reproduced; cause unknown.
