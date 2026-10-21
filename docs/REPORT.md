@@ -1,4 +1,4 @@
-# PR #17 Dynamic Lighting on the ROG Ally X and ROG Xbox Ally X - test report
+# PR #17 Dynamic Lighting on the ROG Ally X and ROG Xbox Ally X20 - test report
 
 Tested at PR head `fb149ab7` (6 commits, "leds: Add Dynamic Lighting class
 and hid-asus Aura/Slash/AniMe support"): ROG Ally X on 2026-10-19, ROG Xbox
@@ -304,5 +304,7 @@ brightness 0) went dark both times, so I can't reproduce it.
   behind a Steam download, and both suspends resumed normally.
 - Once, right after those two long suspends, the Ally X's rings stayed dark
   for every write, the PR's and raw `b3` alike, with no driver warnings.
-  That session ended before `d1 09 01 ff` was tried, and after a reboot
-  everything worked. Not reproduced; cause unknown.
+  That session ended before `d1 09 01 ff` was tried. After a reboot the
+  rings were dark again before any write (as in item 1), but the same
+  first writes, `brightness` 3 then static green, lit both rings at once.
+  Not reproduced; cause unknown.
