@@ -11,6 +11,10 @@ scaffolding. The ally_module driver (Nero's series plus the X20 work) is
 **not** part of this build, and the PR is tested the way linux-unstable
 itself would run it: hid-asus alone, hid-asus-ally blacklisted.
 
+It is published as the `DO_NOT_MERGE_ogc_pr17_test` branch of
+ally_module, a standalone test record that is not meant to be merged
+into any ally_module branch.
+
 ## What is in here
 
 | File | Origin |
