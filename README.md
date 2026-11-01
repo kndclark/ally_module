@@ -55,6 +55,29 @@ strings, neither of which is documented. Two consequences shape this driver:
 This vocabulary matches the upstream Lenovo Legion Go / Go S drivers, which is
 the convention Valve's client is written against.
 
+On the ROG Xbox Ally X (RC74XA) the Quick Access Menu needs three things
+stock SteamOS lacks for that board, and `install.sh` supplies all three:
+
+- **An InputPlumber profile.** The Armoury Crate button sends `KEY_PROG1`,
+  which InputPlumber turns into the Quick Access Menu for a device it
+  matches by DMI. Its stock `50-rog_xbox_ally.yaml` stops at RC73XA.
+  `inputplumber/zz-ally-module-rc74xa.yaml` is that file matching RC74XA
+  instead, with the `go_s:rgb:` LED name, and is installed to
+  `/usr/share/inputplumber/devices/`.
+- **A steamos-manager device file.** steamos-manager offers the menu's TDP
+  and GPU controls only for a device it matches by DMI, and its stock files
+  stop at RC73XA. `steamos-manager/zz-ally-module-rc74xa.toml` adapts the
+  RC73XA entry and is installed to `/usr/share/steamos-manager/devices/`.
+- **asus-armoury power limits.** The stock module has none for RC74XA, so
+  every `ppt_*` attribute fails with `ENODEV`. `platform/asus-armoury` adds
+  them.
+
+Each comes with a gate that notices when SteamOS catches up. The profile and
+the device file are removed once a stock file matches the board's DMI, and
+the patched asus-armoury is skipped once the stock module names the board.
+`sudo ./install.sh --check` reports where all three stand. Reboot after
+installing for the button and the controls to work.
+
 ### Suspend and resume
 
 - **Non-blocking init.** MCU setup runs from a `delayed_work` queue rather than
@@ -117,6 +140,20 @@ interface shows no driver at all, the most common cause is a leftover
 
 ---
 
+### Audio (ROG Xbox Ally X / RC74XA)
+
+The ASUS ROG Xbox Ally X (RC74XA) uses SoundWire audio with dual Texas Instruments TAS2783 smart amplifiers and a Realtek ALC721 / RT721 codec on AMD ACP 7.0 (Strix Point). Stock SteamOS kernels do not yet configure SoundWire on this board, leaving internal audio non-functional.
+
+This repository includes out-of-tree audio drivers ported from Matthew Schwartz's audio branch (`matts/7.2/rog-ally-x20-audio`), providing:
+- SoundWire probe override and machine driver entry for ACP 7.0 on ASUS RC74XA
+- TAS2783 smart amplifier driver with UEFI Speaker ID detection and volume persistence across resets
+- RT721 SDCA codec driver with PS0 power state synchronization
+- SoundWire utility support for DisCo port lists
+
+Special thanks and credit to **Matthew Schwartz** (<matthew.schwartz@linux.dev>) for developing and providing these fixes, as well as upstream contributors Fan Wu, Baojun Xu, Oder Chiou, Shuming Fan, Jack Yu, Antoine Monnet, and Andrey Golovko.
+
+---
+
 ## Differences from the kernel-tree version
 
 This out-of-tree build is kept byte-identical to the upstream submission except
@@ -138,8 +175,8 @@ list to include the Ally.
 ## Credits
 
 Built on the ASUS HID driver work of **Luke Jones**, **Denis Benato (NeroReflex)**,
-and **Derek Clark (pastaq)**, and on protocol findings from the ROG Ally reverse-engineering
-community.
+and **Derek Clark (pastaq)**, audio drivers by **Matthew Schwartz**, and on protocol
+findings from the ROG Ally reverse-engineering community.
 
 Hardware protocol notes and captures live in the companion
 [rog-ally-reverse-engineering](https://github.com/kndclark/rog-ally-reverse-engineering)

@@ -14,8 +14,16 @@ ifeq ($(STUB_NEEDED),yes)
 obj-m += asus-wmi-stub.o
 endif
 
+.PHONY: all audio audio-clean clean configure sync-upstream diff-upstream test
+
 all:
 	make -C $(KDIR) M=$(PWD) modules CONFIG_DEBUG_INFO_BTF_MODULES=
+
+audio:
+	$(MAKE) -C audio all KDIR=$(KDIR)
+
+audio-clean:
+	$(MAKE) -C audio clean KDIR=$(KDIR)
 
 clean:
 	@if [ -d "$(KDIR)" ]; then \

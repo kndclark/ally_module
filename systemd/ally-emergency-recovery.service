@@ -1,0 +1,13 @@
+[Unit]
+Description=ROG Ally X Out-Of-Tree Module Emergency Recovery Guard
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=emergency.target rescue.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'rm -rf /lib/modules/*/updates/ally /lib/firmware/ti/audio/tas2783/1954-*.bin.zst && depmod -a'
+RemainAfterExit=no
+
+[Install]
+WantedBy=emergency.target rescue.target

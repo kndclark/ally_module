@@ -29,14 +29,47 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 # --- Arguments ---
 FORCE_BACKUP=false
 CHECK_ONLY=false
+AUDIO_OVERRIDE="" # "yes", "no", or empty for auto-detect
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --force) FORCE_BACKUP=true ;;
         --check) CHECK_ONLY=true ;;
+        --audio) AUDIO_OVERRIDE="yes" ;;
+        --no-audio) AUDIO_OVERRIDE="no" ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
+
+# Hardware detection for models requiring out-of-tree audio (e.g. X20 / RC74XA)
+BOARD_NAME=$(cat /sys/devices/virtual/dmi/id/board_name 2>/dev/null || cat /sys/class/dmi/id/board_name 2>/dev/null || echo "")
+PRODUCT_NAME=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
+
+# The stock asus-armoury has power limits for RC73XA only; RC74XA gets
+# -ENODEV on every ppt_* attribute, so TDP control needs our build. Gate B
+# (stock_armoury_match) turns this off once the stock module catches up.
+INSTALL_ARMOURY=false
+if [ -d "platform/asus-armoury" ] && { [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; }; then
+    INSTALL_ARMOURY=true
+    log "Hardware detected: RC74XA. asus-armoury with RC74XA power limits enabled."
+fi
+
+INSTALL_AUDIO=false
+if [ -d "audio" ]; then
+    if [ "$AUDIO_OVERRIDE" = "yes" ]; then
+        INSTALL_AUDIO=true
+        log "Audio driver installation explicitly enabled via --audio."
+    elif [ "$AUDIO_OVERRIDE" = "no" ]; then
+        INSTALL_AUDIO=false
+        log "Audio driver installation disabled via --no-audio."
+    elif [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; then
+        INSTALL_AUDIO=true
+        log "Hardware detected: ROG Xbox Ally X (RC74XA). SoundWire audio installation enabled."
+    else
+        INSTALL_AUDIO=false
+        log "Hardware detected: ${BOARD_NAME:-$PRODUCT_NAME} (stock audio already functional, skipping out-of-tree audio)."
+    fi
+fi
 
 # Confirm that every ROG Ally HID interface is bound to our driver ("asus"),
 # not the stock in-kernel one ("asus_rog_ally", from hid-asus-ally.ko). This is
@@ -108,6 +141,157 @@ check_blacklist() {
     return 1
 }
 
+# The Armoury Crate button opens the Quick Access Menu only through an
+# InputPlumber profile matching the board's DMI. The menu shows TDP and GPU
+# controls only when steamos-manager has a device file matching the board's
+# DMI, and its TDP method needs asus-armoury power limits for the board.
+# Stock SteamOS has none of the three for RC74XA, so we ship all three. The
+# gates below detect the stock side catching up, which is when each
+# workaround is removed.
+SM_DEVICES_DIR=/usr/share/steamos-manager/devices
+SM_DEVICE_FILE=zz-ally-module-rc74xa.toml
+IP_DEVICES_DIR=/usr/share/inputplumber/devices
+IP_DEVICE_FILE=zz-ally-module-rc74xa.yaml
+
+# Gate A. Prints the stock steamos-manager device file with a [[device]]
+# entry whose every dmi.* key equals this machine's DMI value; returns 0 if
+# one does, 1 if none does, anything else if the check itself failed.
+stock_steamos_manager_match() {
+    python3 -I - "$SM_DEVICES_DIR" "$SM_DEVICE_FILE" "${DMI_DIR:-/sys/class/dmi/id}" <<'EOF'
+import pathlib, sys, tomllib
+
+devices, ours, dmi_dir = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+
+def dmi(key):
+    try:
+        return (dmi_dir / key).read_text().strip()
+    except OSError:
+        return None
+
+for path in sorted(devices.glob("*.toml")):
+    if path.name == ours:
+        continue
+    try:
+        entries = tomllib.loads(path.read_text()).get("device", [])
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        continue
+    for entry in entries:
+        match = entry.get("dmi", {})
+        if match and all(dmi(key) == value for key, value in match.items()):
+            print(path.name)
+            sys.exit(0)
+sys.exit(1)
+EOF
+}
+
+# Gate B. Prints the RC7x board string in the stock asus-armoury for kernel
+# $1 that DMI_MATCH (a substring match) would accept for this board; returns
+# 0 if there is one, 1 if not. Its only DMI table is the power limits one.
+stock_armoury_match() {
+    local mod name
+    mod=$(find "/lib/modules/$1/kernel" -name 'asus-armoury.ko*' 2>/dev/null | head -n 1)
+    [ -n "$mod" ] || return 1
+    while read -r name; do
+        if [[ "$BOARD_NAME" == *"$name"* ]]; then
+            echo "$name"
+            return 0
+        fi
+    done < <(case "$mod" in
+                 *.zst) zstd -dcq "$mod" ;;
+                 *.xz) xz -dcq "$mod" ;;
+                 *) cat "$mod" ;;
+             esac 2>/dev/null | grep -aoE 'RC7[0-9][A-Z0-9]*' | sort -u)
+    return 1
+}
+
+# Gate C. Prints the stock InputPlumber device file with a dmi_data match
+# InputPlumber would accept for this machine: every key a glob matching the
+# DMI value, as InputPlumber compares them. Returns 0 if one does, 1 if none
+# does, anything else if the check itself failed. A key with no file in the
+# DMI directory, such as cpu_vendor, counts as no match.
+stock_inputplumber_match() {
+    python3 -I - "$IP_DEVICES_DIR" "$IP_DEVICE_FILE" "${DMI_DIR:-/sys/class/dmi/id}" <<'EOF'
+import fnmatch, pathlib, sys
+
+try:
+    import yaml
+except ImportError:
+    sys.exit(2)
+
+devices, ours, dmi_dir = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+
+def accepts(key, pattern):
+    try:
+        value = (dmi_dir / key).read_text().strip()
+    except OSError:
+        return False
+    return fnmatch.fnmatchcase(value, str(pattern))
+
+for path in sorted(devices.glob("*.yaml")):
+    if path.name == ours:
+        continue
+    try:
+        config = yaml.safe_load(path.read_text())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        continue
+    if not isinstance(config, dict):
+        continue
+    for entry in config.get("matches") or []:
+        match = entry.get("dmi_data") if isinstance(entry, dict) else None
+        if isinstance(match, dict) and match and \
+           all(accepts(key, pattern) for key, pattern in match.items()):
+            print(path.name)
+            sys.exit(0)
+sys.exit(1)
+EOF
+}
+
+# Report where the workarounds stand. Informational: never fails --check.
+check_qam_support() {
+    local kver ours match attr
+    [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]] || return 0
+    kver=$(uname -r)
+
+    log "Checking the Quick Access Menu button and its TDP and GPU controls..."
+    ours="$IP_DEVICES_DIR/$IP_DEVICE_FILE"
+    if match=$(stock_inputplumber_match); then
+        log "  InputPlumber: stock $match matches this board; our profile is no longer needed."
+        [ ! -e "$ours" ] || warn "  ...but $ours is still installed. Re-run 'sudo ./install.sh' to remove it."
+    elif [ -e "$ours" ]; then
+        log "  InputPlumber: no stock profile matches this board; ours is installed."
+    else
+        warn "  InputPlumber: no profile matches this board, so the Armoury Crate button does not open the QAM. Re-run 'sudo ./install.sh'."
+    fi
+    systemctl is-active --quiet inputplumber || warn "  InputPlumber is not running, so no profile applies."
+
+    ours="$SM_DEVICES_DIR/$SM_DEVICE_FILE"
+    if match=$(stock_steamos_manager_match); then
+        log "  steamos-manager: stock $match matches this board; our device file is no longer needed."
+        [ ! -e "$ours" ] || warn "  ...but $ours is still installed. Re-run 'sudo ./install.sh' to remove it."
+    elif [ -e "$ours" ]; then
+        log "  steamos-manager: no stock device file matches this board; ours is installed."
+    else
+        warn "  steamos-manager: no device file matches this board, so the QAM has no TDP or GPU controls. Re-run 'sudo ./install.sh'."
+    fi
+
+    ours="/lib/modules/${kver}/updates/ally/drivers/platform/x86/asus-armoury.ko.zst"
+    if match=$(stock_armoury_match "$kver"); then
+        log "  asus-armoury: stock module has power limits for $match; the patched build is no longer needed."
+        [ ! -e "$ours" ] || warn "  ...but $ours is still installed. Re-run 'sudo ./install.sh' to remove it."
+    elif [ -e "$ours" ]; then
+        log "  asus-armoury: stock module has no power limits for this board; the patched build is installed."
+    else
+        warn "  asus-armoury: stock module has no power limits for this board and the patched build is not installed. Re-run 'sudo ./install.sh'."
+    fi
+
+    attr=/sys/class/firmware-attributes/asus-armoury/attributes/ppt_pl1_spl/current_value
+    if cat "$attr" >/dev/null 2>&1; then
+        log "  TDP limit (ppt_pl1_spl) readable: $(cat "$attr") W."
+    else
+        warn "  TDP limit (ppt_pl1_spl) not readable: the loaded asus-armoury has no limits for this board. Reboot after installing."
+    fi
+}
+
 # --- 1. Environment Checks ---
 
 log "Checking environment..."
@@ -126,6 +310,7 @@ if [ "$CHECK_ONLY" = true ]; then
     log "Checking driver binding (no build, no install)..."
     blacklisted=false
     check_blacklist || blacklisted=true
+    check_qam_support
     if verify_binding; then
         log "All ROG Ally interfaces are bound to our driver."
         exit 0
@@ -225,7 +410,14 @@ if [ -z "${KVER}" ]; then
 fi
 
 KDIR="/lib/modules/${KVER}/build"
-INSTALL_PATH="/lib/modules/${KVER}/kernel/drivers/hid/"
+UPDATES_BASE="/lib/modules/${KVER}/updates/ally"
+INSTALL_PATH="${UPDATES_BASE}/drivers/hid"
+
+# Gate B: the install step below removes our copy when this skips it.
+if [ "$INSTALL_ARMOURY" = true ] && ARMOURY_MATCH=$(stock_armoury_match "$KVER"); then
+    INSTALL_ARMOURY=false
+    log "Stock asus-armoury for ${KVER} has power limits for ${ARMOURY_MATCH}: the patched build is no longer needed, skipping it."
+fi
 
 # Compiling needs no privileges, and building as root leaves root-owned
 # objects behind that make the next unprivileged build fail in MODPOST with
@@ -246,8 +438,43 @@ if [ ! -f "$MODULE_FILE" ]; then
     error "Build failed! $MODULE_FILE not found."
 fi
 
+if [ "$INSTALL_AUDIO" = true ]; then
+    log "Building audio modules using headers at ${KDIR}..."
+    "${AS_BUILDER[@]}" make -C audio clean KDIR="${KDIR}"
+    "${AS_BUILDER[@]}" make -C audio all KDIR="${KDIR}"
+fi
+
+if [ "$INSTALL_ARMOURY" = true ]; then
+    log "Building asus-armoury using headers at ${KDIR}..."
+    "${AS_BUILDER[@]}" make -C platform/asus-armoury clean KDIR="${KDIR}"
+    "${AS_BUILDER[@]}" make -C platform/asus-armoury all KDIR="${KDIR}"
+    [ -f platform/asus-armoury/asus-armoury.ko ] || error "Build failed! asus-armoury.ko not found."
+fi
+
+# Pre-flight Symbol & ABI Gate
+log "Running pre-flight symbol verification gate..."
+PREFLIGHT_TARGETS=("$MODULE_FILE")
+if [ "$INSTALL_ARMOURY" = true ]; then
+    PREFLIGHT_TARGETS+=("platform/asus-armoury/asus-armoury.ko")
+fi
+if [ "$INSTALL_AUDIO" = true ]; then
+    for f in audio/*.ko; do
+        [ -f "$f" ] && PREFLIGHT_TARGETS+=("$f")
+    done
+fi
+if [ -f "scripts/preflight_symbol_check.py" ]; then
+    if ! python3 scripts/preflight_symbol_check.py "${PREFLIGHT_TARGETS[@]}" --symvers "${KDIR}/Module.symvers"; then
+        error "Pre-flight symbol check failed! Aborting installation to prevent kernel oops/boot-loop."
+    fi
+else
+    warn "scripts/preflight_symbol_check.py not found; skipping pre-flight gate."
+fi
+
 log "Compressing module..."
 "${AS_BUILDER[@]}" zstd -f "$MODULE_FILE"
+if [ "$INSTALL_ARMOURY" = true ]; then
+    "${AS_BUILDER[@]}" zstd -f platform/asus-armoury/asus-armoury.ko
+fi
 # The Makefile only builds the stub on kernels whose asus-wmi lacks the
 # hid-asus listener API; on the ones that have it the stub is a duplicate
 # GPL export that modprobe refuses, so its absence here is the normal case.
@@ -255,30 +482,175 @@ if [ -f "$STUB_FILE" ]; then
     "${AS_BUILDER[@]}" zstd -f "$STUB_FILE"
 fi
 
-# Backup logic
+# Ensure stock kernel modules under /lib/modules/${KVER}/kernel/ are pristine
+# and not overwritten by previous versions.
+restore_stock_kernel_modules() {
+    local target_kdir="/lib/modules/${KVER}/kernel"
+    local stock_dir="/home/${TARGET_USER}/stock_modules"
+    local files_to_check=(
+        "drivers/hid/hid-asus.ko.zst"
+        "sound/soc/amd/snd-acp-config.ko.zst"
+        "sound/soc/amd/acp/snd-soc-acpi-amd-match.ko.zst"
+        "sound/soc/sdw_utils/snd-soc-sdw-utils.ko.zst"
+        "sound/soc/codecs/snd-soc-tas2783-sdw.ko.zst"
+        "sound/soc/codecs/snd-soc-rt721-sdca.ko.zst"
+        "sound/soc/amd/acp/snd-acp-sdw-legacy-mach.ko.zst"
+        "sound/soc/amd/ps/snd-pci-ps.ko.zst"
+    )
+    for rel in "${files_to_check[@]}"; do
+        local target="${target_kdir}/${rel}"
+        local bak="${target}.bak"
+        if [ -f "$bak" ]; then
+            log "Restoring stock $rel from backup (.bak)..."
+            mv -f "$bak" "$target"
+        elif [ -d "$stock_dir" ]; then
+            local cand=$(find "$stock_dir" -type f -name "$(basename "$target")" 2>/dev/null | head -n 1)
+            if [ -n "$cand" ] && [ -f "$cand" ]; then
+                if ! cmp -s "$cand" "$target" 2>/dev/null; then
+                    log "Restoring pristine stock $rel from extracted official package..."
+                    cp -f "$cand" "$target"
+                fi
+            fi
+        fi
+    done
+}
+restore_stock_kernel_modules
+
+# Install to updates/ally directory (SteamOS search order: updates > extramodules > built-in)
 mkdir -p "$INSTALL_PATH"
-BACKUP_FILE="${INSTALL_PATH}/${MODULE_ZST}.bak"
-TARGET_FILE="${INSTALL_PATH}/${MODULE_ZST}"
-
-if [ -f "$TARGET_FILE" ]; then
-    if [ ! -f "$BACKUP_FILE" ] || [ "$FORCE_BACKUP" = true ]; then
-        log "Creating backup of original driver at $BACKUP_FILE..."
-        cp -f "$TARGET_FILE" "$BACKUP_FILE"
-    else
-        log "Backup already exists at $BACKUP_FILE. Skipping backup."
-    fi
+log "Installing HID module to $INSTALL_PATH..."
+cp -f "$MODULE_ZST" "${INSTALL_PATH}/${MODULE_ZST}"
+ARMOURY_PATH="${UPDATES_BASE}/drivers/platform/x86"
+if [ "$INSTALL_ARMOURY" = true ]; then
+    log "Installing asus-armoury to $ARMOURY_PATH..."
+    mkdir -p "$ARMOURY_PATH"
+    cp -f platform/asus-armoury/asus-armoury.ko.zst "${ARMOURY_PATH}/asus-armoury.ko.zst"
+elif [ -e "${ARMOURY_PATH}/asus-armoury.ko.zst" ]; then
+    rm -f "${ARMOURY_PATH}/asus-armoury.ko.zst"
 fi
-
-log "Installing to $INSTALL_PATH..."
-cp -f "$MODULE_ZST" "$TARGET_FILE"
 if [ -f "$STUB_ZST" ]; then
     cp -f "$STUB_ZST" "${INSTALL_PATH}/${STUB_ZST}"
 elif [ -e "${INSTALL_PATH}/${STUB_ZST}" ]; then
-    # A stub left by an install against an older kernel would still be listed
-    # in modules.dep and would fail to insert here, taking hid-asus with it.
-    log "Removing stale ${STUB_ZST} left by a previous install..."
     rm -f "${INSTALL_PATH}/${STUB_ZST}"
 fi
+
+if [ "$INSTALL_AUDIO" = true ]; then
+    log "Installing audio modules to ${UPDATES_BASE}/sound/..."
+    audio_mods=(
+        "audio/snd-acp-config.ko:sound/soc/amd/snd-acp-config.ko.zst"
+        "audio/snd-soc-acpi-amd-match.ko:sound/soc/amd/acp/snd-soc-acpi-amd-match.ko.zst"
+        "audio/snd-soc-sdw-utils.ko:sound/soc/sdw_utils/snd-soc-sdw-utils.ko.zst"
+        "audio/snd-soc-tas2783-sdw.ko:sound/soc/codecs/snd-soc-tas2783-sdw.ko.zst"
+        "audio/snd-soc-rt721-sdca.ko:sound/soc/codecs/snd-soc-rt721-sdca.ko.zst"
+        "audio/snd-acp-sdw-legacy-mach.ko:sound/soc/amd/acp/snd-acp-sdw-legacy-mach.ko.zst"
+        "audio/snd-pci-ps.ko:sound/soc/amd/ps/snd-pci-ps.ko.zst"
+    )
+    for entry in "${audio_mods[@]}"; do
+        src="${entry%%:*}"
+        rel="${entry##*:}"
+        dst="${UPDATES_BASE}/${rel}"
+        if [ -f "$src" ]; then
+            "${AS_BUILDER[@]}" zstd -f "$src"
+            zst="${src}.zst"
+            mkdir -p "$(dirname "$dst")"
+            cp -f "$zst" "$dst"
+        fi
+    done
+
+    fw_dir="/lib/firmware/ti/audio/tas2783"
+    if [ -d "$fw_dir" ]; then
+        log "Setting up TAS2783 firmware symlinks for ASUS RC74XA (1043:1954)..."
+        ln -sf 1AC4-1-0-0x8.bin.zst "$fw_dir/1954-1-0-0x8.bin.zst"
+        ln -sf 1AC4-1-0-0xB.bin.zst "$fw_dir/1954-1-0-0xB.bin.zst"
+        ln -sf 1AC4-0-0-0x8.bin.zst "$fw_dir/1954-0-0-0x8.bin.zst"
+        ln -sf 1AC4-0-0-0xB.bin.zst "$fw_dir/1954-0-0-0xB.bin.zst"
+    fi
+
+    # Install UCM2 configurations for TAS2783 (missing in stock SteamOS alsa-ucm-conf)
+    ucm_base="/usr/share/alsa/ucm2"
+    if [ -d "$ucm_base" ]; then
+        if [ -f "ucm2/sof-soundwire/tas2783.conf" ]; then
+            log "Installing TAS2783 UCM profile to $ucm_base/sof-soundwire/..."
+            mkdir -p "$ucm_base/sof-soundwire"
+            cp -f "ucm2/sof-soundwire/tas2783.conf" "$ucm_base/sof-soundwire/tas2783.conf"
+        fi
+        if [ -f "ucm2/codecs/tas2783/init.conf" ]; then
+            log "Installing TAS2783 codec init to $ucm_base/codecs/tas2783/..."
+            mkdir -p "$ucm_base/codecs/tas2783"
+            cp -f "ucm2/codecs/tas2783/init.conf" "$ucm_base/codecs/tas2783/init.conf"
+        fi
+    fi
+fi
+
+# Gate A: steamos-manager device file for the QAM's TDP and GPU controls.
+if [ -d "$SM_DEVICES_DIR" ] && [ -f "steamos-manager/$SM_DEVICE_FILE" ] && \
+   { [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; }; then
+    SM_RC=0
+    SM_MATCH=$(stock_steamos_manager_match) || SM_RC=$?
+    if [ "$SM_RC" -eq 0 ]; then
+        log "Stock steamos-manager file $SM_MATCH matches this board: our device file is no longer needed."
+        if [ -e "$SM_DEVICES_DIR/$SM_DEVICE_FILE" ]; then
+            log "Removing $SM_DEVICES_DIR/$SM_DEVICE_FILE..."
+            rm -f "$SM_DEVICES_DIR/$SM_DEVICE_FILE"
+        fi
+    else
+        [ "$SM_RC" -eq 1 ] || warn "Could not read the stock steamos-manager device files (exit $SM_RC); installing ours anyway."
+        log "Installing steamos-manager device file for the QAM's TDP and GPU controls..."
+        cp -f "steamos-manager/$SM_DEVICE_FILE" "$SM_DEVICES_DIR/$SM_DEVICE_FILE"
+        chmod 644 "$SM_DEVICES_DIR/$SM_DEVICE_FILE"
+    fi
+fi
+
+# Gate C: InputPlumber profile that makes the Armoury Crate button open the QAM.
+if [ -d "$IP_DEVICES_DIR" ] && [ -f "inputplumber/$IP_DEVICE_FILE" ] && \
+   { [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; }; then
+    IP_RC=0
+    IP_MATCH=$(stock_inputplumber_match) || IP_RC=$?
+    if [ "$IP_RC" -eq 0 ]; then
+        log "Stock InputPlumber file $IP_MATCH matches this board: our profile is no longer needed."
+        if [ -e "$IP_DEVICES_DIR/$IP_DEVICE_FILE" ]; then
+            log "Removing $IP_DEVICES_DIR/$IP_DEVICE_FILE..."
+            rm -f "$IP_DEVICES_DIR/$IP_DEVICE_FILE"
+        fi
+    else
+        [ "$IP_RC" -eq 1 ] || warn "Could not read the stock InputPlumber device files (exit $IP_RC); installing ours anyway."
+        log "Installing InputPlumber profile for the Armoury Crate button..."
+        cp -f "inputplumber/$IP_DEVICE_FILE" "$IP_DEVICES_DIR/$IP_DEVICE_FILE"
+        chmod 644 "$IP_DEVICES_DIR/$IP_DEVICE_FILE"
+    fi
+fi
+
+# Emergency Boot Guard Installation
+install_emergency_guard() {
+    local svc_file="/etc/systemd/system/ally-emergency-recovery.service"
+    local emergency_wants="/etc/systemd/system/emergency.target.wants"
+    local rescue_wants="/etc/systemd/system/rescue.target.wants"
+
+    log "Installing emergency boot guard service..."
+    if [ -f "systemd/ally-emergency-recovery.service" ]; then
+        cp -f "systemd/ally-emergency-recovery.service" "$svc_file"
+    else
+        cat <<'EOF' > "$svc_file"
+[Unit]
+Description=ROG Ally X Out-Of-Tree Module Emergency Recovery Guard
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=emergency.target rescue.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'rm -rf /lib/modules/*/updates/ally /lib/firmware/ti/audio/tas2783/1954-*.bin.zst && depmod -a'
+RemainAfterExit=no
+
+[Install]
+WantedBy=emergency.target rescue.target
+EOF
+    fi
+    mkdir -p "$emergency_wants" "$rescue_wants"
+    ln -sf "$svc_file" "${emergency_wants}/ally-emergency-recovery.service"
+    ln -sf "$svc_file" "${rescue_wants}/ally-emergency-recovery.service"
+}
+install_emergency_guard
 
 log "Updating dependency map..."
 depmod -a
@@ -412,6 +784,25 @@ fi
 log "Installation complete!"
 log "Checking dmesg for Ally X registration..."
 dmesg | grep -i "asus" | tail -n 5 || true
+
+if [ "$INSTALL_AUDIO" = true ]; then
+    log "Audio modules installed for AMD ACP 7.0 / SoundWire."
+    if [ -d "/sys/bus/soundwire/devices" ] && [ "$(ls -1 /sys/bus/soundwire/devices/ 2>/dev/null | wc -l)" -gt 0 ]; then
+        log "SoundWire devices enumerated: $(ls -1 /sys/bus/soundwire/devices/ | tr '\n' ' ')"
+        if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+            log "Refreshing PipeWire audio services for user '$TARGET_USER'..."
+            runuser -u "$TARGET_USER" -- systemctl --user restart pipewire wireplumber 2>/dev/null || true
+        fi
+    else
+        warn "SoundWire audio requires a system reboot to initialize ACP 7.0 hardware: 'sudo reboot'"
+    fi
+fi
+
+if [[ "$BOARD_NAME" =~ RC74XA ]] || [[ "$PRODUCT_NAME" =~ RC74XA ]]; then
+    log "Reboot for the Armoury Crate button's Quick Access Menu and its TDP and"
+    log "GPU controls: this script does not reload asus-armoury or restart"
+    log "steamos-manager or InputPlumber."
+fi
 
 log "Note: SteamOS updates wipe /etc/modprobe.d, which un-blocks the stock"
 log "driver and lets it silently reclaim interfaces on the next probe. Always"
