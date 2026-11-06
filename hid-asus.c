@@ -765,6 +765,9 @@ static_assert(sizeof(struct ff_report) == sizeof(ALLY_FORCE_FEEDBACK_OFF));
  */
 static void ally_resume_work_fn(struct work_struct *work);
 static void ally_x_ff_work_fn(struct work_struct *work);
+static int ally_restore_gamepad_mode(struct hid_device *hdev,
+				     struct ally_handheld *ally,
+				     struct ally_config *cfg);
 
 /*
  * Changes to ally_drvdata must lock: the raw_event callbacks, which may
@@ -857,7 +860,10 @@ static void ally_resume_work_fn(struct work_struct *work)
 	struct ally_handheld *ally = container_of(work, struct ally_handheld,
 						  resume_work.work);
 	struct input_dev *keyboard_input, *x_input;
+	struct hid_device *cfg_hdev;
+	struct ally_config *cfg;
 	unsigned long flags;
+	int ret;
 
 	/*
 	 * Snapshot the very pointers that get dereferenced under the lock
@@ -869,6 +875,10 @@ static void ally_resume_work_fn(struct work_struct *work)
 	spin_lock_irqsave(&ally_data_lock, flags);
 	keyboard_input = input_get_device(ally->keyboard_input);
 	x_input = input_get_device(ally->ally_x_input);
+	cfg_hdev = ally->cfg_hdev;
+	if (cfg_hdev)
+		get_device(&cfg_hdev->dev);
+	cfg = ally->config;
 	spin_unlock_irqrestore(&ally_data_lock, flags);
 
 	/*
@@ -893,6 +903,25 @@ static void ally_resume_work_fn(struct work_struct *work)
 		input_report_key(x_input, KEY_PROG1, 0);
 		input_sync(x_input);
 		input_put_device(x_input);
+	}
+
+	/*
+	 * Nothing else re-applies the gamepad mode on a resume that did not
+	 * reset the USB device. remove() drains this work before the config
+	 * is freed, so cfg stays valid for as long as it runs.
+	 */
+	if (cfg_hdev) {
+		if (cfg && cfg->initialized) {
+			scoped_guard(mutex, &cfg->config_mutex)
+				ret = ally_restore_gamepad_mode(cfg_hdev, ally, cfg);
+			if (ret < 0)
+				hid_warn(cfg_hdev,
+					 "Failed to restore gamepad mode on resume: %d\n",
+					 ret);
+			else
+				hid_info(cfg_hdev, "Restored gamepad mode after resume\n");
+		}
+		put_device(&cfg_hdev->dev);
 	}
 }
 
@@ -1759,6 +1788,43 @@ static int ally_apply_gamepad_mode(struct hid_device *hdev,
 {
 	scoped_guard(mutex, &cfg->config_mutex)
 		return ally_set_gamepad_mode(ally, hdev, cfg->gamepad_mode);
+}
+
+/**
+ * ally_restore_gamepad_mode() - Re-send the recorded gamepad mode after the MCU lost it
+ * @hdev: HID device of the configuration interface
+ * @ally: ally handheld structure
+ * @cfg: ally config, with config_mutex held by the caller
+ *
+ * The MCU falls back to its desktop (mouse and keyboard) mode across a
+ * system suspend even when its USB device survives the suspend: the
+ * gamepad interface then stays silent while the sticks drive the mouse
+ * endpoint. Writing a mode makes the hardware reset the button mappings
+ * to that mode's defaults, so the cache follows, exactly as
+ * gamepad_mode_store() does.
+ *
+ * Return: 0 on success, negative errno on failure
+ */
+static int ally_restore_gamepad_mode(struct hid_device *hdev,
+				     struct ally_handheld *ally,
+				     struct ally_config *cfg)
+{
+	int ret;
+
+	lockdep_assert_held(&cfg->config_mutex);
+
+	ret = ally_set_gamepad_mode(ally, hdev, cfg->gamepad_mode);
+	if (ret < 0)
+		return ret;
+
+	if (cfg->button_mappings) {
+		if (cfg->gamepad_mode == ALLY_GAMEPAD_MODE_GAMEPAD)
+			ally_set_default_gamepad_mapping(cfg->button_mappings);
+		else if (cfg->gamepad_mode == ALLY_GAMEPAD_MODE_KEYBOARD)
+			ally_set_default_keyboard_mapping(cfg->button_mappings);
+	}
+
+	return 0;
 }
 
 /**
@@ -4807,6 +4873,10 @@ static int hid_asus_ally_init(struct hid_device *hdev, struct ally_handheld *all
 			hid_warn(hdev, "Failed to restore Xbox controller mode: %d\n",
 				 ret);
 	}
+
+	ret = ally_restore_gamepad_mode(hdev, ally, cfg);
+	if (ret < 0)
+		hid_warn(hdev, "Failed to restore gamepad mode: %d\n", ret);
 
 	return 0;
 }

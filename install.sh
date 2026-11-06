@@ -371,19 +371,18 @@ fi
 log "Detected required headers: $HEADER_PKG"
 
 # Install base-devel and headers
-if [ -d "/lib/modules/$(uname -r)/build" ]; then
-    log "Headers for running kernel $(uname -r) are already installed. Skipping headers package installation."
-    pacman -Sy --needed --noconfirm base-devel zstd
+pacman -Sy --needed --noconfirm base-devel zstd
+
+# The repo can run ahead of the OS image, so an unversioned install can fetch
+# another kernel's headers. Install the exact version, signature-checked.
+if [ -d "/lib/modules/${KERNEL_VER}/build" ]; then
+    log "Headers for running kernel ${KERNEL_VER} are already installed. Skipping headers package installation."
 else
-    log "Installing matching headers ($HEADER_PKG) from repository..."
-    if ! pacman -Sy --needed --noconfirm base-devel "$HEADER_PKG" zstd; then
-        warn "Could not install $HEADER_PKG directly from repository. Trying archive URL..."
-        KERNEL_VER_CLEAN=$(echo "$KERNEL_VER" | sed -E 's/([0-9]+)\.([0-9]+)\.([0-9]+)-([^-]+)-([0-9]+)-.*/\1.\2.\3.\4-\5/')
-        EXACT_PKG_URL="https://steamdeck-packages.steamos.cloud/archlinux-mirror/jupiter-main/os/x86_64/${HEADER_PKG}-${KERNEL_VER_CLEAN}-x86_64.pkg.tar.zst"
-        curl -s -f -L "$EXACT_PKG_URL" -o "/tmp/${HEADER_PKG}.pkg.tar.zst"
-        pacman -U --noconfirm --config <(sed 's/SigLevel.*/SigLevel = Never/' /etc/pacman.conf) "/tmp/${HEADER_PKG}.pkg.tar.zst"
-        rm -f "/tmp/${HEADER_PKG}.pkg.tar.zst"
-    fi
+    KERNEL_VER_CLEAN=$(echo "$KERNEL_VER" | sed -E 's/([0-9]+)\.([0-9]+)\.([0-9]+)-([^-]+)-([0-9]+)-.*/\1.\2.\3.\4-\5/')
+    HEADER_REPO=$(pacman -Si "$HEADER_PKG" 2>/dev/null | awk '$1 == "Repository" {print $3; exit}')
+    EXACT_PKG_URL="https://steamdeck-packages.steamos.cloud/archlinux-mirror/${HEADER_REPO}/os/x86_64/${HEADER_PKG}-${KERNEL_VER_CLEAN}-x86_64.pkg.tar.zst"
+    log "Installing headers for ${KERNEL_VER} from ${EXACT_PKG_URL}..."
+    pacman -U --noconfirm "$EXACT_PKG_URL" || error "Could not install headers for running kernel ${KERNEL_VER}. No modules were built. Install them by hand, then re-run."
 fi
 
 
@@ -391,23 +390,10 @@ fi
 
 log "Detecting kernel headers..."
 KVER=$(uname -r)
-if [ -d "/lib/modules/${KVER}/build" ]; then
-    log "Found build headers for running kernel: ${KVER}"
-else
-    log "Headers for running kernel ${KVER} not found. Searching for installed headers..."
-    KVER=""
-    for d in /lib/modules/*; do
-        if [ -d "${d}/build" ]; then
-            KVER=$(basename "${d}")
-            log "Found active kernel headers: ${KVER}"
-            break
-        fi
-    done
+if [ ! -d "/lib/modules/${KVER}/build" ]; then
+    error "No build headers for running kernel ${KVER}. Refusing to build against another kernel's headers."
 fi
-
-if [ -z "${KVER}" ]; then
-    error "Could not find any directory under /lib/modules/ containing a 'build' folder. Please install linux headers."
-fi
+log "Found build headers for running kernel: ${KVER}"
 
 KDIR="/lib/modules/${KVER}/build"
 UPDATES_BASE="/lib/modules/${KVER}/updates/ally"
@@ -673,12 +659,6 @@ fi
 log "Blacklist written and verified at $BLACKLIST_FILE"
 
 # --- 7. Reload Module ---
-
-if [ "${KVER}" != "$(uname -r)" ]; then
-    warn "Module was built for kernel ${KVER} but you are running $(uname -r)."
-    warn "Installation is complete for the new kernel. Please reboot your Steam Deck to use the new kernel and the module."
-    exit 0
-fi
 
 log "Reloading module..."
 

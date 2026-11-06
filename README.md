@@ -88,6 +88,11 @@ installing for the button and the controls to work.
 - **Button state reset.** Vendor buttons (Armoury Crate, Command Center) are
   force-released during re-initialisation so a key held across suspend cannot
   stick.
+- **Gamepad mode restoration.** The MCU drops back to its desktop
+  (mouse/keyboard) mode across suspend, even when its USB device survives it,
+  which leaves the gamepad interface silent. The recorded mode is re-sent on
+  wake, and again after a USB reset, so the sticks and buttons come back as a
+  gamepad.
 
 ### Input handling
 
